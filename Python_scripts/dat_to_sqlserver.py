@@ -12,12 +12,15 @@ Features:
       (case-insensitive). Unmatched .dat columns are reported and skipped;
       table columns with no source are left NULL. If the table does not exist,
       it is created right-sized as a fallback.
-    * RESUMABLE / crash-safe: each committed batch is recorded in a checkpoint
-      file (<name>_checkpoint.txt). On any DB error or Ctrl+C the batch is
-      retried a few times; if it still fails the checkpoint is saved and the
-      script stops cleanly. Re-run the SAME command and it skips everything
-      already loaded and continues from the last committed row -- nothing
-      missed, nothing duplicated. The checkpoint is deleted on a clean finish.
+    * RESUMABLE / crash-safe: the resume point is the ACTUAL number of rows
+      currently in the target table (SELECT COUNT_BIG(*)). On any DB error or
+      Ctrl+C the batch is retried a few times; if it still fails the script
+      stops cleanly. Re-run the SAME command and it skips exactly the rows
+      already in the table and continues from there -- nothing missed, nothing
+      duplicated. Because the resume point is read live from the table, it
+      stays correct even if you TRUNCATE/clear the table between runs (it
+      simply starts over from row 1). Rows are inserted in file order, so the
+      table's row count always equals the number of source rows loaded.
     * PASS 1 analyses the file for the report (and to size a table it must
       create). PASS 2 loads rows in batches, committing each batch.
     * Live progress bar with % complete + estimated time remaining (ETA)
@@ -248,40 +251,14 @@ def read_header(fin):
     return header, cols
 
 
-def read_checkpoint(path: Path) -> int:
-    """How many data rows were already committed on a previous run (0 = fresh)."""
-    try:
-        return int(path.read_text(encoding="utf-8").strip())
-    except (FileNotFoundError, ValueError):
-        return 0
-
-
-def write_checkpoint(path: Path, rows_committed: int):
-    """Record progress. Prefers an atomic tmp+rename, but on Windows the rename
-    can hit transient locks (antivirus, indexer, OneDrive, network drives) and
-    raise PermissionError [WinError 5]. So: retry the rename, and if it still
-    fails, fall back to writing the value straight into the file. Losing the
-    'atomic' guarantee only risks re-loading one batch on a crash mid-write --
-    the DB commit already happened, so no data is ever lost."""
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(str(rows_committed), encoding="utf-8")
-    for attempt in range(1, 4):
-        try:
-            os.replace(tmp, path)   # atomic on Windows and POSIX
-            return
-        except PermissionError:
-            if attempt < 3:
-                time.sleep(0.5)
-                continue
-            # Rename blocked -> write directly in place as a last resort.
-            try:
-                path.write_text(str(rows_committed), encoding="utf-8")
-            finally:
-                try:
-                    tmp.unlink()
-                except FileNotFoundError:
-                    pass
-            return
+def get_row_count(cur, full_table) -> int:
+    """How many rows are already in the target table right now. This is the
+    resume point: rows are inserted in file order, so the count equals the
+    number of source rows already loaded. Reading it live from the table means
+    the resume point can never get out of sync with the data -- if the table is
+    truncated/cleared, the count is 0 and loading starts over from row 1."""
+    cur.execute(f"SELECT COUNT_BIG(*) FROM {full_table}")
+    return int(cur.fetchone()[0])
 
 
 def get_existing_columns(cur, database, schema, table):
@@ -392,7 +369,6 @@ def main():
     database, schema, table = split_table(sys.argv[2])
     full_table = f"[{database}].[{schema}].[{table}]"
     report_path = dat_path.with_name(dat_path.stem + "_import_report.txt")
-    checkpoint_path = dat_path.with_name(dat_path.stem + "_checkpoint.txt")
     total_bytes = os.path.getsize(dat_path)
     start_time = time.time()
 
@@ -462,11 +438,13 @@ def main():
     insert_sql = (f"INSERT INTO {full_table} "
                   f"([{'],['.join(load_cols)}]) VALUES ({placeholders})")
 
-    # How many rows are already loaded from a previous (interrupted) run?
-    resume_from = read_checkpoint(checkpoint_path)
+    # Resume point = rows already in the table (0 if empty / just truncated).
+    resume_from = get_row_count(cur, full_table)
     if resume_from:
-        print(f"[RESUME] {resume_from:,} rows already committed -> skipping them, "
+        print(f"[RESUME] Table already has {resume_from:,} rows -> skipping them, "
               f"continuing from row {resume_from + 1:,}.")
+    else:
+        print("[FRESH] Table is empty -> loading from row 1.")
 
     # ---------------- PASS 2: load (commit + checkpoint each batch) ----------
     print("PASS 2/2  Loading rows into SQL Server...")
@@ -493,22 +471,20 @@ def main():
                 batch.append([v if v != "" else None for v in row])
                 if len(batch) >= BATCH_SIZE:
                     commit_batch(cur, conn, insert_sql, batch)   # retries transient errors
-                    rows_loaded = seen
-                    write_checkpoint(checkpoint_path, rows_loaded)   # resumable point
+                    rows_loaded = seen                           # committed -> resumable
                     batch.clear()
                     render_progress(processed, total_bytes, load_start, rows_loaded)
             if batch:
                 commit_batch(cur, conn, insert_sql, batch)
                 rows_loaded = seen
-                write_checkpoint(checkpoint_path, rows_loaded)
     except (pyodbc.Error, KeyboardInterrupt) as exc:
-        # Everything up to `rows_loaded` is committed and recorded in the
-        # checkpoint file. Re-run the SAME command to continue from here.
+        # Everything up to `rows_loaded` is committed to the table. Re-run the
+        # SAME command to continue -- it reads the table's row count and picks
+        # up from exactly there.
         cur.close()
         conn.close()
         print(f"\n[STOPPED] {type(exc).__name__}: {exc}")
-        print(f"[SAFE] {rows_loaded:,} rows are committed and saved to "
-              f"{checkpoint_path.name}.")
+        print(f"[SAFE] {rows_loaded:,} rows are committed to the table.")
         print("        Re-run the exact same command to resume without losing "
               "or duplicating any rows.")
         sys.exit(2)
@@ -516,12 +492,6 @@ def main():
     render_progress(total_bytes, total_bytes, load_start, rows_loaded)
     cur.close()
     conn.close()
-
-    # Full run finished cleanly -> the checkpoint is no longer needed.
-    try:
-        checkpoint_path.unlink()
-    except FileNotFoundError:
-        pass
 
     elapsed = time.time() - start_time
     print(f"\n[OK] Loaded {rows_loaded:,} rows into {full_table}.")
