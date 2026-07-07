@@ -247,10 +247,31 @@ def read_checkpoint(path: Path) -> int:
 
 
 def write_checkpoint(path: Path, rows_committed: int):
-    """Record progress atomically so a crash mid-write can't corrupt it."""
+    """Record progress. Prefers an atomic tmp+rename, but on Windows the rename
+    can hit transient locks (antivirus, indexer, OneDrive, network drives) and
+    raise PermissionError [WinError 5]. So: retry the rename, and if it still
+    fails, fall back to writing the value straight into the file. Losing the
+    'atomic' guarantee only risks re-loading one batch on a crash mid-write --
+    the DB commit already happened, so no data is ever lost."""
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(str(rows_committed), encoding="utf-8")
-    os.replace(tmp, path)   # atomic on Windows and POSIX
+    for attempt in range(1, 4):
+        try:
+            os.replace(tmp, path)   # atomic on Windows and POSIX
+            return
+        except PermissionError:
+            if attempt < 3:
+                time.sleep(0.5)
+                continue
+            # Rename blocked -> write directly in place as a last resort.
+            try:
+                path.write_text(str(rows_committed), encoding="utf-8")
+            finally:
+                try:
+                    tmp.unlink()
+                except FileNotFoundError:
+                    pass
+            return
 
 
 def get_existing_columns(cur, database, schema, table):
