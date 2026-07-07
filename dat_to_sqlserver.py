@@ -50,7 +50,7 @@ import pyodbc
 
 # ---- EDIT THESE CONNECTION SETTINGS ----
 SERVER = r"localhost\SQLEXPRESS"   # e.g. "MYPC\SQLEXPRESS" or "10.0.0.5"
-DEFAULT_DATABASE = "STS_NL"        # used only if you don't include a DB in the table name
+DEFAULT_DATABASE = "sts_db"        # used only if you don't include a DB in the table name
 USE_WINDOWS_AUTH = False           # False -> use the SQL login below (same as SSMS 'sa')
 SQL_USER = "sa"
 # Never hardcode a real password. Preferred: set an environment variable
@@ -70,6 +70,16 @@ DELIMITER = "þ\x14þ"
 BATCH_SIZE = 1000
 MAX_RETRIES = 3          # per-batch retry attempts before pausing (resumable)
 RETRY_WAIT_SEC = 5       # wait between retries on a transient DB error
+
+# How to line up the .dat columns with an EXISTING table's columns:
+#   "auto"     -> match by name; if the names barely match AND both sides have
+#                 the same number of columns, fall back to matching by position
+#                 (1st .dat col -> 1st table col, ...). Best default.
+#   "name"     -> match strictly by (cleaned) column name, case-insensitive
+#   "position" -> ignore names, match purely by column order
+# Use "position" if your .dat header names differ from the table but the
+# columns are in the same order (the usual Concordance/Relativity case).
+COLUMN_MATCH = "auto"
 # -----------------------------------------
 
 INT_RE = re.compile(r"^-?\d+$")
@@ -284,6 +294,72 @@ def get_existing_columns(cur, database, schema, table):
     return [row[0] for row in cur.fetchall()]
 
 
+def build_mapping(dat_cols, table_cols, mode):
+    """Decide which source column index feeds which real table column.
+
+    Returns (load_idx, load_cols): parallel lists where row value at
+    load_idx[k] is inserted into table column load_cols[k].
+
+      mode="name"     -> match by cleaned name (case-insensitive)
+      mode="position" -> match by order (Nth .dat col -> Nth table col)
+      mode="auto"     -> try name; if it matches poorly AND both sides have the
+                         same count, switch to position and say so.
+    """
+    def by_name():
+        by_lower = {c.lower(): c for c in table_cols}
+        idx, cols_out, unmatched = [], [], []
+        for i, c in enumerate(dat_cols):
+            real = by_lower.get(c.lower())
+            if real is not None:
+                idx.append(i)
+                cols_out.append(real)
+            else:
+                unmatched.append(c)
+        return idx, cols_out, unmatched
+
+    def by_position():
+        m = min(len(dat_cols), len(table_cols))
+        return list(range(m)), list(table_cols[:m])
+
+    if mode == "position":
+        idx, cols_out = by_position()
+        print(f"[MAP] Using POSITION matching ({len(idx)} columns by order).")
+        if len(dat_cols) != len(table_cols):
+            print(f"[WARN] Column counts differ (.dat={len(dat_cols)}, "
+                  f"table={len(table_cols)}); extra columns on the longer side "
+                  f"are ignored/left NULL. Check the pairs printed below.")
+        return idx, cols_out
+
+    idx, cols_out, unmatched = by_name()
+    good = len(idx)
+    if mode == "name":
+        print(f"[MAP] Using NAME matching ({good}/{len(dat_cols)} matched).")
+        if unmatched:
+            print(f"[WARN] {len(unmatched)} .dat column(s) not in table (NULL): "
+                  f"{unmatched[:20]}")
+        return idx, cols_out
+
+    # mode == "auto"
+    enough = good >= 0.8 * min(len(dat_cols), len(table_cols))
+    if enough:
+        print(f"[MAP] Auto -> NAME matching ({good}/{len(dat_cols)} matched).")
+        if unmatched:
+            print(f"[WARN] {len(unmatched)} .dat column(s) not in table (NULL): "
+                  f"{unmatched[:20]}")
+        return idx, cols_out
+    if len(dat_cols) == len(table_cols):
+        pidx, pcols = by_position()
+        print(f"[MAP] Auto -> POSITION matching (names matched only {good}/"
+              f"{len(dat_cols)}, but column counts are equal so order is used).")
+        return pidx, pcols
+    # Poor name match and counts differ -> best effort by name, warn loudly.
+    print(f"[MAP] Auto -> NAME matching, but only {good}/{len(dat_cols)} matched "
+          f"and counts differ (.dat={len(dat_cols)}, table={len(table_cols)}).")
+    print("[WARN] Many columns will be NULL. If the columns are actually in the "
+          "same ORDER, set COLUMN_MATCH = \"position\" near the top and re-run.")
+    return idx, cols_out
+
+
 def commit_batch(cur, conn, insert_sql, batch):
     """Insert + commit one batch, retrying transient errors. Raises if it can't."""
     for attempt in range(1, MAX_RETRIES + 1):
@@ -360,27 +436,19 @@ def main():
 
     existing = get_existing_columns(cur, database, schema, table)
     if existing:
-        # Table already exists -> DO NOT drop. Map the .dat header onto the real
-        # columns by name (case-insensitive). Anything unmatched is reported.
-        by_lower = {c.lower(): c for c in existing}
-        load_idx, load_cols = [], []       # source col index -> real table col
-        unmatched_src = []
-        for i, c in enumerate(cols):
-            real = by_lower.get(c.lower())
-            if real is not None:
-                load_idx.append(i)
-                load_cols.append(real)
-            else:
-                unmatched_src.append(c)
-        if not load_cols:
-            print(f"\n[ERROR] None of the .dat columns match table {full_table}.")
+        # Table already exists -> DO NOT drop. Line up the .dat columns with the
+        # real table columns using COLUMN_MATCH ("auto" / "name" / "position").
+        load_idx, load_cols = build_mapping(cols, existing, COLUMN_MATCH)
+        if not load_idx:
+            print(f"\n[ERROR] Could not map any .dat column to table {full_table}.")
             print(f"        .dat columns : {cols[:20]}")
             print(f"        table columns: {existing[:20]}")
             sys.exit(1)
-        print(f"Existing table found: mapping {len(load_cols)}/{len(cols)} columns.")
-        if unmatched_src:
-            print(f"[WARN] {len(unmatched_src)} .dat column(s) not in table (skipped): "
-                  f"{unmatched_src[:20]}")
+        print(f"Existing table found. Mapping {len(load_idx)} columns "
+              f"(.dat={len(cols)}, table={len(existing)}).")
+        print("First column pairs (.dat header -> table column):")
+        for src_i, tbl_c in list(zip(load_idx, load_cols))[:8]:
+            print(f"   {cols[src_i][:30]:<30} -> {tbl_c}")
     else:
         # Table does not exist -> create it right-sized (no drop needed).
         print("Target table not found -> creating it.")

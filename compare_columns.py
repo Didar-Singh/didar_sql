@@ -5,11 +5,13 @@ It compares the .dat file's header columns (after the same name-cleaning that
 dat_to_sqlserver.py does) against the real columns of your SQL Server table,
 and prints which ones match and which stay NULL.
 
-Run (Windows auth):
+Run (uses the SAME sa login as the load -- set the password first):
+    $env:SQL_PASSWORD = 'your_sa_password'
     python compare_columns.py
 
 Edit the settings below to match your load if needed.
 """
+import os
 import re
 import pyodbc
 
@@ -20,9 +22,21 @@ DATABASE = "sts_db"
 SCHEMA   = "dbo"
 TABLE    = "sts_master"
 DAT      = "input.dat"
+
+# Auth -- match dat_to_sqlserver.py. Your load used the sa SQL login, so:
+USE_WINDOWS_AUTH = False
+SQL_USER = "sa"
+SQL_PASSWORD = os.environ.get("SQL_PASSWORD", "")   # set $env:SQL_PASSWORD first
 # ----------------------------------
 
 DELIM = "þ\x14þ"   # þ \x14 þ
+
+
+def conn_str():
+    base = f"DRIVER={DRIVER};SERVER={SERVER};DATABASE={DATABASE};"
+    if USE_WINDOWS_AUTH:
+        return base + "Trusted_Connection=yes;"
+    return base + f"UID={SQL_USER};PWD={SQL_PASSWORD};"
 
 
 def clean_col(name, idx):
@@ -39,9 +53,10 @@ def main():
         raw = f.readline().strip().split(DELIM)
     dat_cols = [clean_col(c, i) for i, c in enumerate(raw)]
 
-    conn_str = (f"DRIVER={DRIVER};SERVER={SERVER};DATABASE={DATABASE};"
-                f"Trusted_Connection=yes;")
-    cn = pyodbc.connect(conn_str, timeout=5)
+    if not USE_WINDOWS_AUTH and not SQL_PASSWORD:
+        print("ERROR: set the sa password first ->  $env:SQL_PASSWORD = 'your_sa_password'")
+        return
+    cn = pyodbc.connect(conn_str(), timeout=5)
     cur = cn.cursor()
     cur.execute(
         "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
