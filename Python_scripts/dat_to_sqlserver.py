@@ -52,7 +52,7 @@ from pathlib import Path
 import pyodbc
 
 # ---- EDIT THESE CONNECTION SETTINGS ----
-SERVER = r"localhost\SQLEXPRESS"   # e.g. "MYPC\SQLEXPRESS" or "10.0.0.5"
+SERVER = r"prdenvfdevm-3\MSSQLSERVER01"   # Developer edition instance (no 10 GB limit)
 DEFAULT_DATABASE = "sts_db"        # used only if you don't include a DB in the table name
 USE_WINDOWS_AUTH = False           # False -> use the SQL login below (same as SSMS 'sa')
 SQL_USER = "sa"
