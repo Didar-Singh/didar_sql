@@ -40,7 +40,7 @@ import pyodbc
 
 # ---- EDIT THESE CONNECTION SETTINGS ----
 SERVER = r"localhost\SQLEXPRESS"   # e.g. "MYPC\SQLEXPRESS" or "10.0.0.5"
-DEFAULT_DATABASE = "StagingDB"     # used only if you don't include a DB in the table name
+DEFAULT_DATABASE = "STS_NL"        # used only if you don't include a DB in the table name
 USE_WINDOWS_AUTH = True            # False -> use SQL login below
 SQL_USER = "youruser"
 SQL_PASSWORD = "yourpass"          # keep real credentials out of source control
