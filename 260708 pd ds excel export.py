@@ -39,20 +39,52 @@ OUTPUT_XLSX = "260708 re ds space and flip name.xlsx"
 EXCEL_MAX_ROWS = 1_048_576                 # per-sheet hard limit
 
 # ------------------------------------------------------------
-# AUTH - same approach as the working dat_to_sqlserver.py
-#   USE_WINDOWS_AUTH = True  -> Trusted_Connection (like SSMS Windows login)
-#   USE_WINDOWS_AUTH = False -> SQL login; set the password via env var:
+# AUTH - mirrors the working dat_to_sqlserver.py.
+# The script tries Windows auth first; if that login fails it
+# automatically falls back to SQL login (sa) using the password
+# from the SQL_PASSWORD environment variable:
 #       PowerShell:  $env:SQL_PASSWORD = 'yourpassword'
+# Set USE_WINDOWS_AUTH = False to skip Windows auth and go
+# straight to the SQL login.
 # ------------------------------------------------------------
 USE_WINDOWS_AUTH = True
 SQL_USER = "sa"
 SQL_PASSWORD = os.environ.get("SQL_PASSWORD", "")   # never hard-code a real password
 
 _base = f"DRIVER={{{DRIVER}}};SERVER={SERVER};DATABASE={DATABASE};"
-if USE_WINDOWS_AUTH:
-    CONN_STR = _base + "Trusted_Connection=yes;"
-else:
-    CONN_STR = _base + f"UID={SQL_USER};PWD={SQL_PASSWORD};"
+CONN_WINDOWS = _base + "Trusted_Connection=yes;"
+CONN_SQL = _base + f"UID={SQL_USER};PWD={SQL_PASSWORD};"
+
+
+def connect():
+    """Connect, trying Windows auth then SQL login. Clear message on failure."""
+    attempts = []
+    if USE_WINDOWS_AUTH:
+        attempts.append(("Windows auth", CONN_WINDOWS))
+    if SQL_PASSWORD:
+        attempts.append((f"SQL login ({SQL_USER})", CONN_SQL))
+
+    if not attempts:
+        raise SystemExit(
+            "No usable auth. Either keep USE_WINDOWS_AUTH = True, or set the "
+            "password:  $env:SQL_PASSWORD = 'yourSApassword'  then re-run."
+        )
+
+    last_err = None
+    for label, conn_str in attempts:
+        try:
+            print(f"Trying {label} ...")
+            return pyodbc.connect(conn_str)
+        except pyodbc.Error as exc:
+            last_err = exc
+            print(f"  {label} failed: {exc.args[1] if len(exc.args) > 1 else exc}")
+
+    raise SystemExit(
+        f"\nCould not connect. Last error:\n  {last_err}\n"
+        "Fix: if Windows login is refused (error 18456), set the SA password:\n"
+        "  $env:SQL_PASSWORD = 'yourSApassword'\n"
+        "then run the script again."
+    )
 
 
 def q(name: str) -> str:
@@ -164,7 +196,7 @@ def dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 def main() -> None:
     print(f"Connecting to {SERVER} / {DATABASE} ...")
-    with pyodbc.connect(CONN_STR) as conn:
+    with connect() as conn:
         print("Building + running SPACE query ...")
         df_space = pd.read_sql(build_space_query(conn), conn)
         print(f"  Space rows: {len(df_space):,}")
