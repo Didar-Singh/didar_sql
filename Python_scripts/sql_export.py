@@ -260,7 +260,8 @@ def run_gui():
 
     root = tk.Tk()
     root.title("SQL -> CSV / Excel Export")
-    root.geometry("720x640")
+    root.geometry("720x780")
+    root.minsize(720, 620)
 
     pad = {"padx": 8, "pady": 4}
     row = 0
@@ -357,10 +358,20 @@ def run_gui():
     tk.Entry(root, textvariable=rpp_var, width=15).grid(
         row=row, column=1, sticky="w", **pad); row += 1
 
-    # --- log box ---
-    log_box = tk.Text(root, width=90, height=12, state="disabled",
+    # --- run button (kept above the log so it is always visible) ---
+    run_btn = tk.Button(root, text="Run export", height=2,
+                        bg="#0a7d28", fg="white",
+                        font=("Segoe UI", 10, "bold"))
+    run_btn.grid(row=row, column=0, columnspan=3, sticky="we",
+                 padx=8, pady=8); row += 1
+
+    # --- log box (expands with the window) ---
+    log_box = tk.Text(root, width=90, height=10, state="disabled",
                       bg="#1e1e1e", fg="#d4d4d4")
-    log_box.grid(row=row, column=0, columnspan=3, sticky="we", **pad); row += 1
+    log_box.grid(row=row, column=0, columnspan=3, sticky="nsew", **pad)
+    root.rowconfigure(row, weight=1)
+    root.columnconfigure(1, weight=1)
+    row += 1
 
     msg_queue = queue.Queue()
 
@@ -378,8 +389,6 @@ def run_gui():
             log_box.see("end")
             log_box.config(state="disabled")
         root.after(100, drain_queue)
-
-    run_btn = tk.Button(root, text="Run export")
 
     def worker(args):
         try:
@@ -434,7 +443,6 @@ def run_gui():
         threading.Thread(target=worker, args=(args,), daemon=True).start()
 
     run_btn.config(command=on_run)
-    run_btn.grid(row=row, column=0, columnspan=3, pady=10)
 
     root.after(100, drain_queue)
     root.mainloop()
