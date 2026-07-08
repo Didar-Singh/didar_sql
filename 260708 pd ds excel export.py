@@ -13,18 +13,20 @@ table's column list, so it scales to 50+ columns automatically.
 ============================================================
 """
 
+import os
 import sys
 import pandas as pd
 import pyodbc
 
 # ------------------------------------------------------------
 # 1) CONFIG  - edit these values
+#    (connection settings mirror the working dat_to_sqlserver.py)
 # ------------------------------------------------------------
-SERVER   = r"prdenvfdevm-3\INSTANCE"      # <-- your server (from SSMS)
+SERVER   = r"prdenvfdevm-3\MSSQLSERVER01"  # same instance as dat_to_sqlserver.py
 DATABASE = "sts_db"                        # <-- your database
 SCHEMA   = "dbo"
 TABLE    = "sts_master_core"               # <-- your table
-DRIVER   = "ODBC Driver 17 for SQL Server" # or "ODBC Driver 18 for SQL Server"
+DRIVER   = "ODBC Driver 17 for SQL Server"
 
 # Column names used by the Flip Name query (edit to match your table)
 UNIQUE_ID_COL = "Unique_ID"                # <-- your real unique id column
@@ -37,29 +39,20 @@ OUTPUT_XLSX = "260708 re ds space and flip name.xlsx"
 EXCEL_MAX_ROWS = 1_048_576                 # per-sheet hard limit
 
 # ------------------------------------------------------------
-# AUTH MODE - pick how you log in (match how you connect in SSMS)
-#   "aad_interactive" : Azure AD / Entra ID + MFA (browser popup)  <-- your case
-#   "aad_integrated"  : Azure AD single sign-on (no prompt, if domain-joined)
-#   "windows"         : local Windows / Trusted_Connection
-#   "sql"             : SQL Server login (set SQL_USER / SQL_PASSWORD)
+# AUTH - same approach as the working dat_to_sqlserver.py
+#   USE_WINDOWS_AUTH = True  -> Trusted_Connection (like SSMS Windows login)
+#   USE_WINDOWS_AUTH = False -> SQL login; set the password via env var:
+#       PowerShell:  $env:SQL_PASSWORD = 'yourpassword'
 # ------------------------------------------------------------
-AUTH_MODE = "aad_interactive"
-SQL_USER = ""          # only for AUTH_MODE = "sql"
-SQL_PASSWORD = ""      # only for AUTH_MODE = "sql"  (avoid hard-coding secrets)
+USE_WINDOWS_AUTH = True
+SQL_USER = "sa"
+SQL_PASSWORD = os.environ.get("SQL_PASSWORD", "")   # never hard-code a real password
 
 _base = f"DRIVER={{{DRIVER}}};SERVER={SERVER};DATABASE={DATABASE};"
-_encrypt = "Encrypt=yes;TrustServerCertificate=yes;"
-
-if AUTH_MODE == "aad_interactive":
-    CONN_STR = _base + "Authentication=ActiveDirectoryInteractive;" + _encrypt
-elif AUTH_MODE == "aad_integrated":
-    CONN_STR = _base + "Authentication=ActiveDirectoryIntegrated;" + _encrypt
-elif AUTH_MODE == "windows":
-    CONN_STR = _base + "Trusted_Connection=yes;" + _encrypt
-elif AUTH_MODE == "sql":
-    CONN_STR = _base + f"UID={SQL_USER};PWD={SQL_PASSWORD};" + _encrypt
+if USE_WINDOWS_AUTH:
+    CONN_STR = _base + "Trusted_Connection=yes;"
 else:
-    raise ValueError(f"Unknown AUTH_MODE: {AUTH_MODE}")
+    CONN_STR = _base + f"UID={SQL_USER};PWD={SQL_PASSWORD};"
 
 
 def q(name: str) -> str:
