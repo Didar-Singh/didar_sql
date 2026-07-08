@@ -36,12 +36,30 @@ LAST_NAME     = "Last Name"
 OUTPUT_XLSX = "260708 re ds space and flip name.xlsx"
 EXCEL_MAX_ROWS = 1_048_576                 # per-sheet hard limit
 
-# Windows (SSMS) auth. For SQL login, swap in UID=...;PWD=...
-CONN_STR = (
-    f"DRIVER={{{DRIVER}}};SERVER={SERVER};DATABASE={DATABASE};"
-    "Trusted_Connection=yes;"
-    "Encrypt=yes;TrustServerCertificate=yes;"   # needed for Driver 18; harmless on 17
-)
+# ------------------------------------------------------------
+# AUTH MODE - pick how you log in (match how you connect in SSMS)
+#   "aad_interactive" : Azure AD / Entra ID + MFA (browser popup)  <-- your case
+#   "aad_integrated"  : Azure AD single sign-on (no prompt, if domain-joined)
+#   "windows"         : local Windows / Trusted_Connection
+#   "sql"             : SQL Server login (set SQL_USER / SQL_PASSWORD)
+# ------------------------------------------------------------
+AUTH_MODE = "aad_interactive"
+SQL_USER = ""          # only for AUTH_MODE = "sql"
+SQL_PASSWORD = ""      # only for AUTH_MODE = "sql"  (avoid hard-coding secrets)
+
+_base = f"DRIVER={{{DRIVER}}};SERVER={SERVER};DATABASE={DATABASE};"
+_encrypt = "Encrypt=yes;TrustServerCertificate=yes;"
+
+if AUTH_MODE == "aad_interactive":
+    CONN_STR = _base + "Authentication=ActiveDirectoryInteractive;" + _encrypt
+elif AUTH_MODE == "aad_integrated":
+    CONN_STR = _base + "Authentication=ActiveDirectoryIntegrated;" + _encrypt
+elif AUTH_MODE == "windows":
+    CONN_STR = _base + "Trusted_Connection=yes;" + _encrypt
+elif AUTH_MODE == "sql":
+    CONN_STR = _base + f"UID={SQL_USER};PWD={SQL_PASSWORD};" + _encrypt
+else:
+    raise ValueError(f"Unknown AUTH_MODE: {AUTH_MODE}")
 
 
 def q(name: str) -> str:
