@@ -13,14 +13,17 @@ CONNECTION  (same settings as test_conn.py)
 ------------------------------------------------------------------------------
 RUN COMMANDS
 ------------------------------------------------------------------------------
-    # export a whole table to CSV
+    # export a whole table to CSV  (CSV is the default when no format given)
     python sql_export.py --table dbo.MyTable
 
     # export the result of a query to CSV
     python sql_export.py --query "SELECT * FROM dbo.MyTable WHERE Year = 2025"
 
-    # also produce Excel, split into parts of <= 800,000 rows each
+    # Excel only, split into parts of <= 800,000 rows each
     python sql_export.py --table dbo.MyTable --excel
+
+    # both CSV and Excel
+    python sql_export.py --table dbo.MyTable --csv --excel
 
     # choose the output folder / base name and Excel chunk size
     python sql_export.py --table dbo.MyTable --excel ^
@@ -110,9 +113,12 @@ def export(args, log=print, progress=None):
             sys.stdout.write("\r" + text)
             sys.stdout.flush()
 
+    if not args.csv and not args.excel:
+        raise RuntimeError("Nothing to export: choose CSV, Excel, or both.")
+
     base = Path(args.out) if args.out else Path("export")
     base.parent.mkdir(parents=True, exist_ok=True)
-    csv_path = base.with_suffix(".csv")
+    csv_path = base.with_suffix(".csv") if args.csv else None
     sql = build_sql(args)
     start_time = time.time()
 
@@ -156,10 +162,12 @@ def export(args, log=print, progress=None):
         excel_parts.append((part_path, rows_in_part))
         wb = None
 
-    with open(csv_path, "w", encoding="utf-8-sig", newline="") as fout:
-        writer = csv.writer(fout)
-        writer.writerow(headers)
-
+    # Open the CSV file only if CSV output was requested.
+    fout = open(csv_path, "w", encoding="utf-8-sig", newline="") if args.csv else None
+    writer = csv.writer(fout) if fout else None
+    try:
+        if writer:
+            writer.writerow(headers)
         if args.excel:
             open_new_part()
 
@@ -169,7 +177,8 @@ def export(args, log=print, progress=None):
                 break
             for row in batch:
                 values = list(row)
-                writer.writerow(values)
+                if writer:
+                    writer.writerow(values)
 
                 if args.excel:
                     if rows_in_part >= args.rows_per_part:
@@ -182,6 +191,9 @@ def export(args, log=print, progress=None):
                 if total_rows % FETCH_BATCH == 0:
                     show_progress(total_rows, start_time,
                                   part_no if args.excel else None)
+    finally:
+        if fout:
+            fout.close()
 
     if args.excel:
         close_part()
@@ -190,9 +202,10 @@ def export(args, log=print, progress=None):
     show_progress(total_rows, start_time, part_no if args.excel else None)
     elapsed = time.time() - start_time
 
-    log(f"\nCSV file created: {csv_path}")
-    log(f"Rows exported:    {total_rows:,}")
+    log(f"\nRows exported:    {total_rows:,}")
     log(f"Columns exported: {ncols}")
+    if args.csv:
+        log(f"CSV file created: {csv_path}")
     if args.excel:
         log(f"Excel parts:      {len(excel_parts)} "
             f"(<= {args.rows_per_part:,} rows each)")
@@ -217,7 +230,8 @@ def write_report(base, sql, headers, total_rows, excel_parts, args, elapsed,
         r.write(f"Processing time : {elapsed:.1f} s\n")
         r.write(f"Total data rows : {total_rows:,}\n")
         r.write(f"Total columns   : {len(headers)}\n")
-        r.write(f"CSV output      : {base.with_suffix('.csv')}\n")
+        if args.csv:
+            r.write(f"CSV output      : {base.with_suffix('.csv')}\n")
         if args.excel:
             r.write(f"Rows per part   : {args.rows_per_part:,}\n")
             r.write(f"Excel parts     : {len(excel_parts)}\n")
@@ -328,10 +342,15 @@ def run_gui():
     tk.Button(root, text="Browse...", command=browse).grid(
         row=row, column=2, sticky="w", **pad); row += 1
 
+    add_label("Formats", row)
+    fmt_frame = tk.Frame(root)
+    fmt_frame.grid(row=row, column=1, columnspan=2, sticky="w", **pad)
+    csv_var = tk.BooleanVar(value=True)
     excel_var = tk.BooleanVar(value=False)
-    tk.Checkbutton(root, text="Also export Excel (split into Set_0001, ...)",
-                   variable=excel_var).grid(
-        row=row, column=1, columnspan=2, sticky="w", **pad); row += 1
+    tk.Checkbutton(fmt_frame, text="CSV (single file)",
+                   variable=csv_var).pack(side="left")
+    tk.Checkbutton(fmt_frame, text="Excel (split into Set_0001, ...)",
+                   variable=excel_var).pack(side="left"); row += 1
 
     add_label("Rows per Excel part", row)
     rpp_var = tk.StringVar(value=str(DEFAULT_ROWS_PER_PART))
@@ -387,6 +406,7 @@ def run_gui():
         args.query = (query_text.get("1.0", "end").strip()
                       if mode_var.get() == "query" else None)
         args.out = out_var.get().strip() or None
+        args.csv = csv_var.get()
         args.excel = excel_var.get()
         try:
             args.rows_per_part = int(rpp_var.get())
@@ -394,6 +414,10 @@ def run_gui():
             messagebox.showerror("Invalid input", "Rows per part must be a number.")
             return
 
+        if not args.csv and not args.excel:
+            messagebox.showerror("Missing input",
+                                 "Choose at least one format: CSV, Excel, or both.")
+            return
         if args.rows_per_part > 1_048_575:
             messagebox.showerror(
                 "Invalid input",
@@ -424,8 +448,10 @@ def main():
     src.add_argument("--table", help="table to export, e.g. dbo.MyTable")
     src.add_argument("--query", help="custom SELECT query to export")
     p.add_argument("--out", help="output base path/name (default: ./export)")
+    p.add_argument("--csv", action="store_true",
+                   help="write CSV (single file). Default if no format is given.")
     p.add_argument("--excel", action="store_true",
-                   help="also write Excel, split into Set_0001, Set_0002, ...")
+                   help="write Excel, split into Set_0001, Set_0002, ...")
     p.add_argument("--rows-per-part", type=int, default=DEFAULT_ROWS_PER_PART,
                    help=f"max rows per Excel part (default {DEFAULT_ROWS_PER_PART:,})")
     p.add_argument("--gui", action="store_true", help="open the Tkinter window")
@@ -439,6 +465,10 @@ def main():
     if args.rows_per_part > 1_048_575:
         print("ERROR: --rows-per-part must be <= 1,048,575 (Excel sheet limit).")
         sys.exit(1)
+
+    # No format flag -> default to CSV (backward compatible).
+    if not args.csv and not args.excel:
+        args.csv = True
 
     # Fill the connection fields the CLI path relies on from module defaults.
     args.server = SERVER
