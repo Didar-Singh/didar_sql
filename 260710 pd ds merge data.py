@@ -55,7 +55,7 @@ COL_FIRST  = "First Name"
 COL_LAST   = "Last Name"
 COL_MIDDLE = "Middle Name"
 COL_SUFFIX = "Suffix"
-COL_DOB    = "Full Date of Birth (MM/DD/YYYY)"
+COL_DOB    = "Date of Birth"
 COL_SSN    = "Social Security Number"
 
 # Tuning knobs
