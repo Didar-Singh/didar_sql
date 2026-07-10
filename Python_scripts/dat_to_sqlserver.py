@@ -69,7 +69,12 @@ def build_conn_str(database: str) -> str:
     return base + f"UID={SQL_USER};PWD={SQL_PASSWORD};"
 
 
-DELIMITER = "þ\x14þ"
+# Concordance/Relativity load-file delimiters:
+#   \x14 (DC4, ASCII 20) = column separator  <-- what we split on
+#   þ    (thorn, \xFE)   = text qualifier wrapping each field, stripped per-field
+# Splitting on the DC4 separator alone (not "þ\x14þ") is robust: it still works
+# even if the thorn byte is dropped during decoding (ANSI-exported files).
+DELIMITER = "\x14"
 BATCH_SIZE = 1000
 MAX_RETRIES = 3          # per-batch retry attempts before pausing (resumable)
 RETRY_WAIT_SEC = 5       # wait between retries on a transient DB error
