@@ -54,7 +54,7 @@ import pyodbc
 # ---- EDIT THESE CONNECTION SETTINGS ----
 SERVER = r"prdenvfdevm-3\MSSQLSERVER01"   # Developer edition instance (no 10 GB limit)
 DEFAULT_DATABASE = "sts_db"        # used only if you don't include a DB in the table name
-USE_WINDOWS_AUTH = True            # True -> connect with your Windows/domain login (like SSMS)
+USE_WINDOWS_AUTH = False           # True -> Windows/domain login (like SSMS); False -> SQL login (sa) below
 SQL_USER = "sa"
 # Never hardcode a real password. Preferred: set an environment variable
 #   PowerShell:  $env:SQL_PASSWORD = 'yourpassword'
