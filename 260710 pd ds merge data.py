@@ -64,6 +64,16 @@ COL_SSN    = "Social Security Number"
 FIRST_MIN_PREFIX = 3      # "Saj" (>=3) counts as a prefix of "Sajan"; "Jo" would not
 EXCEL_MAX_ROWS = 1_048_576
 
+# Placeholder name values that are NOT a real name. These are treated as blank,
+# so "[Unknown]" rows never match each other by name -- they can only share a
+# Unique ID via a real, equal SSN. Compared AFTER stripping brackets/punctuation
+# and spaces, so "[Unknown]", "(unknown)", "N/A", "UN KNOWN" all match "UNKNOWN".
+# Add your own placeholder cores here (letters/digits only, upper-case).
+NAME_PLACEHOLDERS = {
+    "UNKNOWN", "UNK", "UNKN", "NA", "NONE", "NULL", "NIL",
+    "TEST", "XXX", "XX", "X", "NMN", "NONAME", "NOTGIVEN", "NOTPROVIDED",
+}
+
 
 # ------------------------------------------------------------
 # 3) Normalisation helpers
@@ -77,17 +87,57 @@ def norm_text(v) -> str:
     return "" if s.lower() in ("nan", "none", "null") else s
 
 
+def norm_name(v) -> str:
+    """Like norm_text, but placeholder values ('[Unknown]', 'N/A', ...) become
+    '' so they are never treated as a real, matchable name. The check strips
+    everything except letters/digits first, so brackets and punctuation don't
+    hide a placeholder."""
+    s = norm_text(v)
+    core = re.sub(r"[^A-Z0-9]", "", s)          # drop [] () - / . spaces etc.
+    if not core or core in NAME_PLACEHOLDERS:
+        return ""
+    return s
+
+
+SSN_MIN_KNOWN_OVERLAP = 4     # min matching KNOWN digits to accept a masked SSN
+
+
 def norm_ssn(v) -> str:
-    """Keep digits only. Reject blanks and obvious non-SSNs (all same digit,
-    not 9 digits) so junk SSNs never merge two different people."""
+    """Return a 9-character SSN pattern of digits and 'X' (X = redacted digit),
+    or '' if unusable. Mask characters *, #, ? are treated as X, e.g.
+        123-45-6789 -> '123456789'
+        123-45-XXXX -> '12345XXXX'
+        XXX-XX-6789 -> 'XXXXX6789'
+    Rejected (returns ''): not 9 chars, all-X (no info), a fully-known junk SSN
+    (all same digit / 000000000), or a masked SSN with fewer than
+    SSN_MIN_KNOWN_OVERLAP known digits."""
     if v is None:
         return ""
-    digits = re.sub(r"\D", "", str(v))
-    if len(digits) != 9:
+    s = str(v).upper().replace("*", "X").replace("#", "X").replace("?", "X")
+    kept = re.sub(r"[^0-9X]", "", s)
+    if len(kept) != 9:
         return ""
-    if digits == "000000000" or len(set(digits)) == 1:
-        return ""
-    return digits
+    if "X" not in kept:                                   # fully known
+        if kept == "000000000" or len(set(kept)) == 1:
+            return ""
+        return kept
+    known = sum(c != "X" for c in kept)                   # masked
+    return kept if known >= SSN_MIN_KNOWN_OVERLAP else ""
+
+
+def ssn_cmp(a: str, b: str) -> str:
+    """Compare two 9-char SSN patterns treating 'X' as a wildcard.
+    Returns 'diff'    -> a known digit disagrees (definitely different people),
+            'same'    -> known digits agree on >= SSN_MIN_KNOWN_OVERLAP positions,
+            'unknown' -> compatible but too few overlapping known digits to be
+                         sure (e.g. '12345XXXX' vs 'XXXXX6789')."""
+    overlap = 0
+    for ca, cb in zip(a, b):
+        if ca != "X" and cb != "X":
+            if ca != cb:
+                return "diff"
+            overlap += 1
+    return "same" if overlap >= SSN_MIN_KNOWN_OVERLAP else "unknown"
 
 
 def norm_dob(v) -> str:
@@ -151,8 +201,10 @@ def name_conflict(r1, r2) -> bool:
 
 
 def ssn_conflict(r1, r2) -> bool:
-    """True when both SSNs are present and different (two different people)."""
-    return bool(r1["ssn"]) and bool(r2["ssn"]) and r1["ssn"] != r2["ssn"]
+    """True only when both SSNs are present and a KNOWN digit disagrees.
+    Masked SSNs whose known digits agree ('123456789' vs '12345XXXX') do NOT
+    conflict; non-overlapping masks are 'unknown', not a conflict."""
+    return bool(r1["ssn"]) and bool(r2["ssn"]) and ssn_cmp(r1["ssn"], r2["ssn"]) == "diff"
 
 
 def dob_conflict(r1, r2) -> bool:
@@ -193,10 +245,10 @@ def build_records(df: pd.DataFrame):
     for i, row in df.iterrows():
         recs.append({
             "idx":   i,
-            "first": norm_text(row[COL_FIRST]),
-            "last":  norm_text(row[COL_LAST]),
-            "mid":   norm_text(row[COL_MIDDLE]),
-            "suf":   norm_text(row[COL_SUFFIX]),
+            "first": norm_name(row[COL_FIRST]),
+            "last":  norm_name(row[COL_LAST]),
+            "mid":   norm_name(row[COL_MIDDLE]),
+            "suf":   norm_name(row[COL_SUFFIX]),
             "dob":   norm_dob(row[COL_DOB]),
             "ssn":   norm_ssn(row[COL_SSN]),
         })
@@ -217,21 +269,36 @@ def cluster(recs, uf, reasons):
       * same SSN  (R1)  -- but only if the names do not conflict
       * fuzzy name match (R2/R3/R4/R6) -- but only if SSN/DOB do not conflict
     """
-    # ---- R1: same SSN, blocked by SSN.  Merge within a group only when the
-    #          names are compatible (Sajan/Saj) and DOBs don't conflict.
-    #          Different names on the same SSN stay SEPARATE (Didar vs Harish).
+    # ---- R1: same SSN. Merge within a group only when the names are
+    #          compatible (Sajan/Saj) and DOBs don't conflict. Different names
+    #          on the same SSN stay SEPARATE (Didar vs Harish).
+    ssn_recs = [r for r in recs if r["ssn"]]
+    masked = [r for r in ssn_recs if "X" in r["ssn"]]
+
+    # Fully-known SSNs: exact grouping via a dict (fast, no O(n^2)).
     by_ssn = {}
-    for r in recs:
-        if r["ssn"]:
+    for r in ssn_recs:
+        if "X" not in r["ssn"]:
             by_ssn.setdefault(r["ssn"], []).append(r)
     for ssn, group in by_ssn.items():
-        m = len(group)
-        for a in range(m):
-            for b in range(a + 1, m):
+        for a in range(len(group)):
+            for b in range(a + 1, len(group)):
                 r1, r2 = group[a], group[b]
                 if name_conflict(r1, r2) or dob_conflict(r1, r2):
                     continue
                 _link(uf, reasons, r1, r2, "R1 same-SSN")
+
+    # Masked SSNs (123-45-XXXX): compare each against every SSN record and
+    # merge when the known digits agree (ssn_cmp == 'same') and name/DOB are ok.
+    for mr in masked:
+        for r in ssn_recs:
+            if r["idx"] == mr["idx"] or uf.find(r["idx"]) == uf.find(mr["idx"]):
+                continue
+            if ssn_cmp(mr["ssn"], r["ssn"]) != "same":
+                continue
+            if name_conflict(mr, r) or dob_conflict(mr, r):
+                continue
+            _link(uf, reasons, mr, r, "R1 same-SSN (masked)")
 
     # ---- R2/R3/R4/R6: fuzzy name inside (last, first-initial) blocks.
     #      Blocking on last + first initial keeps comparisons small while
