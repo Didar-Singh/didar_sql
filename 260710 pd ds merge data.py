@@ -74,6 +74,15 @@ NAME_PLACEHOLDERS = {
     "TEST", "XXX", "XX", "X", "NMN", "NONAME", "NOTGIVEN", "NOTPROVIDED",
 }
 
+# Fake / placeholder SSNs that must NEVER be used to merge people. These are
+# structurally valid but are common test/default values entered when the real
+# SSN is unknown. Add any others you see in your data (9 digits, no dashes).
+SSN_PLACEHOLDERS = {
+    "123456789", "987654321", "111223333", "123121234", "456789123",
+    "078051120",   # famous Woolworth wallet SSN
+    "219099999", "457555462",
+}
+
 
 # ------------------------------------------------------------
 # 3) Normalisation helpers
@@ -118,11 +127,27 @@ def norm_ssn(v) -> str:
     if len(kept) != 9:
         return ""
     if "X" not in kept:                                   # fully known
-        if kept == "000000000" or len(set(kept)) == 1:
-            return ""
-        return kept
+        return "" if is_junk_ssn(kept) else kept
     known = sum(c != "X" for c in kept)                   # masked
     return kept if known >= SSN_MIN_KNOWN_OVERLAP else ""
+
+
+def is_junk_ssn(d: str) -> bool:
+    """True for a 9-digit SSN that cannot belong to a real, single person:
+    invalid per SSA structure, all-same-digit, sequential, or a known fake."""
+    if len(set(d)) == 1:                       # 000000000, 111111111, ...
+        return True
+    if d in SSN_PLACEHOLDERS:
+        return True
+    if d in ("123456789", "234567890", "345678901", "456789012", "567890123",
+             "012345678", "987654321", "098765432"):
+        return True
+    area, group, serial = d[:3], d[3:5], d[5:]
+    if area in ("000", "666") or area >= "900":  # SSA-invalid area numbers
+        return True
+    if group == "00" or serial == "0000":        # SSA-invalid group / serial
+        return True
+    return False
 
 
 def ssn_cmp(a: str, b: str) -> str:
@@ -212,6 +237,20 @@ def dob_conflict(r1, r2) -> bool:
     return bool(r1["dob"]) and bool(r2["dob"]) and r1["dob"] != r2["dob"]
 
 
+def group_is_coherent(group) -> bool:
+    """True if NO two rows in the group have conflicting names or DOBs.
+    A shared SSN whose rows carry clearly different names (Blankenship vs
+    Bradford) is unreliable -- often a fake/default SSN -- so we refuse to
+    merge the whole group and let the safer name rules decide instead. This
+    also stops a blank '[Unknown]' row from bridging two conflicting people."""
+    n = len(group)
+    for a in range(n):
+        for b in range(a + 1, n):
+            if name_conflict(group[a], group[b]) or dob_conflict(group[a], group[b]):
+                return False
+    return True
+
+
 # ------------------------------------------------------------
 # 5) Union-Find (disjoint set) for transitive clustering
 # ------------------------------------------------------------
@@ -269,34 +308,43 @@ def cluster(recs, uf, reasons):
       * same SSN  (R1)  -- but only if the names do not conflict
       * fuzzy name match (R2/R3/R4/R6) -- but only if SSN/DOB do not conflict
     """
-    # ---- R1: same SSN. Merge within a group only when the names are
-    #          compatible (Sajan/Saj) and DOBs don't conflict. Different names
-    #          on the same SSN stay SEPARATE (Didar vs Harish).
+    # ---- R1: same SSN. A shared full SSN merges its rows ONLY if the whole
+    #          group is coherent (no two rows have conflicting names/DOBs).
+    #          A group with conflicting names means the SSN is unreliable
+    #          (usually a fake/default value) -> we skip it entirely so a blank
+    #          '[Unknown]' row cannot bridge two different people.
     ssn_recs = [r for r in recs if r["ssn"]]
     masked = [r for r in ssn_recs if "X" in r["ssn"]]
+    skipped_ssns = 0
 
-    # Fully-known SSNs: exact grouping via a dict (fast, no O(n^2)).
     by_ssn = {}
     for r in ssn_recs:
         if "X" not in r["ssn"]:
             by_ssn.setdefault(r["ssn"], []).append(r)
     for ssn, group in by_ssn.items():
-        for a in range(len(group)):
-            for b in range(a + 1, len(group)):
-                r1, r2 = group[a], group[b]
-                if name_conflict(r1, r2) or dob_conflict(r1, r2):
-                    continue
-                _link(uf, reasons, r1, r2, "R1 same-SSN")
+        if len(group) < 2:
+            continue
+        if not group_is_coherent(group):
+            skipped_ssns += 1
+            continue                              # unreliable SSN -> don't merge
+        root = group[0]
+        for other in group[1:]:                   # coherent -> all one person
+            _link(uf, reasons, root, other, "R1 same-SSN")
 
-    # Masked SSNs (123-45-XXXX): compare each against every SSN record and
-    # merge when the known digits agree (ssn_cmp == 'same') and name/DOB are ok.
+    # Masked SSNs (123-45-XXXX): a mask reveals only a few digits, so we require
+    # a POSITIVE real-name match (both names present and fuzzy-equal). This
+    # prevents a mask from bridging '[Unknown]' rows across different people.
     for mr in masked:
+        if not (mr["first"] and mr["last"]):
+            continue                              # blank name: too weak to trust a mask
         for r in ssn_recs:
             if r["idx"] == mr["idx"] or uf.find(r["idx"]) == uf.find(mr["idx"]):
                 continue
+            if not (r["first"] and r["last"]):
+                continue
             if ssn_cmp(mr["ssn"], r["ssn"]) != "same":
                 continue
-            if name_conflict(mr, r) or dob_conflict(mr, r):
+            if dob_conflict(mr, r) or not name_match(mr, r):
                 continue
             _link(uf, reasons, mr, r, "R1 same-SSN (masked)")
 
@@ -415,6 +463,23 @@ def main() -> None:
     n_dups = (df_out["Duplicate Count"] > 1).sum()
     print(f"  {len(df):,} rows kept  ->  {n_people:,} distinct Unique IDs "
           f"({n_dups:,} rows share an ID with at least one other row).")
+
+    # ---- SANITY CHECK: a real person should be a handful of rows, not
+    #      thousands. Print the biggest clusters so over-merging is obvious.
+    biggest = df_out["Duplicate Count"].max()
+    print(f"  Largest cluster: {biggest:,} rows.")
+    if biggest > 50:
+        print("  WARNING: a cluster >50 rows almost always means a shared "
+              "junk/placeholder value. Inspect these Unique IDs:")
+        top = (df_out[df_out["Duplicate Count"] > 50]
+               .groupby("Unique ID")
+               .agg(rows=("Unique ID", "size"),
+                    sample_last=(COL_LAST, lambda s: s.head(3).tolist()),
+                    sample_ssn=(COL_SSN, lambda s: s.head(3).tolist()))
+               .sort_values("rows", ascending=False).head(10))
+        print(top.to_string())
+        print("  If a cluster mixes different real names, add its SSN to "
+              "SSN_PLACEHOLDERS (or its name to NAME_PLACEHOLDERS) and re-run.")
 
     # Write results: ALL rows, with the new Unique ID column. No merged sheet.
     print(f"Writing {OUTPUT_XLSX} ...")
