@@ -315,18 +315,26 @@ def classify_name_link(r1, r2) -> str:
 
 
 # ------------------------------------------------------------
-# 7) Golden record (most complete row per person)
+# 7) Unique ID generator  ->  3 letters + 4-digit number
+#    AAA1000, AAA1001, ... AAA9999, AAB1000, ...
+#    (same person gets the same Unique ID; NO rows are merged/removed)
 # ------------------------------------------------------------
-def completeness_score(r) -> tuple:
-    """Higher = more complete. Prefer rows that have SSN, DOB, a longer first
-    name, a full middle name and a suffix."""
-    return (
-        1 if r["ssn"] else 0,
-        1 if r["dob"] else 0,
-        len(r["first"]),
-        len(r["mid"]),
-        1 if r["suf"] else 0,
-    )
+UID_FIRST_NUMBER = 1000        # 4-digit numbers start at 1000
+UID_NUMBER_SPAN = 9000         # 1000..9999 inclusive
+
+
+def make_uid(seq: int) -> str:
+    """seq is 0-based order of the person. Numbers roll 1000->9999, then the
+    3-letter prefix advances AAA->AAB->...->ZZZ (over 234 million IDs)."""
+    letter_index = seq // UID_NUMBER_SPAN
+    number = UID_FIRST_NUMBER + (seq % UID_NUMBER_SPAN)
+    if letter_index >= 26 * 26 * 26:
+        raise RuntimeError("Ran out of Unique IDs (max ZZZ9999).")
+    a = letter_index // (26 * 26)
+    b = (letter_index // 26) % 26
+    c = letter_index % 26
+    letters = chr(65 + a) + chr(65 + b) + chr(65 + c)
+    return f"{letters}{number}"
 
 
 # ------------------------------------------------------------
@@ -335,11 +343,14 @@ def completeness_score(r) -> tuple:
 def main() -> None:
     print(f"Connecting to {SERVER} / {DATABASE} ...")
     with connect() as conn:
+        # DISTINCT collapses exact duplicates first (30k -> ~10k), matching the
+        # SELECT DISTINCT step you already run; the fuzzy rules below then
+        # catch the NEAR-duplicates that DISTINCT cannot (Sajan vs Saj, etc.).
         sql = (
-            f"SELECT {q(COL_FIRST)}, {q(COL_LAST)}, {q(COL_MIDDLE)}, "
+            f"SELECT DISTINCT {q(COL_FIRST)}, {q(COL_LAST)}, {q(COL_MIDDLE)}, "
             f"{q(COL_SUFFIX)}, {q(COL_DOB)}, {q(COL_SSN)} FROM {FULL_TABLE}"
         )
-        print("Reading rows ...")
+        print("Reading rows (SELECT DISTINCT) ...")
         df = pd.read_sql(sql, conn)
     print(f"  {len(df):,} rows read.")
 
@@ -351,40 +362,33 @@ def main() -> None:
     print("Clustering ...")
     cluster(recs, uf, reasons)
 
-    # Assign a stable person_id per cluster root
-    root_to_pid = {}
-    person_id = [0] * len(recs)
-    next_pid = 1
-    for r in recs:
+    # Assign a Unique ID per cluster root. Same person -> same Unique ID.
+    # NO rows are merged or removed; every input row is kept.
+    root_to_uid = {}
+    unique_id = [""] * len(recs)
+    next_seq = 0
+    for r in recs:                        # preserves original row order
         root = uf.find(r["idx"])
-        if root not in root_to_pid:
-            root_to_pid[root] = next_pid
-            next_pid += 1
-        person_id[r["idx"]] = root_to_pid[root]
+        if root not in root_to_uid:
+            root_to_uid[root] = make_uid(next_seq)
+            next_seq += 1
+        unique_id[r["idx"]] = root_to_uid[root]
 
     df_out = df.copy()
-    df_out.insert(0, "person_id", person_id)
-    df_out["cluster_size"] = df_out.groupby("person_id")["person_id"].transform("size")
+    df_out.insert(0, "Unique ID", unique_id)
+    df_out["Duplicate Count"] = df_out.groupby("Unique ID")["Unique ID"].transform("size")
     df_out["match_reason"] = [", ".join(sorted(s)) if s else "unique" for s in reasons]
 
-    n_people = df_out["person_id"].nunique()
-    n_dups = (df_out["cluster_size"] > 1).sum()
-    print(f"  {len(df):,} rows  ->  {n_people:,} distinct people "
-          f"({n_dups:,} rows are duplicates of someone else).")
+    n_people = df_out["Unique ID"].nunique()
+    n_dups = (df_out["Duplicate Count"] > 1).sum()
+    print(f"  {len(df):,} rows kept  ->  {n_people:,} distinct Unique IDs "
+          f"({n_dups:,} rows share an ID with at least one other row).")
 
-    # Golden record: most complete row from each cluster
-    best_idx = []
-    for pid, grp in df_out.groupby("person_id"):
-        best = max(grp.index, key=lambda i: completeness_score(recs[i]))
-        best_idx.append(best)
-    df_merged = df_out.loc[sorted(best_idx)].copy()
-
-    # Write results
+    # Write results: ALL rows, with the new Unique ID column. No merged sheet.
     print(f"Writing {OUTPUT_XLSX} ...")
     with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl") as xl:
-        _write_sheet(xl, "Merged", df_merged)                 # one row per person
-        _write_sheet(xl, "Clusters",
-                     df_out.sort_values(["cluster_size", "person_id"],
+        _write_sheet(xl, "Data with Unique ID",
+                     df_out.sort_values(["Duplicate Count", "Unique ID"],
                                         ascending=[False, True]))
     print(f"Done -> {OUTPUT_XLSX}")
     print("Reminder: save the output to the secured Global Insider folder, "
