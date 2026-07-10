@@ -26,7 +26,12 @@ import sys
 import time
 from pathlib import Path
 
-DELIMITER = "þ\x14þ"
+# Concordance/Relativity load-file delimiters:
+#   \x14 (DC4, ASCII 20) = column separator  <-- what we split on
+#   þ    (thorn, \xFE)   = text qualifier wrapping each field, stripped per-field
+# Splitting on the DC4 separator alone (not "þ\x14þ") is robust: it still works
+# even if the thorn byte is dropped during decoding (ANSI-exported files).
+DELIMITER = "\x14"
 
 # ---- data-type inference patterns ----
 INT_RE = re.compile(r"^-?\d+$")
