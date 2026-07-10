@@ -1,56 +1,58 @@
 """
 ============================================================
 260710 pd ds merge data.py
-Person de-duplication / merge for [cng_db].[dbo].[cng_dedup]
+Assign a person Unique ID to an Excel file (Data_01.xlsx).
 
-Reads First/Middle/Last/Suffix, Full DOB (MM/DD/YYYY) and SSN, groups
-records that represent the SAME PERSON into clusters (a person_id), and
-writes:
-    Sheet "Clusters" -> every input row + person_id + why it matched
-    Sheet "Merged"   -> one "golden" (most complete) row per person
+INPUT  : an Excel workbook with these columns:
+         First Name, Middle Name, Last Name, Suffix,
+         Date of Birth, Social Security Number
+OUTPUT : a new Excel workbook = ALL rows kept, with a new "Unique ID"
+         column where the SAME PERSON gets the SAME id.  No rows are
+         merged or deleted.
+
+Unique ID format: 3 letters + 4-digit number  ->  AAA1000, AAA1001, ...
+
+The script first drops EXACT duplicate rows (your SELECT DISTINCT step),
+then assigns ids.  Rows that are the same person but not identical
+(Sajan vs Saj, "H" vs "Harish", suffix present/absent) share one id via
+the rules below.
 
 Matching rules (a pair of rows is the same person if ANY hold):
-    R1  Same SSN (both present, equal)               -> same, even if names differ
+    R1  Same SSN -- but only if the names do NOT conflict
+        (Didar Singh vs Harish Singh on one SSN stay separate)
     R2  Same fuzzy name + SSN present on one, blank on other
     R3  Same fuzzy name + one has DOB, other has SSN
     R4  Same fuzzy name (First+Middle+Last+Suffix)
     R6  Middle initial vs full ("H" / "Harish"), rest of name equal
-    (R5 = same SSN with/without suffix -> already covered by R1)
+Guards: identical name but DIFFERENT SSN or DIFFERENT DOB -> NOT merged.
 
 "Fuzzy name" = Last equal AND First equal-or-prefix (min 3 chars) AND
                Middle equal-or-blank-or-prefix AND Suffix equal-or-blank.
+Clustering is TRANSITIVE (union-find).
 
-Clustering is TRANSITIVE via union-find: A~B by SSN and B~C by name+DOB
-puts A, B and C in one person.
-
-READ-ONLY: the source table is never modified. Output goes to a workbook
-you save in the secured Global Insider folder (never the desktop).
+The input file is never modified. Save the output to the secured Global
+Insider folder (never the desktop) -- it contains SSN/DOB.
 
 Install once:
-    pip install pyodbc pandas openpyxl
+    pip install pandas openpyxl
 
 Run:
-    # Windows auth (default). For SQL login:  $env:SQL_PASSWORD = 'your_sa_password'
     python "260710 pd ds merge data.py"
 ============================================================
 """
 
-import os
-import re
 import sys
+import re
 import pandas as pd
-import pyodbc
 
 # ------------------------------------------------------------
-# 1) CONFIG  - edit these to match your environment
+# 1) CONFIG  - edit these to match your files
 # ------------------------------------------------------------
-SERVER   = r"prdenvfdevm-3\MSSQLSERVER01"   # same instance style as your other scripts
-DATABASE = "cng_db"
-SCHEMA   = "dbo"
-TABLE    = "cng_dedup"
-DRIVER   = "ODBC Driver 17 for SQL Server"
+INPUT_XLSX  = "Data_01.xlsx"     # input workbook (same folder as this script)
+INPUT_SHEET = 0                  # sheet name or 0 for the first sheet
+OUTPUT_XLSX = "260710 re ds data with unique id.xlsx"
 
-# Column names exactly as they appear in the table
+# Column names exactly as they appear in the header row
 COL_FIRST  = "First Name"
 COL_LAST   = "Last Name"
 COL_MIDDLE = "Middle Name"
@@ -60,51 +62,7 @@ COL_SSN    = "Social Security Number"
 
 # Tuning knobs
 FIRST_MIN_PREFIX = 3      # "Saj" (>=3) counts as a prefix of "Sajan"; "Jo" would not
-
-OUTPUT_XLSX = "260710 re ds merge data results.xlsx"
 EXCEL_MAX_ROWS = 1_048_576
-
-# ------------------------------------------------------------
-# 2) AUTH - Windows auth first, SQL login (sa) fallback
-#    (mirrors your dat_to_sqlserver.py / excel export.py)
-# ------------------------------------------------------------
-USE_WINDOWS_AUTH = True
-SQL_USER = "sa"
-SQL_PASSWORD = os.environ.get("SQL_PASSWORD", "")   # never hard-code a real password
-
-_base = f"DRIVER={{{DRIVER}}};SERVER={SERVER};DATABASE={DATABASE};"
-CONN_WINDOWS = _base + "Trusted_Connection=yes;"
-CONN_SQL = _base + f"UID={SQL_USER};PWD={SQL_PASSWORD};"
-
-
-def connect():
-    attempts = []
-    if USE_WINDOWS_AUTH:
-        attempts.append(("Windows auth", CONN_WINDOWS))
-    if SQL_PASSWORD:
-        attempts.append((f"SQL login ({SQL_USER})", CONN_SQL))
-    if not attempts:
-        raise SystemExit(
-            "No usable auth. Keep USE_WINDOWS_AUTH = True, or set the password:\n"
-            "  $env:SQL_PASSWORD = 'yourSApassword'  then re-run."
-        )
-    last_err = None
-    for label, conn_str in attempts:
-        try:
-            print(f"Trying {label} ...")
-            return pyodbc.connect(conn_str)
-        except pyodbc.Error as exc:
-            last_err = exc
-            print(f"  {label} failed: {exc.args[1] if len(exc.args) > 1 else exc}")
-    raise SystemExit(f"\nCould not connect. Last error:\n  {last_err}")
-
-
-def q(name: str) -> str:
-    """Safely bracket-quote an identifier."""
-    return "[" + name.replace("]", "]]") + "]"
-
-
-FULL_TABLE = f"{q(SCHEMA)}.{q(TABLE)}"
 
 
 # ------------------------------------------------------------
@@ -340,21 +298,28 @@ def make_uid(seq: int) -> str:
 # ------------------------------------------------------------
 # 8) Main
 # ------------------------------------------------------------
+EXPECTED_COLS = [COL_FIRST, COL_MIDDLE, COL_LAST, COL_SUFFIX, COL_DOB, COL_SSN]
+
+
 def main() -> None:
-    print(f"Connecting to {SERVER} / {DATABASE} ...")
-    with connect() as conn:
-        # DISTINCT collapses exact duplicates first (30k -> ~10k), matching the
-        # SELECT DISTINCT step you already run; the fuzzy rules below then
-        # catch the NEAR-duplicates that DISTINCT cannot (Sajan vs Saj, etc.).
-        sql = (
-            f"SELECT DISTINCT {q(COL_FIRST)}, {q(COL_LAST)}, {q(COL_MIDDLE)}, "
-            f"{q(COL_SUFFIX)}, {q(COL_DOB)}, {q(COL_SSN)} FROM {FULL_TABLE}"
+    print(f"Reading {INPUT_XLSX} ...")
+    df = pd.read_excel(INPUT_XLSX, sheet_name=INPUT_SHEET, dtype=str)
+    df.columns = [str(c).strip() for c in df.columns]   # tidy header whitespace
+
+    missing = [c for c in EXPECTED_COLS if c not in df.columns]
+    if missing:
+        raise SystemExit(
+            f"These expected columns were not found in {INPUT_XLSX}:\n"
+            f"  {missing}\nColumns present:\n  {list(df.columns)}\n"
+            "Fix the COL_* names in the CONFIG block to match your header row."
         )
-        print("Reading rows (SELECT DISTINCT) ...")
-        df = pd.read_sql(sql, conn)
     print(f"  {len(df):,} rows read.")
 
-    df = df.reset_index(drop=True)
+    # Drop EXACT duplicate rows first (your SELECT DISTINCT step). The fuzzy
+    # rules below then catch the NEAR-duplicates DISTINCT cannot (Sajan vs Saj).
+    before = len(df)
+    df = df.drop_duplicates(subset=EXPECTED_COLS).reset_index(drop=True)
+    print(f"  {before - len(df):,} exact-duplicate rows removed -> {len(df):,} rows.")
     recs = build_records(df)
     uf = UnionFind(len(recs))
     reasons = [set() for _ in recs]
