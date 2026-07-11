@@ -49,9 +49,9 @@ COL_DOB    = "Full Date of Birth (MM/DD/YYYY)"
 COL_SSN    = "Social Security Number"
 
 # PII fields used for Rule 3 (matching PII overrides a blank/"[Unknown]" name)
-COL_DL      = "Driver's License Number"
+COL_DL       = "Driver's License Number"
 COL_PASSPORT = "Passport Number"
-COL_GOVID   = "Government-Issued ID Number"
+COL_GOVID    = "Government-Issued ID Number"
 
 # Every other column in the sheet - these get semicolon-merged as-is.
 # Edit this list if your real headers differ.
@@ -118,7 +118,7 @@ SSN_PLACEHOLDERS = {
 def norm_text(v) -> str:
     if v is None:
         return ""
-    s = str(v).replace(" ", " ")
+    s = str(v).replace(" ", " ")
     s = re.sub(r"\s+", " ", s).strip().upper()
     return "" if s.lower() in ("nan", "none", "null") else s
 
@@ -166,7 +166,47 @@ def norm_pii(v) -> str:
 
 
 # ------------------------------------------------------------
-# 3) Pairwise matching rules (Base + Rules 1-9 from the summary doc)
+# 3) Record type - __slots__ for fast attribute access at scale
+#    (this loop runs millions of times, so dict-key lookups add up)
+# ------------------------------------------------------------
+class Rec:
+    __slots__ = ("idx", "first", "last", "mid", "suf", "dob", "dob_raw",
+                 "ssn", "dl", "passport", "govid")
+
+    def __init__(self, idx):
+        self.idx = idx
+
+
+def build_records(df: pd.DataFrame):
+    """df MUST already have a 0..n-1 RangeIndex (see main()) - idx doubles
+    as the record's position, so no separate index->position map is needed.
+    Uses positional numpy-array access (df.values) rather than itertuples(),
+    since itertuples() mangles column names with spaces/punctuation."""
+    recs = []
+    col_pos = {c: p for p, c in enumerate(df.columns)}
+    values = df.values  # numpy object array, fast positional access
+    fi, la, mi, su, do, ss = (col_pos[COL_FIRST], col_pos[COL_LAST], col_pos[COL_MIDDLE],
+                              col_pos[COL_SUFFIX], col_pos[COL_DOB], col_pos[COL_SSN])
+    dl, pp, gv = col_pos[COL_DL], col_pos[COL_PASSPORT], col_pos[COL_GOVID]
+    for i in range(len(df)):
+        row = values[i]
+        r = Rec(i)
+        r.first = norm_name(row[fi])
+        r.last = norm_name(row[la])
+        r.mid = norm_name(row[mi])
+        r.suf = norm_suffix(row[su])
+        r.dob_raw = row[do]
+        r.dob = norm_dob(row[do])
+        r.ssn = norm_ssn(row[ss])
+        r.dl = norm_pii(row[dl])
+        r.passport = norm_pii(row[pp])
+        r.govid = norm_pii(row[gv])
+        recs.append(r)
+    return recs
+
+
+# ------------------------------------------------------------
+# 4) Pairwise matching rules (Base + Rules 1-9 from the summary doc)
 # ------------------------------------------------------------
 def first_compat(a: str, b: str) -> bool:
     """Exact, or one is a prefix of the other (covers 'H'->'Harish' and
@@ -199,34 +239,41 @@ def middle_compat(a: str, b: str) -> bool:
     return long_.startswith(short)
 
 
-def name_match(r1, r2) -> bool:
+def name_match(r1: Rec, r2: Rec) -> bool:
     return (
-        r1["last"] and r2["last"] and last_compat(r1["last"], r2["last"])
-        and first_compat(r1["first"], r2["first"])
-        and middle_compat(r1["mid"], r2["mid"])
+        r1.last and r2.last and last_compat(r1.last, r2.last)
+        and first_compat(r1.first, r2.first)
+        and middle_compat(r1.mid, r2.mid)
     )
 
 
-def suffix_conflict(r1, r2) -> bool:
+def suffix_conflict(r1: Rec, r2: Rec) -> bool:
     """Rule 8: a real, differing suffix blocks EVERY rule below, even the
     base SSN+DOB match. Rule 9 (blank vs. a real suffix) is NOT a conflict."""
-    return bool(r1["suf"]) and bool(r2["suf"]) and r1["suf"] != r2["suf"]
+    return bool(r1.suf) and bool(r2.suf) and r1.suf != r2.suf
 
 
-def pii_match(r1, r2) -> bool:
+def ssn_conflict(r1: Rec, r2: Rec) -> bool:
+    """Two DIFFERENT real SSNs must never be merged, even if a fuzzy name
+    and a matching DOB (Rules 4-7) would otherwise corroborate the pair.
+    A blank SSN on either side is not a conflict (Rule 2 still applies)."""
+    return bool(r1.ssn) and bool(r2.ssn) and r1.ssn != r2.ssn
+
+
+def pii_match(r1: Rec, r2: Rec) -> bool:
     return (
-        (r1["dl"] and r1["dl"] == r2["dl"])
-        or (r1["passport"] and r1["passport"] == r2["passport"])
-        or (r1["govid"] and r1["govid"] == r2["govid"])
+        (r1.dl and r1.dl == r2.dl)
+        or (r1.passport and r1.passport == r2.passport)
+        or (r1.govid and r1.govid == r2.govid)
     )
 
 
-def is_match(r1, r2) -> bool:
-    if suffix_conflict(r1, r2):
+def is_match(r1: Rec, r2: Rec) -> bool:
+    if suffix_conflict(r1, r2) or ssn_conflict(r1, r2):
         return False
 
-    ssn_same = bool(r1["ssn"]) and r1["ssn"] == r2["ssn"]
-    dob_same = bool(r1["dob"]) and r1["dob"] == r2["dob"]
+    ssn_same = bool(r1.ssn) and r1.ssn == r2.ssn
+    dob_same = bool(r1.dob) and r1.dob == r2.dob
 
     if ssn_same and dob_same:                      # Base rule
         return True
@@ -239,16 +286,16 @@ def is_match(r1, r2) -> bool:
 
     # Rule 2: same exact name, complementary SSN/DOB (one has SSN only,
     # the other DOB only)
-    if r1["first"] and r1["first"] == r2["first"] and r1["last"] and r1["last"] == r2["last"]:
-        ssn_complementary = bool(r1["ssn"]) != bool(r2["ssn"])
-        dob_complementary = bool(r1["dob"]) != bool(r2["dob"])
+    if r1.first and r1.first == r2.first and r1.last and r1.last == r2.last:
+        ssn_complementary = bool(r1.ssn) != bool(r2.ssn)
+        dob_complementary = bool(r1.dob) != bool(r2.dob)
         if ssn_complementary and dob_complementary:
             return True
 
     # Rule 3: matching PII, one side's name is entirely blank/"[Unknown]"
     if pii_match(r1, r2):
-        r1_blank = not r1["first"] and not r1["last"]
-        r2_blank = not r2["first"] and not r2["last"]
+        r1_blank = not r1.first and not r1.last
+        r2_blank = not r2.first and not r2.last
         if r1_blank != r2_blank:
             return True
 
@@ -256,7 +303,7 @@ def is_match(r1, r2) -> bool:
 
 
 # ------------------------------------------------------------
-# 4) Union-Find (disjoint set) for transitive clustering
+# 5) Union-Find (disjoint set) for transitive clustering
 # ------------------------------------------------------------
 class UnionFind:
     def __init__(self, n):
@@ -275,44 +322,26 @@ class UnionFind:
 
 
 # ------------------------------------------------------------
-# 5) Blocking - only test pairs that already share something exact, so we
-#    never do a full N x N comparison. Candidate pairs come from three
+# 6) Blocking - only test pairs that already share something exact, so we
+#    never do a full N x N comparison. Candidate pairs come from five
 #    cheap buckets; is_match() then applies the real rules within each.
 # ------------------------------------------------------------
 MAX_BUCKET_SIZE = 300   # safety valve: skip pairwise test inside a bucket
 
 
-def build_records(df: pd.DataFrame):
-    recs = []
-    for i, row in df.iterrows():
-        recs.append({
-            "idx":      i,
-            "first":    norm_name(row[COL_FIRST]),
-            "last":     norm_name(row[COL_LAST]),
-            "mid":      norm_name(row[COL_MIDDLE]),
-            "suf":      norm_suffix(row[COL_SUFFIX]),
-            "dob":      norm_dob(row[COL_DOB]),
-            "ssn":      norm_ssn(row[COL_SSN]),
-            "dl":       norm_pii(row[COL_DL]),
-            "passport": norm_pii(row[COL_PASSPORT]),
-            "govid":    norm_pii(row[COL_GOVID]),
-        })
-    return recs
-
-
 def bucket_candidate_pairs(recs):
     buckets = defaultdict(list)
     for r in recs:
-        if r["ssn"]:
-            buckets[("ssn", r["ssn"])].append(r["idx"])
-        if r["last"] and r["first"]:
-            buckets[("name", r["last"], r["first"][0])].append(r["idx"])
-        if r["dl"]:
-            buckets[("dl", r["dl"])].append(r["idx"])
-        if r["passport"]:
-            buckets[("passport", r["passport"])].append(r["idx"])
-        if r["govid"]:
-            buckets[("govid", r["govid"])].append(r["idx"])
+        if r.ssn:
+            buckets[("ssn", r.ssn)].append(r.idx)
+        if r.last and r.first:
+            buckets[("name", r.last, r.first[0])].append(r.idx)
+        if r.dl:
+            buckets[("dl", r.dl)].append(r.idx)
+        if r.passport:
+            buckets[("passport", r.passport)].append(r.idx)
+        if r.govid:
+            buckets[("govid", r.govid)].append(r.idx)
 
     pairs = set()
     skipped = 0
@@ -321,7 +350,7 @@ def bucket_candidate_pairs(recs):
             continue
         if len(idxs) > MAX_BUCKET_SIZE:
             skipped += 1
-            print(f"  WARNING: bucket {key[:1]}... has {len(idxs):,} rows "
+            print(f"  WARNING: bucket {key[:2]}... has {len(idxs):,} rows "
                   f"(> {MAX_BUCKET_SIZE}) - skipping exhaustive compare, "
                   f"likely a junk/shared value. Review manually.")
             continue
@@ -333,7 +362,7 @@ def bucket_candidate_pairs(recs):
 
 
 # ------------------------------------------------------------
-# 6) Merge helpers for building the output
+# 7) Merge helpers for building the output
 # ------------------------------------------------------------
 def semicolon_merge(values) -> str:
     """Distinct, non-blank values joined with '; ', first-seen order,
@@ -352,24 +381,24 @@ def semicolon_merge(values) -> str:
 
 def fullest_value(values, norm_values) -> str:
     """Longest non-blank/non-placeholder value (Rules 4/5/6/7/9)."""
-    best, best_norm_len = "", -1
+    best, best_len = "", -1
     for raw, norm in zip(values, norm_values):
         if not norm:
             continue
-        raw = str(raw).strip()
-        if len(raw) > best_norm_len:
-            best, best_norm_len = raw, len(raw)
+        raw = "" if raw is None else str(raw).strip()
+        if len(raw) > best_len:
+            best, best_len = raw, len(raw)
     return best
 
 
-def majority_dob(rows) -> str:
+def majority_dob(sub_recs) -> str:
     """Rule 1: most frequent normalized DOB wins; '' if none present."""
     counts = defaultdict(int)
     raw_for = {}
-    for r in rows:
-        if r["dob"]:
-            counts[r["dob"]] += 1
-            raw_for.setdefault(r["dob"], r["dob_raw"])
+    for r in sub_recs:
+        if r.dob:
+            counts[r.dob] += 1
+            raw_for.setdefault(r.dob, r.dob_raw)
     if not counts:
         return ""
     best = max(counts.items(), key=lambda kv: (kv[1], kv[0]))[0]
@@ -377,12 +406,13 @@ def majority_dob(rows) -> str:
 
 
 # ------------------------------------------------------------
-# 7) Main
+# 8) Main
 # ------------------------------------------------------------
 def main() -> None:
     print(f"Reading {INPUT_XLSX} ...")
     df = pd.read_excel(INPUT_XLSX, sheet_name=INPUT_SHEET, dtype=str)
     df.columns = [str(c).strip() for c in df.columns]
+    df = df.reset_index(drop=True)   # guarantees row position == record idx
 
     missing = [c for c in EXPECTED_COLS if c not in df.columns]
     if missing:
@@ -393,49 +423,48 @@ def main() -> None:
         )
     print(f"  {len(df):,} rows read.")
 
-    recs = build_records(df)
-    for r in recs:
-        r["dob_raw"] = df.loc[r["idx"], COL_DOB]
-
-    # UnionFind is positional (0..n-1); map DataFrame index -> position
-    uf = UnionFind(len(recs))
-    pos_of = {r["idx"]: i for i, r in enumerate(recs)}
-    recs_by_pos = recs
-
-    def is_match_pos(a_idx, b_idx):
-        return is_match(recs_by_pos[pos_of[a_idx]], recs_by_pos[pos_of[b_idx]])
+    recs = build_records(df)   # recs[i].idx == i == df row position
 
     print("Clustering (blocked comparison) ...")
     pairs = bucket_candidate_pairs(recs)
     print(f"  {len(pairs):,} candidate pairs to test.")
+
+    uf = UnionFind(len(recs))
+    tested = 0
     for a_idx, b_idx in pairs:
-        if is_match_pos(a_idx, b_idx):
-            uf.union(pos_of[a_idx], pos_of[b_idx])
+        if is_match(recs[a_idx], recs[b_idx]):
+            uf.union(a_idx, b_idx)
+        tested += 1
+        if tested % 1_000_000 == 0:
+            print(f"  ... {tested:,} / {len(pairs):,} pairs tested")
 
     groups = defaultdict(list)
     for r in recs:
-        groups[uf.find(pos_of[r["idx"]])].append(r["idx"])
+        groups[uf.find(r.idx)].append(r.idx)
 
     print(f"  {len(df):,} rows -> {len(groups):,} merged people "
           f"({len(df) - len(groups):,} rows collapsed by a match).")
 
+    print("Building merged output ...")
     out_rows = []
-    for root, idxs in groups.items():
-        sub = df.loc[idxs]
-        sub_recs = [r for r in recs if r["idx"] in idxs]
+    for group_idxs in groups.values():
+        sub = df.iloc[group_idxs]                       # O(group size), not O(n)
+        sub_recs = [recs[i] for i in group_idxs]         # O(group size), not O(n)
 
         row = {
             COL_DOCID: semicolon_merge(sub[COL_DOCID]),
-            COL_FIRST: fullest_value(sub[COL_FIRST], [r["first"] for r in sub_recs]),
-            COL_LAST:  fullest_value(sub[COL_LAST],  [r["last"] for r in sub_recs]),
-            COL_MIDDLE: fullest_value(sub[COL_MIDDLE], [r["mid"] for r in sub_recs]),
-            COL_SUFFIX: fullest_value(sub[COL_SUFFIX], [r["suf"] for r in sub_recs]),
+            COL_FIRST: fullest_value(sub[COL_FIRST], [r.first for r in sub_recs]),
+            COL_LAST:  fullest_value(sub[COL_LAST],  [r.last for r in sub_recs]),
+            COL_MIDDLE: fullest_value(sub[COL_MIDDLE], [r.mid for r in sub_recs]),
+            COL_SUFFIX: fullest_value(sub[COL_SUFFIX], [r.suf for r in sub_recs]),
             COL_DOB: majority_dob(sub_recs),
-            COL_SSN: semicolon_merge(sub[COL_SSN]),
+            # A single value, not semicolon-joined: the ssn_conflict guard in
+            # is_match() guarantees every real SSN in this group is identical.
+            COL_SSN: fullest_value(sub[COL_SSN], [r.ssn for r in sub_recs]),
         }
         for c in OTHER_MERGE_COLS:
             row[c] = semicolon_merge(sub[c])
-        row["Rows Merged"] = len(idxs)
+        row["Rows Merged"] = len(group_idxs)
         row["Names Differ"] = ";" in row[COL_FIRST] or ";" in row[COL_LAST]
         out_rows.append(row)
 

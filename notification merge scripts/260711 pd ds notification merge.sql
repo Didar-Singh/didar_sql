@@ -147,6 +147,10 @@ JOIN #base b ON b.row_id > a.row_id
 WHERE
     -- Rule 8: a real, differing suffix on both sides blocks any merge
     NOT (a.n_suffix <> '' AND b.n_suffix <> '' AND a.n_suffix <> b.n_suffix)
+    -- Two DIFFERENT real SSNs must never be merged, even when a fuzzy name +
+    -- matching DOB (Rules 4-7) would otherwise corroborate the pair. A blank
+    -- SSN on either side is not a conflict (Rule 2 still applies).
+    AND NOT (a.n_ssn IS NOT NULL AND b.n_ssn IS NOT NULL AND a.n_ssn <> b.n_ssn)
 AND (
     -- Base rule: SSN + DOB both present and match exactly (name irrelevant)
     (a.n_ssn IS NOT NULL AND a.n_ssn = b.n_ssn AND a.n_dob IS NOT NULL AND a.n_dob = b.n_dob)
@@ -271,10 +275,11 @@ SELECT
      GROUP BY b.n_dob
      ORDER BY COUNT(*) DESC, b.n_dob DESC) AS [Date of Birth],
 
-    (SELECT STRING_AGG(v, '; ') WITHIN GROUP (ORDER BY v)
-     FROM (SELECT DISTINCT LTRIM(RTRIM(b.[Social Security Number])) AS v FROM #base b
-           WHERE b.grp = g.grp AND NULLIF(LTRIM(RTRIM(b.[Social Security Number])), '') IS NOT NULL) d
-    ) AS [Social Security Number],
+    -- A single value, not semicolon-joined: the SSN-conflict guard above
+    -- guarantees every real SSN in this group is identical.
+    (SELECT TOP 1 LTRIM(RTRIM(b.[Social Security Number])) FROM #base b
+     WHERE b.grp = g.grp AND NULLIF(LTRIM(RTRIM(b.[Social Security Number])), '') IS NOT NULL
+     ORDER BY LEN(LTRIM(RTRIM(b.[Social Security Number]))) DESC) AS [Social Security Number],
 
     (SELECT STRING_AGG(v, '; ') WITHIN GROUP (ORDER BY v)
      FROM (SELECT DISTINCT LTRIM(RTRIM(b.[Data Subject Type])) AS v FROM #base b
