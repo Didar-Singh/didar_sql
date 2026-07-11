@@ -151,6 +151,24 @@ WHERE
     -- matching DOB (Rules 4-7) would otherwise corroborate the pair. A blank
     -- SSN on either side is not a conflict (Rule 2 still applies).
     AND NOT (a.n_ssn IS NOT NULL AND b.n_ssn IS NOT NULL AND a.n_ssn <> b.n_ssn)
+    -- Two genuinely different names (both sides have a real first+last name,
+    -- and they don't even loosely match - not a typo/prefix/initial) block
+    -- EVERY rule, including the Base rule. A matching SSN+DOB alongside a
+    -- real name conflict usually means a fake/reused/incorrect SSN, not
+    -- confirmation of the same person.
+    AND NOT (
+        a.n_first <> '' AND a.n_last <> '' AND b.n_first <> '' AND b.n_last <> ''
+        AND NOT (
+            (a.n_last = b.n_last
+                 OR (LEN(a.n_last) >= 3 AND b.n_last LIKE a.n_last + '%')
+                 OR (LEN(b.n_last) >= 3 AND a.n_last LIKE b.n_last + '%'))
+            AND (a.n_first = b.n_first
+                 OR (LEN(a.n_first) >= 1 AND b.n_first LIKE a.n_first + '%')
+                 OR (LEN(b.n_first) >= 1 AND a.n_first LIKE b.n_first + '%'))
+            AND (a.n_middle = b.n_middle OR a.n_middle = '' OR b.n_middle = ''
+                 OR b.n_middle LIKE a.n_middle + '%' OR a.n_middle LIKE b.n_middle + '%')
+        )
+    )
 AND (
     -- Base rule: SSN + DOB both present and match exactly (name irrelevant)
     (a.n_ssn IS NOT NULL AND a.n_ssn = b.n_ssn AND a.n_dob IS NOT NULL AND a.n_dob = b.n_dob)
@@ -460,3 +478,28 @@ AND (
         AND ((a.n_ssn IS NOT NULL AND a.n_ssn = b.n_ssn) OR (a.n_dob IS NOT NULL AND a.n_dob = b.n_dob))
        )
 );
+
+-------------------------------------------------------------------
+-- 6) Name-conflict review list: row pairs that share an SSN + DOB match
+--    (the Base rule) but have two genuinely different, non-typo names.
+--    This usually signals a fake/reused/incorrect SSN rather than the
+--    same person - NOT merged above; review manually.
+-------------------------------------------------------------------
+SELECT
+    a.[DOCIDs] AS [DOCID A], a.[First Name] AS [First Name A], a.[Last Name] AS [Last Name A], a.[Social Security Number] AS [SSN A],
+    b.[DOCIDs] AS [DOCID B], b.[First Name] AS [First Name B], b.[Last Name] AS [Last Name B], b.[Social Security Number] AS [SSN B]
+FROM #base a
+JOIN #base b ON b.row_id > a.row_id
+WHERE a.n_ssn IS NOT NULL AND a.n_ssn = b.n_ssn
+  AND a.n_dob IS NOT NULL AND a.n_dob = b.n_dob
+  AND a.n_first <> '' AND a.n_last <> '' AND b.n_first <> '' AND b.n_last <> ''
+  AND NOT (
+      (a.n_last = b.n_last
+           OR (LEN(a.n_last) >= 3 AND b.n_last LIKE a.n_last + '%')
+           OR (LEN(b.n_last) >= 3 AND a.n_last LIKE b.n_last + '%'))
+      AND (a.n_first = b.n_first
+           OR (LEN(a.n_first) >= 1 AND b.n_first LIKE a.n_first + '%')
+           OR (LEN(b.n_first) >= 1 AND a.n_first LIKE b.n_first + '%'))
+      AND (a.n_middle = b.n_middle OR a.n_middle = '' OR b.n_middle = ''
+           OR b.n_middle LIKE a.n_middle + '%' OR a.n_middle LIKE b.n_middle + '%')
+  );

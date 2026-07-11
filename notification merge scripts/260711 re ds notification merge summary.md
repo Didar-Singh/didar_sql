@@ -8,7 +8,7 @@ and confirmed first.
 
 | # | Condition | Result |
 |---|---|---|
-| Base | SSN matches **and** DOB matches (name not considered) | Merge |
+| Base | SSN matches **and** DOB matches, and the names don't genuinely conflict | Merge |
 | 1 | Same SSN, matching name (exact or typo), DOB differs | Merge; use the majority (most frequent) DOB |
 | 2 | Same name, one row has DOB only / other has SSN only, no conflict | Merge (complementary data) |
 | 3 | Matching PII (e.g. Driver's License/Passport/other gov ID), one row's name is "[Unknown]" | Merge; real name supersedes "[Unknown]" |
@@ -18,6 +18,8 @@ and confirmed first.
 | 7 | Middle name blank, an initial, or misspelled on one row; first/last/SSN/DOB otherwise match | Merge; fullest middle name spelling kept |
 | 8 | Suffix conflicts (e.g. Jr vs. Sr, II vs. III), even if SSN/DOB/PII otherwise match | **Do not merge** — flag for manual review |
 | 9 | Any suffix (Jr, Sr, II, III, IV, etc.) present on one row, blank on the other, everything else matches | Merge; non-blank suffix kept |
+| 10 | Two different real SSNs, even if a similar name + matching DOB would otherwise corroborate (Rules 4–7) | **Do not merge** — different SSNs can never belong to one merged record |
+| 11 | SSN and DOB both match, but the two names are genuinely different (not a typo/prefix/initial) | **Do not merge** — flag for manual review (likely a fake/reused/incorrect SSN) |
 | — | SSN or DOB differs (even if name is identical) | **Do not merge** — different person |
 | — | No matching SSN+DOB and none of rules 1–7 apply | **Do not merge** — stays a separate row |
 
@@ -183,6 +185,28 @@ same as the middle-name-blank case, and the non-blank suffix is kept.
 Note rule 8 still applies whenever **both** rows have a real, differing
 suffix (Jr vs. Sr, II vs. III, Sr vs. IV, etc.) — that combination blocks the
 merge. Rule 9 only covers the case where one side is blank.
+
+**10. Two different real SSNs are never merged into the same person**, even
+when a similar name and a matching DOB would otherwise be enough (Rules
+4–7). SSN is the strongest identifier — if it genuinely disagrees, the rows
+stay separate no matter what else lines up.
+
+**11. SSN and DOB both match, but the two names are genuinely different —
+not a typo, not an initial, not a shortened spelling.** This is **not**
+merged, even though it satisfies the Base rule. A matching SSN+DOB paired
+with two unrelated real names usually means the SSN is fake, reused, or was
+entered incorrectly on one of the records — not that the records describe
+the same person. These pairs are flagged for manual review instead of being
+silently merged (or silently having one name overwrite the other).
+
+| First Name | Last Name | SSN | DOB |
+|---|---|---|---|
+| Ravi | Kumar | 123-45-6789 | 01/02/1980 |
+| Sunita | Devi | 123-45-6789 | 01/02/1980 |
+
+→ **Not merged** — flagged for review. "Ravi Kumar" and "Sunita Devi" are not
+name variants of each other, so a shared SSN+DOB here is a data-quality flag,
+not a same-person confirmation.
 
 ## What counts as a "different person"
 

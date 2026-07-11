@@ -260,6 +260,17 @@ def ssn_conflict(r1: Rec, r2: Rec) -> bool:
     return bool(r1.ssn) and bool(r2.ssn) and r1.ssn != r2.ssn
 
 
+def name_conflict(r1: Rec, r2: Rec) -> bool:
+    """True when BOTH rows have a real first+last name and they don't even
+    weakly match (not exact, not a typo/prefix, not an initial) - i.e. two
+    genuinely different names. A matching SSN+DOB alongside a real name
+    conflict usually means a fake/reused/incorrect SSN, not the same
+    person - so this blocks the Base rule too, not just the fuzzy rules."""
+    if not (r1.first and r1.last and r2.first and r2.last):
+        return False
+    return not name_match(r1, r2)
+
+
 def pii_match(r1: Rec, r2: Rec) -> bool:
     return (
         (r1.dl and r1.dl == r2.dl)
@@ -269,7 +280,7 @@ def pii_match(r1: Rec, r2: Rec) -> bool:
 
 
 def is_match(r1: Rec, r2: Rec) -> bool:
-    if suffix_conflict(r1, r2) or ssn_conflict(r1, r2):
+    if suffix_conflict(r1, r2) or ssn_conflict(r1, r2) or name_conflict(r1, r2):
         return False
 
     ssn_same = bool(r1.ssn) and r1.ssn == r2.ssn
@@ -430,10 +441,19 @@ def main() -> None:
     print(f"  {len(pairs):,} candidate pairs to test.")
 
     uf = UnionFind(len(recs))
+    # SSN+DOB matched but the names are genuinely conflicting (Rule 8/name-
+    # conflict guard blocked it) - surfaced for manual review, not silently
+    # merged or silently dropped.
+    name_conflict_review = []
     tested = 0
     for a_idx, b_idx in pairs:
-        if is_match(recs[a_idx], recs[b_idx]):
+        r1, r2 = recs[a_idx], recs[b_idx]
+        if is_match(r1, r2):
             uf.union(a_idx, b_idx)
+        elif (bool(r1.ssn) and r1.ssn == r2.ssn
+              and bool(r1.dob) and r1.dob == r2.dob
+              and name_conflict(r1, r2)):
+            name_conflict_review.append((a_idx, b_idx))
         tested += 1
         if tested % 1_000_000 == 0:
             print(f"  ... {tested:,} / {len(pairs):,} pairs tested")
@@ -444,6 +464,10 @@ def main() -> None:
 
     print(f"  {len(df):,} rows -> {len(groups):,} merged people "
           f"({len(df) - len(groups):,} rows collapsed by a match).")
+    if name_conflict_review:
+        print(f"  WARNING: {len(name_conflict_review):,} row pair(s) share an "
+              f"SSN+DOB but have conflicting names - NOT merged, flagged for "
+              f"manual review (see the 'Name Conflict Review' sheet).")
 
     print("Building merged output ...")
     out_rows = []
@@ -482,22 +506,39 @@ def main() -> None:
         print(df_out.sort_values("Rows Merged", ascending=False).head(10)
               [[COL_FIRST, COL_LAST, COL_SSN, "Rows Merged"]].to_string())
 
+    review_rows = []
+    for a_idx, b_idx in name_conflict_review:
+        ra, rb = recs[a_idx], recs[b_idx]
+        review_rows.append({
+            "DOCID A": df.at[a_idx, COL_DOCID], "First Name A": df.at[a_idx, COL_FIRST],
+            "Last Name A": df.at[a_idx, COL_LAST], "SSN A": df.at[a_idx, COL_SSN],
+            "DOCID B": df.at[b_idx, COL_DOCID], "First Name B": df.at[b_idx, COL_FIRST],
+            "Last Name B": df.at[b_idx, COL_LAST], "SSN B": df.at[b_idx, COL_SSN],
+        })
+    df_review = pd.DataFrame(review_rows)
+
     print(f"Writing {OUTPUT_XLSX} ...")
-    _write_sheet(OUTPUT_XLSX, "Merged Notification Data", df_out)
+    _write_workbook(OUTPUT_XLSX, {
+        "Merged Notification Data": df_out,
+        "Name Conflict Review": df_review,
+    })
     print(f"Done -> {OUTPUT_XLSX}")
     print("Reminder: save the output only to the secured/authorized folder for "
           "this data - never a desktop or personal drive. It contains SSN, "
           "DOB, and other PII/PHI.")
 
 
-def _write_sheet(path, sheet, df):
-    if len(df) > EXCEL_MAX_ROWS:
-        csv_name = path.replace(".xlsx", f" {sheet}.csv")
-        df.to_csv(csv_name, index=False, encoding="utf-8-sig")
-        print(f"  {sheet}: {len(df):,} rows exceed Excel limit -> {csv_name}")
-        return
+def _write_workbook(path, sheets: dict):
     with pd.ExcelWriter(path, engine="openpyxl") as xl:
-        df.to_excel(xl, sheet_name=sheet, index=False)
+        for sheet, df in sheets.items():
+            if len(df) > EXCEL_MAX_ROWS:
+                csv_name = path.replace(".xlsx", f" {sheet}.csv")
+                df.to_csv(csv_name, index=False, encoding="utf-8-sig")
+                print(f"  {sheet}: {len(df):,} rows exceed Excel limit -> {csv_name}")
+                pd.DataFrame({"note": [f"{sheet} exported to {csv_name} (too large)"]}
+                             ).to_excel(xl, sheet_name=sheet, index=False)
+            else:
+                df.to_excel(xl, sheet_name=sheet, index=False)
 
 
 if __name__ == "__main__":
