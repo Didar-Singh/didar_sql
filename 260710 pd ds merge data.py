@@ -132,6 +132,18 @@ def norm_ssn(v) -> str:
     return kept if known >= SSN_MIN_KNOWN_OVERLAP else ""
 
 
+def norm_ssn_raw(v) -> str:
+    """The 9-char SSN pattern AS ENTERED (digits + X), with NO junk filtering.
+    Used only to detect that two rows show DIFFERENT SSNs -- so an invalid /
+    fake SSN on one row still blocks a name-based merge with a differing SSN.
+    Returns '' only when there aren't 9 usable characters."""
+    if v is None:
+        return ""
+    s = str(v).upper().replace("*", "X").replace("#", "X").replace("?", "X")
+    kept = re.sub(r"[^0-9X]", "", s)
+    return kept if len(kept) == 9 else ""
+
+
 def is_junk_ssn(d: str) -> bool:
     """True for a 9-digit SSN that cannot belong to a real, single person:
     invalid per SSA structure, all-same-digit, sequential, or a known fake."""
@@ -180,13 +192,25 @@ def norm_dob(v) -> str:
 # 4) Fuzzy name comparison
 # ------------------------------------------------------------
 def first_match(a: str, b: str) -> bool:
-    """Equal, or one is a prefix of the other (min FIRST_MIN_PREFIX chars)."""
+    """STRONG: equal, or one is a prefix of the other (min FIRST_MIN_PREFIX
+    chars). 'Saj'->'Sajan' yes; 'D'->'Didar' NO (too weak on its own)."""
     if not a or not b:
         return False
     if a == b:
         return True
     short, long = (a, b) if len(a) <= len(b) else (b, a)
     return len(short) >= FIRST_MIN_PREFIX and long.startswith(short)
+
+
+def first_match_initial(a: str, b: str) -> bool:
+    """WEAK: strong match, OR one is a single-letter initial of the other
+    ('D'->'Didar'). Only used where SSN or DOB corroborates the identity."""
+    if first_match(a, b):
+        return True
+    if not a or not b:
+        return False
+    short, long = (a, b) if len(a) <= len(b) else (b, a)
+    return len(short) == 1 and long.startswith(short)
 
 
 def part_match(a: str, b: str) -> bool:
@@ -205,31 +229,44 @@ def suffix_match(a: str, b: str) -> bool:
     return a == b or not a or not b
 
 
-def name_match(r1, r2) -> bool:
-    """Full fuzzy-name equality used by R2/R3/R4/R6."""
+def _name_match(r1, r2, first_fn) -> bool:
     return (
         r1["last"] and r1["last"] == r2["last"]        # last name must be equal
-        and first_match(r1["first"], r2["first"])
+        and first_fn(r1["first"], r2["first"])
         and part_match(r1["mid"], r2["mid"])
         and suffix_match(r1["suf"], r2["suf"])
     )
 
 
+def name_match(r1, r2) -> bool:
+    """STRONG name equality (Saj/Sajan). Used to merge on NAME ALONE."""
+    return _name_match(r1, r2, first_match)
+
+
+def name_match_weak(r1, r2) -> bool:
+    """WEAK name equality that also allows a first-name initial ('D'/'Didar').
+    Only used when SSN or DOB corroborates the identity."""
+    return _name_match(r1, r2, first_match_initial)
+
+
 # ---- conflict guards (added per rule refinement #1) ----
 def name_conflict(r1, r2) -> bool:
-    """True when BOTH rows have a real name and they do NOT fuzzy-match.
-    This stops a shared SSN from merging two clearly different people
-    (Didar Singh vs Harish Singh). A blank name can't conflict."""
+    """True when BOTH rows have a real name and they do NOT even WEAKLY match.
+    Uses the weak rule so 'D Singh' vs 'Didar Singh' is NOT a conflict (and can
+    merge when the SSN/DOB agrees), while 'Didar' vs 'Harish' still conflicts.
+    A blank name can't conflict."""
     if not (r1["last"] and r2["last"] and r1["first"] and r2["first"]):
         return False
-    return not name_match(r1, r2)
+    return not name_match_weak(r1, r2)
 
 
 def ssn_conflict(r1, r2) -> bool:
-    """True only when both SSNs are present and a KNOWN digit disagrees.
-    Masked SSNs whose known digits agree ('123456789' vs '12345XXXX') do NOT
-    conflict; non-overlapping masks are 'unknown', not a conflict."""
-    return bool(r1["ssn"]) and bool(r2["ssn"]) and ssn_cmp(r1["ssn"], r2["ssn"]) == "diff"
+    """True when both rows show an SSN (even an invalid/fake one) and a KNOWN
+    digit disagrees. Uses the RAW SSN so a differing SSN blocks a name merge
+    even if one value was rejected as junk. Masked SSNs whose known digits
+    agree do NOT conflict; non-overlapping masks are 'unknown', not a conflict."""
+    a, b = r1["ssn_raw"], r2["ssn_raw"]
+    return bool(a) and bool(b) and ssn_cmp(a, b) == "diff"
 
 
 def dob_conflict(r1, r2) -> bool:
@@ -289,7 +326,8 @@ def build_records(df: pd.DataFrame):
             "mid":   norm_name(row[COL_MIDDLE]),
             "suf":   norm_name(row[COL_SUFFIX]),
             "dob":   norm_dob(row[COL_DOB]),
-            "ssn":   norm_ssn(row[COL_SSN]),
+            "ssn":   norm_ssn(row[COL_SSN]),         # validated (junk -> '')
+            "ssn_raw": norm_ssn_raw(row[COL_SSN]),   # as entered (for conflicts)
         })
     return recs
 
@@ -300,84 +338,123 @@ def _link(uf, reasons, r1, r2, tag):
     reasons[r2["idx"]].add(tag)
 
 
+def greedy_subclusters(group, match_fn, conflict_fn):
+    """Partition `group` into sub-clusters. A record joins an existing sub only
+    if it POSITIVELY matches at least one member AND conflicts with NONE. This
+    is what stops a blank/ambiguous row from BRIDGING two incompatible people:
+    it can only sit in a sub where it agrees with everyone already there."""
+    subs = []
+    for r in group:
+        target = None
+        for sub in subs:
+            if all(not conflict_fn(r, x) for x in sub) and any(match_fn(r, x) for x in sub):
+                target = sub
+                break
+        if target is not None:
+            target.append(r)
+        else:
+            subs.append([r])
+    return subs
+
+
+def _any_conflict(r1, r2) -> bool:
+    return name_conflict(r1, r2) or ssn_conflict(r1, r2) or dob_conflict(r1, r2)
+
+
 def cluster(recs, uf, reasons):
-    """Union records that are the same person; record a reason per link.
+    """Assign the same person to one cluster. SSN is the PRIMARY identity:
+    two rows with different SSNs are NEVER merged, and names can only group
+    rows that do not have a reliable, differing SSN.
 
-    A pair merges only when nothing CONFLICTS (name / SSN / DOB) AND there is
-    a positive signal:
-      * same SSN  (R1)  -- but only if the names do not conflict
-      * fuzzy name match (R2/R3/R4/R6) -- but only if SSN/DOB do not conflict
+    Pass A - real SSN:   rows sharing a valid SSN merge, but only if the group
+                         has no conflicting names/DOBs (else the SSN is treated
+                         as an unreliable fake and merges nothing).
+    Pass B - no SSN:     rows with no usable SSN group by fuzzy name (+DOB),
+                         but a blank row can never bridge two different SSNs.
+    Pass C - R2 attach:  a no-SSN row joins a real-SSN person of the same name
+                         ONLY when exactly one such person exists (unambiguous).
     """
-    # ---- R1: same SSN. A shared full SSN merges its rows ONLY if the whole
-    #          group is coherent (no two rows have conflicting names/DOBs).
-    #          A group with conflicting names means the SSN is unreliable
-    #          (usually a fake/default value) -> we skip it entirely so a blank
-    #          '[Unknown]' row cannot bridge two different people.
-    ssn_recs = [r for r in recs if r["ssn"]]
-    masked = [r for r in ssn_recs if "X" in r["ssn"]]
-    skipped_ssns = 0
+    real = [r for r in recs if r["ssn"]]
+    full = [r for r in real if "X" not in r["ssn"]]
+    masked = [r for r in real if "X" in r["ssn"]]
+    noreal = [r for r in recs if not r["ssn"]]
 
+    # ---- Pass A: real full SSN ----
     by_ssn = {}
-    for r in ssn_recs:
-        if "X" not in r["ssn"]:
-            by_ssn.setdefault(r["ssn"], []).append(r)
+    for r in full:
+        by_ssn.setdefault(r["ssn"], []).append(r)
     for ssn, group in by_ssn.items():
-        if len(group) < 2:
-            continue
-        if not group_is_coherent(group):
-            skipped_ssns += 1
-            continue                              # unreliable SSN -> don't merge
-        root = group[0]
-        for other in group[1:]:                   # coherent -> all one person
-            _link(uf, reasons, root, other, "R1 same-SSN")
+        if len(group) < 2 or not group_is_coherent(group):
+            continue                               # unreliable / singleton
+        for other in group[1:]:
+            _link(uf, reasons, group[0], other, "R1 same-SSN")
 
-    # Masked SSNs (123-45-XXXX): a mask reveals only a few digits, so we require
-    # a POSITIVE real-name match (both names present and fuzzy-equal). This
-    # prevents a mask from bridging '[Unknown]' rows across different people.
+    # masked SSN: attach only to a real row with matching known digits AND a
+    # positive real-name match (a mask is too weak to trust on a blank name).
+    real_by_block = _index_by_block(real)
     for mr in masked:
         if not (mr["first"] and mr["last"]):
-            continue                              # blank name: too weak to trust a mask
-        for r in ssn_recs:
+            continue
+        for r in real_by_block.get((mr["last"], mr["first"][0]), []):
             if r["idx"] == mr["idx"] or uf.find(r["idx"]) == uf.find(mr["idx"]):
                 continue
-            if not (r["first"] and r["last"]):
-                continue
-            if ssn_cmp(mr["ssn"], r["ssn"]) != "same":
-                continue
-            if dob_conflict(mr, r) or not name_match(mr, r):
-                continue
-            _link(uf, reasons, mr, r, "R1 same-SSN (masked)")
+            if ssn_cmp(mr["ssn"], r["ssn"]) == "same" and not dob_conflict(mr, r) \
+                    and name_match(mr, r):
+                _link(uf, reasons, mr, r, "R1 same-SSN (masked)")
 
-    # ---- R2/R3/R4/R6: fuzzy name inside (last, first-initial) blocks.
-    #      Blocking on last + first initial keeps comparisons small while
-    #      still allowing prefix matches (a prefix shares the first initial).
-    #      Skip if SSN or DOB conflict (same name but clearly two people).
-    blocks = {}
+    # ---- Pass B: rows with NO usable SSN -> group by fuzzy name, no bridging ----
+    for key, group in _index_by_block(noreal).items():
+        for sub in greedy_subclusters(group, name_match, _any_conflict):
+            for other in sub[1:]:
+                _link(uf, reasons, sub[0], other, classify_name_link(sub[0], other))
+
+    # ---- Pass B2: DOB corroboration. Same last name + same DOB lets a first
+    #      name INITIAL match a full name ('D Singh' == 'Didar Singh'). Blocked
+    #      by (last, DOB) and guarded by _any_conflict so a different SSN still
+    #      keeps them apart; greedy sub-clustering prevents bridging.
+    by_lastdob = {}
     for r in recs:
+        if r["last"] and r["dob"]:
+            by_lastdob.setdefault((r["last"], r["dob"]), []).append(r)
+    for key, group in by_lastdob.items():
+        if len(group) < 2:
+            continue
+        for sub in greedy_subclusters(group, name_match_weak, _any_conflict):
+            for other in sub[1:]:
+                _link(uf, reasons, sub[0], other, "R same-name(initial)+DOB")
+
+    # ---- Pass C: unambiguous R2 attach (blank name+DOB row -> its SSN person) ----
+    real_by_block = _index_by_block(real)          # rebuild (roots now set)
+    for r in noreal:
+        if not (r["first"] and r["last"]):
+            continue
+        roots = set()
+        rep = {}
+        for cand in real_by_block.get((r["last"], r["first"][0]), []):
+            if name_match(r, cand) and not dob_conflict(r, cand) and not ssn_conflict(r, cand):
+                root = uf.find(cand["idx"])
+                roots.add(root)
+                rep[root] = cand
+        if len(roots) == 1:                         # exactly one candidate person
+            cand = next(iter(rep.values()))
+            _link(uf, reasons, cand, r, "R2 same-name+one-id")
+
+
+def _index_by_block(rows):
+    """Bucket rows by (last name, first initial) for cheap blocked comparison.
+    Rows without a real first+last name are skipped (they can't name-match)."""
+    blocks = {}
+    for r in rows:
         if not r["last"] or not r["first"]:
             continue
-        key = (r["last"], r["first"][0])
-        blocks.setdefault(key, []).append(r)
-
-    for key, group in blocks.items():
-        m = len(group)
-        for a in range(m):
-            for b in range(a + 1, m):
-                r1, r2 = group[a], group[b]
-                if uf.find(r1["idx"]) == uf.find(r2["idx"]):
-                    continue                       # already linked (e.g. by SSN)
-                if ssn_conflict(r1, r2) or dob_conflict(r1, r2):
-                    continue                       # different SSN/DOB -> not same
-                if name_match(r1, r2):
-                    _link(uf, reasons, r1, r2, classify_name_link(r1, r2))
+        blocks.setdefault((r["last"], r["first"][0]), []).append(r)
+    return blocks
 
 
 def classify_name_link(r1, r2) -> str:
     """Label which rule explains a name-based link (for the audit column)."""
     if r1["dob"] and r2["dob"] and r1["dob"] == r2["dob"]:
         base = "R4 same-name+DOB"
-    elif (r1["ssn"] or r2["ssn"]) and not (r1["ssn"] and r2["ssn"]):
-        base = "R2/R3 same-name+one-id"      # one has SSN/DOB, other blank
     else:
         base = "R4 same-name"
     if r1["mid"] != r2["mid"] and (r1["mid"] and r2["mid"]):
