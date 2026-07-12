@@ -7,11 +7,21 @@
        260711 re ds notification merge summary.md
 
    Match key: Social Security Number + Full Date of Birth (Base rule),
-   plus 9 additional corroborating rules (same-SSN+name/DOB-differs,
-   complementary SSN/DOB, [Unknown]-name override, name shorthand/typo
-   variants, middle-name flexibility, suffix-conflict guard, suffix-
-   blank exception). See the summary .md for the plain-language version
-   of every rule below.
+   plus 12 additional corroborating rules (same-SSN+name/DOB-differs,
+   complementary SSN/DOB, [Unknown]-name override via PII/Employee ID/
+   fully-known SSN, name shorthand/typo variants, middle-name flexibility,
+   suffix-conflict guard, suffix-blank exception, SSN-conflict guard,
+   name-conflict guard, masked/partial-SSN + name corroboration, and an
+   address-only fallback when SSN+DOB are both missing). See the summary
+   .md for the plain-language version of every rule below.
+
+   Address fields (Residential Address, City, State, Province, Zip,
+   Country) are handled differently from other PII/PHI: the MAJORITY
+   address per merged person stays in those columns as-is, and every OTHER
+   distinct address is combined into one string per address in a new
+   "Other Address" column - NOT merged field-by-field, which would break
+   the link between (e.g.) a city and the zip code that actually goes with
+   it.
 
    THIS SCRIPT ONLY READS DATA (SELECT). It does not UPDATE, DELETE, or
    modify [cng_db].[dbo].[cng_dedup] in any way.
@@ -23,19 +33,24 @@
        exported result only to the secured/authorized folder for this
        data - never to a desktop or personal drive.
      - Requires SQL Server 2017+ (STRING_AGG ... WITHIN GROUP).
+     - This script does a full, unindexed self-join to find matching row
+       pairs - fine for a dev/staging table or a modest row count, but NOT
+       recommended as-is for a full 400k+ row production table (see the
+       Python version of this script, which uses blocking/indexing and is
+       built for that scale).
 
    Known simplifications (call these out to the business owner before
    sign-off):
-     - SSN is treated as valid only when it is exactly 9 digits after
-       stripping non-digit characters, and not a common junk value
-       (all-same-digit, or one of a short placeholder list below).
-       Masked/partial SSNs (with X's, asterisks, etc.) are NOT handled
-       here and will simply fail to match on SSN.
      - DOB is parsed assuming MM/DD/YYYY; a value that doesn't parse is
        treated as "no DOB" (can't be used to match).
-     - "Fullest name kept" and "majority DOB" tie-breaks are heuristic
-       (longest string / most frequent value) - review groups with
-       more than 2-3 rows before trusting the chosen value blindly.
+     - "Fullest name kept" and "majority DOB"/"majority address" tie-breaks
+       are heuristic (longest string / most frequent value, first-seen
+       row_id as final tiebreak) - review groups with more than 2-3 rows
+       before trusting the chosen value blindly.
+     - Result sets: (1) Merged Notification Data, (2) Rule 8 suffix-
+       conflict review, (3) Rule 11 name-conflict review, (4) Placeholder
+       Name Review (real text that got blanked as a placeholder, e.g. a
+       genuine short name colliding with "[Unknown]"-style patterns).
    ============================================================ */
 
 SET NOCOUNT ON;
@@ -48,13 +63,23 @@ IF OBJECT_ID('tempdb..#name_placeholders') IS NOT NULL DROP TABLE #name_placehol
 CREATE TABLE #name_placeholders (v VARCHAR(30) PRIMARY KEY);
 INSERT INTO #name_placeholders (v) VALUES
     ('UNKNOWN'),('UNK'),('UNKN'),('NA'),('NONE'),('NULL'),('NIL'),
-    ('TEST'),('XXX'),('XX'),('X'),('NMN'),('NONAME'),('NOTGIVEN'),('NOTPROVIDED');
+    ('XXX'),('XX'),('X'),('NMN'),('NONAME'),('NOTGIVEN'),('NOTPROVIDED');
 
 IF OBJECT_ID('tempdb..#ssn_placeholders') IS NOT NULL DROP TABLE #ssn_placeholders;
 CREATE TABLE #ssn_placeholders (v CHAR(9) PRIMARY KEY);
 INSERT INTO #ssn_placeholders (v) VALUES
     ('123456789'),('987654321'),('111223333'),('123121234'),
     ('456789123'),('078051120'),('219099999'),('457555462');
+
+-- 9 numbered positions (1..9), used to compare two SSN patterns character-
+-- by-character so a masked SSN (e.g. '12345XXXX') can be compared against a
+-- full one on just its KNOWN digits ('X' = wildcard).
+IF OBJECT_ID('tempdb..#digits9') IS NOT NULL DROP TABLE #digits9;
+SELECT TOP (9) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n
+INTO #digits9
+FROM sys.all_objects;
+
+DECLARE @SSN_MIN_KNOWN_OVERLAP INT = 4;   -- min matching KNOWN digits to trust a masked SSN
 
 -------------------------------------------------------------------
 -- 1) Load + normalize source rows into a working copy
@@ -96,17 +121,28 @@ ALTER TABLE #base ADD row_id INT IDENTITY(1,1);
 ALTER TABLE #base ADD grp INT;
 UPDATE #base SET grp = row_id;   -- every row starts as its own group
 
--- SSN: keep only if exactly 9 digits after stripping punctuation, and not a
--- known junk/placeholder value or an all-same-digit fake (000000000, ...)
+-- SSN: normalized to a 9-character pattern of digits and 'X' (X = redacted
+-- digit; mask characters *, #, ? are treated as X too), e.g.
+--     123-45-6789 -> '123456789'      123-45-XXXX -> '12345XXXX'
+-- A fully-known (no X) SSN is rejected if it's a junk/placeholder value or
+-- all-same-digit. A masked SSN is rejected if it has fewer than
+-- @SSN_MIN_KNOWN_OVERLAP known digits (too little information to trust).
 UPDATE b
 SET n_ssn = CASE
-    WHEN LEN(d.digits_only) = 9
-         AND NOT EXISTS (SELECT 1 FROM #ssn_placeholders p WHERE p.v = d.digits_only)
-         AND d.digits_only <> REPLICATE(LEFT(d.digits_only, 1), 9)
-    THEN d.digits_only ELSE NULL END
+    WHEN d.kept IS NULL OR LEN(d.kept) <> 9 THEN NULL
+    WHEN d.kept NOT LIKE '%X%'
+         AND NOT EXISTS (SELECT 1 FROM #ssn_placeholders p WHERE p.v = d.kept)
+         AND d.kept <> REPLICATE(LEFT(d.kept, 1), 9)
+        THEN d.kept
+    WHEN d.kept LIKE '%X%'
+         AND (9 - (LEN(d.kept) - LEN(REPLACE(d.kept, 'X', '')))) >= @SSN_MIN_KNOWN_OVERLAP
+        THEN d.kept
+    ELSE NULL END
 FROM #base b
 CROSS APPLY (
-    SELECT REPLACE(REPLACE(REPLACE(LTRIM(RTRIM(ISNULL(b.[Social Security Number], ''))), '-', ''), ' ', ''), '.', '') AS digits_only
+    SELECT REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
+        UPPER(LTRIM(RTRIM(ISNULL(b.[Social Security Number], '')))),
+        '-', ''), ' ', ''), '.', ''), '*', 'X'), '#', 'X'), '?', 'X') AS kept
 ) d;
 
 -- DOB: parse assuming MM/DD/YYYY (style 101); NULL if it doesn't parse
@@ -132,6 +168,34 @@ CROSS APPLY (SELECT REPLACE(REPLACE(l.norm, '[', ''), ']', '')       AS core) lc
 CROSS APPLY (SELECT UPPER(LTRIM(RTRIM(ISNULL(b.[Middle Name], '')))) AS norm) m
 CROSS APPLY (SELECT REPLACE(REPLACE(m.norm, '[', ''), ']', '')       AS core) mc;
 
+-- Address helper columns: addr_key groups rows by the SAME address (used to
+-- find the majority address per merged group); full_addr is the address
+-- formatted as one readable string (blank parts skipped), used for the
+-- "Other Address" output column.
+ALTER TABLE #base ADD addr_key NVARCHAR(600), full_addr NVARCHAR(500);
+
+UPDATE b
+SET addr_key =
+        UPPER(LTRIM(RTRIM(ISNULL(b.[Residential Address], '')))) + '|' +
+        UPPER(LTRIM(RTRIM(ISNULL(b.[City], '')))) + '|' +
+        UPPER(LTRIM(RTRIM(ISNULL(b.[State of Residence (if US)], '')))) + '|' +
+        UPPER(LTRIM(RTRIM(ISNULL(b.[Province of Residence (if Canada)], '')))) + '|' +
+        UPPER(LTRIM(RTRIM(ISNULL(b.[Zip Code], '')))) + '|' +
+        UPPER(LTRIM(RTRIM(ISNULL(b.[Country of Residence], '')))),
+    full_addr =
+        CASE WHEN LEN(parts.joined) > 0 THEN STUFF(parts.joined, 1, 2, '') ELSE '' END
+FROM #base b
+CROSS APPLY (
+    SELECT
+        CASE WHEN NULLIF(LTRIM(RTRIM(b.[Residential Address])), '') IS NOT NULL THEN ', ' + LTRIM(RTRIM(b.[Residential Address])) ELSE '' END +
+        CASE WHEN NULLIF(LTRIM(RTRIM(b.[City])), '') IS NOT NULL THEN ', ' + LTRIM(RTRIM(b.[City])) ELSE '' END +
+        CASE WHEN NULLIF(LTRIM(RTRIM(b.[State of Residence (if US)])), '') IS NOT NULL THEN ', ' + LTRIM(RTRIM(b.[State of Residence (if US)])) ELSE '' END +
+        CASE WHEN NULLIF(LTRIM(RTRIM(b.[Province of Residence (if Canada)])), '') IS NOT NULL THEN ', ' + LTRIM(RTRIM(b.[Province of Residence (if Canada)])) ELSE '' END +
+        CASE WHEN NULLIF(LTRIM(RTRIM(b.[Zip Code])), '') IS NOT NULL THEN ', ' + LTRIM(RTRIM(b.[Zip Code])) ELSE '' END +
+        CASE WHEN NULLIF(LTRIM(RTRIM(b.[Country of Residence])), '') IS NOT NULL THEN ', ' + LTRIM(RTRIM(b.[Country of Residence])) ELSE '' END
+        AS joined
+) parts;
+
 -------------------------------------------------------------------
 -- 2) Build a symmetric edge list: which rows are the same person?
 --    Every branch below is guarded by the Rule 8 suffix-conflict check
@@ -144,73 +208,12 @@ SELECT a.row_id AS row_a, b.row_id AS row_b
 INTO #edges
 FROM #base a
 JOIN #base b ON b.row_id > a.row_id
-WHERE
-    -- Rule 8: a real, differing suffix on both sides blocks any merge
-    NOT (a.n_suffix <> '' AND b.n_suffix <> '' AND a.n_suffix <> b.n_suffix)
-    -- Two DIFFERENT real SSNs must never be merged, even when a fuzzy name +
-    -- matching DOB (Rules 4-7) would otherwise corroborate the pair. A blank
-    -- SSN on either side is not a conflict (Rule 2 still applies).
-    AND NOT (a.n_ssn IS NOT NULL AND b.n_ssn IS NOT NULL AND a.n_ssn <> b.n_ssn)
-    -- Two genuinely different names (both sides have a real first+last name,
-    -- and they don't even loosely match - not a typo/prefix/initial) block
-    -- EVERY rule, including the Base rule. A matching SSN+DOB alongside a
-    -- real name conflict usually means a fake/reused/incorrect SSN, not
-    -- confirmation of the same person.
-    AND NOT (
-        a.n_first <> '' AND a.n_last <> '' AND b.n_first <> '' AND b.n_last <> ''
-        AND NOT (
-            (a.n_last = b.n_last
-                 OR (LEN(a.n_last) >= 3 AND b.n_last LIKE a.n_last + '%')
-                 OR (LEN(b.n_last) >= 3 AND a.n_last LIKE b.n_last + '%'))
-            AND (a.n_first = b.n_first
-                 OR (LEN(a.n_first) >= 1 AND b.n_first LIKE a.n_first + '%')
-                 OR (LEN(b.n_first) >= 1 AND a.n_first LIKE b.n_first + '%'))
-            AND (a.n_middle = b.n_middle OR a.n_middle = '' OR b.n_middle = ''
-                 OR b.n_middle LIKE a.n_middle + '%' OR a.n_middle LIKE b.n_middle + '%')
-        )
-    )
-AND (
-    -- Base rule: SSN + DOB both present and match exactly (name irrelevant)
-    (a.n_ssn IS NOT NULL AND a.n_ssn = b.n_ssn AND a.n_dob IS NOT NULL AND a.n_dob = b.n_dob)
-
-    -- Rule 1: same SSN + matching/typo name, DOB differs -> majority DOB wins later
-    OR (a.n_ssn IS NOT NULL AND a.n_ssn = b.n_ssn
-        AND a.n_last <> '' AND b.n_last <> ''
-        AND (a.n_last = b.n_last
-             OR (LEN(a.n_last) >= 3 AND b.n_last LIKE a.n_last + '%')
-             OR (LEN(b.n_last) >= 3 AND a.n_last LIKE b.n_last + '%'))
-        AND (a.n_first = b.n_first
-             OR (LEN(a.n_first) >= 1 AND b.n_first LIKE a.n_first + '%')
-             OR (LEN(b.n_first) >= 1 AND a.n_first LIKE b.n_first + '%'))
-       )
-
-    -- Rule 2: same name, complementary data (one row SSN-only, other DOB-only)
-    OR (a.n_last <> '' AND a.n_last = b.n_last AND a.n_first = b.n_first
-        AND ((a.n_ssn IS NOT NULL AND b.n_ssn IS NULL) OR (a.n_ssn IS NULL AND b.n_ssn IS NOT NULL))
-        AND ((a.n_dob IS NOT NULL AND b.n_dob IS NULL) OR (a.n_dob IS NULL AND b.n_dob IS NOT NULL))
-       )
-
-    -- Rule 3: matching PII (Driver's License / Passport / Government ID
-    -- Number), and one side's name is entirely blank/"[Unknown]"
-    OR (
-        (
-            (NULLIF(LTRIM(RTRIM(a.[Driver's License Number])), '') IS NOT NULL
-             AND UPPER(LTRIM(RTRIM(a.[Driver's License Number]))) = UPPER(LTRIM(RTRIM(b.[Driver's License Number]))))
-         OR (NULLIF(LTRIM(RTRIM(a.[Passport Number])), '') IS NOT NULL
-             AND UPPER(LTRIM(RTRIM(a.[Passport Number]))) = UPPER(LTRIM(RTRIM(b.[Passport Number]))))
-         OR (NULLIF(LTRIM(RTRIM(a.[Government-Issued ID Number])), '') IS NOT NULL
-             AND UPPER(LTRIM(RTRIM(a.[Government-Issued ID Number]))) = UPPER(LTRIM(RTRIM(b.[Government-Issued ID Number]))))
-        )
-        AND (
-            (a.n_first = '' AND a.n_last = '' AND (b.n_first <> '' OR b.n_last <> ''))
-            OR (b.n_first = '' AND b.n_last = '' AND (a.n_first <> '' OR a.n_last <> ''))
-        )
-       )
-
-    -- Rules 4-7: fuzzy name (initial / partial-spelling first name,
-    -- partial-spelling/typo last name, flexible middle name), corroborated
-    -- by a matching SSN or a matching DOB
-    OR (
+CROSS APPLY (
+    -- Loose name match: last name equal or a >=3-char prefix/typo (e.g.
+    -- "Sklar"->"Sklarczuk", "Sin"/"Sing"->"Singh"); first name equal or a
+    -- prefix/initial of any length (e.g. "H"/"Did"->"Harish"/"Didar");
+    -- middle name equal, blank on either side, or a prefix of the other.
+    SELECT CASE WHEN
         a.n_last <> '' AND b.n_last <> ''
         AND (a.n_last = b.n_last
              OR (LEN(a.n_last) >= 3 AND b.n_last LIKE a.n_last + '%')
@@ -220,7 +223,124 @@ AND (
              OR (LEN(b.n_first) >= 1 AND a.n_first LIKE b.n_first + '%'))
         AND (a.n_middle = b.n_middle OR a.n_middle = '' OR b.n_middle = ''
              OR b.n_middle LIKE a.n_middle + '%' OR a.n_middle LIKE b.n_middle + '%')
-        AND ((a.n_ssn IS NOT NULL AND a.n_ssn = b.n_ssn) OR (a.n_dob IS NOT NULL AND a.n_dob = b.n_dob))
+    THEN 1 ELSE 0 END AS name_match
+) nm
+CROSS APPLY (
+    -- SSN comparison, 'X' = wildcard: conflict = a known digit disagrees;
+    -- overlap = count of positions where both sides have a matching known
+    -- digit. A masked SSN (contains 'X') additionally needs nm.name_match
+    -- to count as "the same SSN" - see ssn_same below.
+    SELECT
+        CASE WHEN a.n_ssn IS NULL OR b.n_ssn IS NULL THEN 0
+             WHEN EXISTS (SELECT 1 FROM #digits9 d
+                          WHERE SUBSTRING(a.n_ssn, d.n, 1) <> 'X' AND SUBSTRING(b.n_ssn, d.n, 1) <> 'X'
+                            AND SUBSTRING(a.n_ssn, d.n, 1) <> SUBSTRING(b.n_ssn, d.n, 1))
+             THEN 1 ELSE 0 END AS conflict,
+        CASE WHEN a.n_ssn IS NULL OR b.n_ssn IS NULL THEN 0
+             ELSE (SELECT COUNT(*) FROM #digits9 d
+                   WHERE SUBSTRING(a.n_ssn, d.n, 1) <> 'X' AND SUBSTRING(b.n_ssn, d.n, 1) <> 'X'
+                     AND SUBSTRING(a.n_ssn, d.n, 1) = SUBSTRING(b.n_ssn, d.n, 1))
+        END AS overlap
+) ssncmp
+CROSS APPLY (
+    -- Address comparison across all 6 fields at once: conflict = any field
+    -- where BOTH sides have a real value that disagrees (e.g. different Zip
+    -- Codes); real_match = at least one field where both sides agree on a
+    -- real value. A field blank on just one side is neither - same
+    -- tolerance as the middle name/suffix rules.
+    SELECT
+        MAX(CASE WHEN f.va <> '' AND f.vb <> '' AND f.va <> f.vb THEN 1 ELSE 0 END) AS conflict,
+        MAX(CASE WHEN f.va <> '' AND f.vb <> '' AND f.va = f.vb THEN 1 ELSE 0 END) AS real_match
+    FROM (
+        SELECT UPPER(LTRIM(RTRIM(ISNULL(a.[Residential Address], '')))) AS va, UPPER(LTRIM(RTRIM(ISNULL(b.[Residential Address], '')))) AS vb
+        UNION ALL SELECT UPPER(LTRIM(RTRIM(ISNULL(a.[City], '')))), UPPER(LTRIM(RTRIM(ISNULL(b.[City], ''))))
+        UNION ALL SELECT UPPER(LTRIM(RTRIM(ISNULL(a.[State of Residence (if US)], '')))), UPPER(LTRIM(RTRIM(ISNULL(b.[State of Residence (if US)], ''))))
+        UNION ALL SELECT UPPER(LTRIM(RTRIM(ISNULL(a.[Province of Residence (if Canada)], '')))), UPPER(LTRIM(RTRIM(ISNULL(b.[Province of Residence (if Canada)], ''))))
+        UNION ALL SELECT UPPER(LTRIM(RTRIM(ISNULL(a.[Zip Code], '')))), UPPER(LTRIM(RTRIM(ISNULL(b.[Zip Code], ''))))
+        UNION ALL SELECT UPPER(LTRIM(RTRIM(ISNULL(a.[Country of Residence], '')))), UPPER(LTRIM(RTRIM(ISNULL(b.[Country of Residence], ''))))
+    ) f
+) addrcmp
+WHERE
+    -- Rule 8: a real, differing suffix on both sides blocks any merge
+    NOT (a.n_suffix <> '' AND b.n_suffix <> '' AND a.n_suffix <> b.n_suffix)
+    -- Rule 10: two DIFFERENT real SSNs must never be merged, even when a
+    -- fuzzy name + matching DOB (Rules 4-7) would otherwise corroborate the
+    -- pair. A blank SSN on either side is not a conflict (Rule 2 still
+    -- applies). Uses the wildcard-aware comparison so a known digit
+    -- disagreeing between a masked and a full SSN still blocks the merge.
+    AND ssncmp.conflict = 0
+    -- Rule 11: two genuinely different names (both sides have a real
+    -- first+last name, and they don't even loosely match - not a typo/
+    -- prefix/initial) block EVERY rule, including the Base rule. A matching
+    -- SSN+DOB alongside a real name conflict usually means a fake/reused/
+    -- incorrect SSN, not confirmation of the same person.
+    AND NOT (a.n_first <> '' AND a.n_last <> '' AND b.n_first <> '' AND b.n_last <> '' AND nm.name_match = 0)
+AND (
+    -- Base rule: SSN + DOB both present and match exactly (name irrelevant),
+    -- OR a masked SSN whose known digits agree AND the names also match
+    -- (Rule 12 - a redacted number alone is too weak to trust without name
+    -- corroboration)
+    (
+        a.n_ssn IS NOT NULL AND b.n_ssn IS NOT NULL AND ssncmp.overlap >= @SSN_MIN_KNOWN_OVERLAP
+        AND (
+            (a.n_ssn NOT LIKE '%X%' AND b.n_ssn NOT LIKE '%X%')
+            OR nm.name_match = 1
+        )
+        AND a.n_dob IS NOT NULL AND a.n_dob = b.n_dob
+    )
+
+    -- Rule 1: same SSN (fully known) + matching/typo name, DOB differs ->
+    -- majority DOB wins later
+    OR (a.n_ssn IS NOT NULL AND a.n_ssn = b.n_ssn AND a.n_ssn NOT LIKE '%X%'
+        AND nm.name_match = 1)
+
+    -- Rule 2: same name, complementary data (one row SSN-only, other DOB-only)
+    OR (a.n_last <> '' AND a.n_last = b.n_last AND a.n_first = b.n_first
+        AND ((a.n_ssn IS NOT NULL AND b.n_ssn IS NULL) OR (a.n_ssn IS NULL AND b.n_ssn IS NOT NULL))
+        AND ((a.n_dob IS NOT NULL AND b.n_dob IS NULL) OR (a.n_dob IS NULL AND b.n_dob IS NOT NULL))
+       )
+
+    -- Rule 3: matching identifier - Driver's License, Passport, Government
+    -- ID Number, Employee ID, or a FULLY KNOWN (non-masked) SSN - and one
+    -- side's name is entirely blank/"[Unknown]". (A masked SSN is excluded
+    -- here: there's no name on the blank side to corroborate it with.)
+    OR (
+        (
+            (NULLIF(LTRIM(RTRIM(a.[Driver's License Number])), '') IS NOT NULL
+             AND UPPER(LTRIM(RTRIM(a.[Driver's License Number]))) = UPPER(LTRIM(RTRIM(b.[Driver's License Number]))))
+         OR (NULLIF(LTRIM(RTRIM(a.[Passport Number])), '') IS NOT NULL
+             AND UPPER(LTRIM(RTRIM(a.[Passport Number]))) = UPPER(LTRIM(RTRIM(b.[Passport Number]))))
+         OR (NULLIF(LTRIM(RTRIM(a.[Government-Issued ID Number])), '') IS NOT NULL
+             AND UPPER(LTRIM(RTRIM(a.[Government-Issued ID Number]))) = UPPER(LTRIM(RTRIM(b.[Government-Issued ID Number]))))
+         OR (NULLIF(LTRIM(RTRIM(a.[Employee Identification Number])), '') IS NOT NULL
+             AND UPPER(LTRIM(RTRIM(a.[Employee Identification Number]))) = UPPER(LTRIM(RTRIM(b.[Employee Identification Number]))))
+         OR (a.n_ssn IS NOT NULL AND b.n_ssn IS NOT NULL
+             AND a.n_ssn NOT LIKE '%X%' AND b.n_ssn NOT LIKE '%X%' AND a.n_ssn = b.n_ssn)
+        )
+        AND (
+            (a.n_first = '' AND a.n_last = '' AND (b.n_first <> '' OR b.n_last <> ''))
+            OR (b.n_first = '' AND b.n_last = '' AND (a.n_first <> '' OR a.n_last <> ''))
+        )
+       )
+
+    -- Rules 4-7: fuzzy name (initial / partial-spelling first name,
+    -- partial-spelling/typo last name, flexible middle name), corroborated
+    -- by a matching SSN (fully known, or masked - name_match already
+    -- required by nm.name_match) or a matching DOB
+    OR (
+        nm.name_match = 1
+        AND ((a.n_ssn IS NOT NULL AND b.n_ssn IS NOT NULL AND ssncmp.conflict = 0 AND ssncmp.overlap >= @SSN_MIN_KNOWN_OVERLAP)
+             OR (a.n_dob IS NOT NULL AND a.n_dob = b.n_dob))
+       )
+
+    -- Rule 13: SSN and DOB both missing on both rows - a matching/typo name
+    -- PLUS a compatible address (Zip Code etc. may be blank on one side;
+    -- see addrcmp above) stands in as the corroborating proof, since
+    -- there's nothing else to go on.
+    OR (
+        a.n_ssn IS NULL AND b.n_ssn IS NULL AND a.n_dob IS NULL AND b.n_dob IS NULL
+        AND nm.name_match = 1
+        AND addrcmp.conflict = 0 AND addrcmp.real_match = 1
        )
 
     -- Rule 9 is implicit: a blank suffix never triggers the Rule 8 guard
@@ -261,6 +381,24 @@ END
 -------------------------------------------------------------------
 IF OBJECT_ID('tempdb..#groups') IS NOT NULL DROP TABLE #groups;
 SELECT DISTINCT grp INTO #groups FROM #base;
+
+-- Majority address per group: the most common address (Rows Merged tie
+-- broken by first-seen row_id) is what appears in the normal address
+-- columns below; every other distinct address goes into "Other Address".
+IF OBJECT_ID('tempdb..#majority_addr') IS NOT NULL DROP TABLE #majority_addr;
+SELECT grp, [Residential Address], [City], [State of Residence (if US)],
+       [Province of Residence (if Canada)], [Zip Code], [Country of Residence],
+       addr_key
+INTO #majority_addr
+FROM (
+    SELECT b.*,
+           ROW_NUMBER() OVER (
+               PARTITION BY b.grp
+               ORDER BY COUNT(*) OVER (PARTITION BY b.grp, b.addr_key) DESC, MIN(b.row_id) OVER (PARTITION BY b.grp, b.addr_key)
+           ) AS rn
+    FROM #base b
+) ranked
+WHERE rn = 1;
 
 SELECT
     g.grp AS [Merge Group],
@@ -309,35 +447,24 @@ SELECT
            WHERE b.grp = g.grp AND NULLIF(LTRIM(RTRIM(b.[Birth Information])), '') IS NOT NULL) d
     ) AS [Birth Information],
 
-    (SELECT STRING_AGG(v, '; ') WITHIN GROUP (ORDER BY v)
-     FROM (SELECT DISTINCT LTRIM(RTRIM(b.[Residential Address])) AS v FROM #base b
-           WHERE b.grp = g.grp AND NULLIF(LTRIM(RTRIM(b.[Residential Address])), '') IS NOT NULL) d
-    ) AS [Residential Address],
+    -- Address: the MAJORITY address (most common among this group's rows)
+    -- is kept as-is in these 6 columns, unlike other PII/PHI fields - see
+    -- "Other Address" below for every other distinct address in the group.
+    maj.[Residential Address],
+    maj.[City],
+    maj.[State of Residence (if US)],
+    maj.[Province of Residence (if Canada)],
+    maj.[Zip Code],
+    maj.[Country of Residence],
 
-    (SELECT STRING_AGG(v, '; ') WITHIN GROUP (ORDER BY v)
-     FROM (SELECT DISTINCT LTRIM(RTRIM(b.[City])) AS v FROM #base b
-           WHERE b.grp = g.grp AND NULLIF(LTRIM(RTRIM(b.[City])), '') IS NOT NULL) d
-    ) AS [City],
-
-    (SELECT STRING_AGG(v, '; ') WITHIN GROUP (ORDER BY v)
-     FROM (SELECT DISTINCT LTRIM(RTRIM(b.[State of Residence (if US)])) AS v FROM #base b
-           WHERE b.grp = g.grp AND NULLIF(LTRIM(RTRIM(b.[State of Residence (if US)])), '') IS NOT NULL) d
-    ) AS [State of Residence (if US)],
-
-    (SELECT STRING_AGG(v, '; ') WITHIN GROUP (ORDER BY v)
-     FROM (SELECT DISTINCT LTRIM(RTRIM(b.[Province of Residence (if Canada)])) AS v FROM #base b
-           WHERE b.grp = g.grp AND NULLIF(LTRIM(RTRIM(b.[Province of Residence (if Canada)])), '') IS NOT NULL) d
-    ) AS [Province of Residence (if Canada)],
-
-    (SELECT STRING_AGG(v, '; ') WITHIN GROUP (ORDER BY v)
-     FROM (SELECT DISTINCT LTRIM(RTRIM(b.[Zip Code])) AS v FROM #base b
-           WHERE b.grp = g.grp AND NULLIF(LTRIM(RTRIM(b.[Zip Code])), '') IS NOT NULL) d
-    ) AS [Zip Code],
-
-    (SELECT STRING_AGG(v, '; ') WITHIN GROUP (ORDER BY v)
-     FROM (SELECT DISTINCT LTRIM(RTRIM(b.[Country of Residence])) AS v FROM #base b
-           WHERE b.grp = g.grp AND NULLIF(LTRIM(RTRIM(b.[Country of Residence])), '') IS NOT NULL) d
-    ) AS [Country of Residence],
+    -- Every OTHER distinct address (not the majority one), each combined
+    -- into one readable string (street, city, state, zip, country
+    -- together), semicolon-joined - so city/state/zip never get scattered
+    -- into separate lists where they'd lose their connection to each other.
+    (SELECT STRING_AGG(x.full_addr, '; ') WITHIN GROUP (ORDER BY x.full_addr)
+     FROM (SELECT DISTINCT b.full_addr, b.addr_key FROM #base b
+           WHERE b.grp = g.grp AND b.full_addr <> '' AND b.addr_key <> maj.addr_key) x
+    ) AS [Other Address],
 
     (SELECT STRING_AGG(v, '; ') WITHIN GROUP (ORDER BY v)
      FROM (SELECT DISTINCT LTRIM(RTRIM(b.[Address Comments])) AS v FROM #base b
@@ -457,6 +584,7 @@ SELECT
     (SELECT COUNT(*) FROM #base b WHERE b.grp = g.grp) AS [Rows Merged]
 
 FROM #groups g
+JOIN #majority_addr maj ON maj.grp = g.grp
 ORDER BY [Rows Merged] DESC, g.grp;
 
 -------------------------------------------------------------------
@@ -503,3 +631,21 @@ WHERE a.n_ssn IS NOT NULL AND a.n_ssn = b.n_ssn
       AND (a.n_middle = b.n_middle OR a.n_middle = '' OR b.n_middle = ''
            OR b.n_middle LIKE a.n_middle + '%' OR a.n_middle LIKE b.n_middle + '%')
   );
+
+-------------------------------------------------------------------
+-- 7) Placeholder Name Review: every First/Last/Middle Name value that had
+--    REAL text typed in it, but got treated as a placeholder and blanked
+--    out (e.g. "[Unknown]", "N/A", or literally "nan"). Exists so a
+--    genuine short name that happens to collide with a placeholder pattern
+--    (e.g. "Nan" as a real nickname) can be spotted, not silently dropped.
+-------------------------------------------------------------------
+SELECT b.[DOCIDs], v.field, v.original_value,
+       b.[First Name], b.[Last Name]
+FROM #base b
+CROSS APPLY (
+    SELECT 'First Name' AS field, b.[First Name] AS original_value, b.n_first AS normed
+    UNION ALL SELECT 'Last Name', b.[Last Name], b.n_last
+    UNION ALL SELECT 'Middle Name', b.[Middle Name], b.n_middle
+) v
+WHERE NULLIF(LTRIM(RTRIM(v.original_value)), '') IS NOT NULL
+  AND v.normed = '';
