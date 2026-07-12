@@ -7,13 +7,21 @@ documented in "260711 re ds notification merge summary.md" (Base rule
 + Rules 1-9).
 
 INPUT  : an Excel workbook with the columns listed in EXPECTED_COLS below.
-OUTPUT : a new Excel workbook, ONE ROW PER CONFIRMED PERSON. Rows that
-         match are combined; PII/PHI fields keep every distinct value
-         seen, joined with "; ". Address fields (Residential Address, City,
-         State, Province, Zip, Country) are kept TOGETHER as one unit: the
-         most common address stays in those columns as-is, and every OTHER
-         distinct address goes into a new "Other Address" column as one
-         combined string per address, semicolon-joined.
+OUTPUT : a new Excel workbook with three sheets:
+         - "Merged Notification Data": ONE ROW PER CONFIRMED PERSON. Rows
+           that match are combined; PII/PHI fields keep every distinct value
+           seen, joined with "; ". Address fields (Residential Address, City,
+           State, Province, Zip, Country) are kept TOGETHER as one unit: the
+           most common address stays in those columns as-is, and every OTHER
+           distinct address goes into a new "Other Address" column as one
+           combined string per address, semicolon-joined.
+         - "Name Conflict Review": row pairs that share an SSN+DOB but have
+           genuinely conflicting names - NOT merged, needs manual review.
+         - "Placeholder Name Review": every First/Last/Middle Name value that
+           had real text but got blanked as a placeholder ("[Unknown]",
+           "nan", etc.) - so a genuine short name that happens to collide
+           with a placeholder pattern (e.g. "Nan") can be spotted, not
+           silently dropped.
 
 This script does not touch the input file. Save the output only to the
 secured/authorized folder for this data (never a desktop) - it contains
@@ -244,13 +252,23 @@ def build_records(df: pd.DataFrame):
     """df MUST already have a 0..n-1 RangeIndex (see main()) - idx doubles
     as the record's position, so no separate index->position map is needed.
     Uses positional numpy-array access (df.values) rather than itertuples(),
-    since itertuples() mangles column names with spaces/punctuation."""
+    since itertuples() mangles column names with spaces/punctuation.
+
+    Also returns placeholder_review: every (row, field, original value) where
+    the field had REAL text in it but norm_name() blanked it out as a
+    placeholder (matches NAME_PLACEHOLDERS, or is a literal 'nan'/'none'/
+    'null' string) - so a genuine short name (e.g. "Nan" as a real nickname)
+    that happens to collide with a placeholder pattern can be spotted and
+    reviewed instead of silently disappearing."""
     recs = []
+    placeholder_review = []
     col_pos = {c: p for p, c in enumerate(df.columns)}
     values = df.values  # numpy object array, fast positional access
     fi, la, mi, su, do, ss = (col_pos[COL_FIRST], col_pos[COL_LAST], col_pos[COL_MIDDLE],
                               col_pos[COL_SUFFIX], col_pos[COL_DOB], col_pos[COL_SSN])
     dl, pp, gv = col_pos[COL_DL], col_pos[COL_PASSPORT], col_pos[COL_GOVID]
+    docid_pos = col_pos[COL_DOCID]
+    name_fields = ((COL_FIRST, fi), (COL_LAST, la), (COL_MIDDLE, mi))
     for i in range(len(df)):
         row = values[i]
         r = Rec(i)
@@ -265,7 +283,19 @@ def build_records(df: pd.DataFrame):
         r.passport = norm_pii(row[pp])
         r.govid = norm_pii(row[gv])
         recs.append(r)
-    return recs
+
+        for label, pos in name_fields:
+            raw_val = row[pos]
+            raw_str = "" if raw_val is None else str(raw_val).strip()
+            normed = {fi: r.first, la: r.last, mi: r.mid}[pos]
+            if raw_str and not normed:
+                placeholder_review.append({
+                    "DOCID": row[docid_pos],
+                    "Field": label,
+                    "Original Value": raw_str,
+                    "First Name": row[fi], "Last Name": row[la],
+                })
+    return recs, placeholder_review
 
 
 # ------------------------------------------------------------
@@ -578,7 +608,12 @@ def main() -> None:
         )
     print(f"  {len(df):,} rows read.")
 
-    recs = build_records(df)   # recs[i].idx == i == df row position
+    recs, placeholder_review = build_records(df)   # recs[i].idx == i == df row position
+    if placeholder_review:
+        print(f"  {len(placeholder_review):,} name value(s) were treated as a "
+              f"placeholder ('[Unknown]', 'nan', etc.) and blanked - see the "
+              f"'Placeholder Name Review' sheet to confirm none of these were "
+              f"actually real names.")
 
     print("Clustering (blocked comparison) ...")
     pairs = bucket_candidate_pairs(recs)
@@ -666,11 +701,13 @@ def main() -> None:
             "Last Name B": df.at[b_idx, COL_LAST], "SSN B": df.at[b_idx, COL_SSN],
         })
     df_review = pd.DataFrame(review_rows)
+    df_placeholder = pd.DataFrame(placeholder_review)
 
     print(f"Writing {OUTPUT_XLSX} ...")
     _write_workbook(OUTPUT_XLSX, {
         "Merged Notification Data": df_out,
         "Name Conflict Review": df_review,
+        "Placeholder Name Review": df_placeholder,
     })
     print(f"Done -> {OUTPUT_XLSX}")
     print("Reminder: save the output only to the secured/authorized folder for "

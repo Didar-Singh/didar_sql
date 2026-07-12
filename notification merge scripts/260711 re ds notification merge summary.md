@@ -339,6 +339,20 @@ other.
 Any row that does not have a matching SSN + DOB with another row stays exactly
 as it is — it is not combined with anything.
 
+## The output has three sheets, not just one
+
+1. **Merged Notification Data** — the main report: one row per confirmed
+   person, per all the rules above.
+2. **Name Conflict Review** — row pairs that shared an SSN+DOB but had two
+   genuinely conflicting names (Rule 11) — these were deliberately NOT
+   merged and need a human to check them.
+3. **Placeholder Name Review** — every First/Middle/Last Name value that had
+   real text typed in it, but got treated as a placeholder and blanked out
+   (e.g. "[Unknown]", "N/A", or literally "nan"). This exists so a genuine
+   short name that happens to collide with a placeholder pattern (for
+   example "Nan" as a real nickname) can be double-checked rather than
+   silently disappearing from the report.
+
 ## Handling reminder (PII/PHI)
 
 This process works with SSN, DOB, and other PII/PHI. Per organizational
