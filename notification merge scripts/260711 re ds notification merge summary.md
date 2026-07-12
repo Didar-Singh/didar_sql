@@ -11,7 +11,7 @@ and confirmed first.
 | Base | SSN matches **and** DOB matches, and the names don't genuinely conflict | Merge |
 | 1 | Same SSN, matching name (exact or typo), DOB differs | Merge; use the majority (most frequent) DOB |
 | 2 | Same name, one row has DOB only / other has SSN only, no conflict | Merge (complementary data) |
-| 3 | Matching PII (e.g. Driver's License/Passport/other gov ID), one row's name is "[Unknown]" | Merge; real name supersedes "[Unknown]" |
+| 3 | Matching identifier (SSN, Driver's License, Passport, other gov ID, **or Employee ID**), one row's name is "[Unknown]" | Merge; real name supersedes "[Unknown]" |
 | 4 | Same last name, first name is an initial vs. full (e.g. "H" vs. "Harish"), SSN/PII confirms | Merge; full name kept |
 | 5 | Same last name, first name is a partial spelling (e.g. "Did" vs. "Didar"), SSN/DOB match | Merge; full name kept |
 | 6 | Same first name, last name is a partial spelling/typo (e.g. "Sin"/"Sing" vs. "Singh"), SSN/DOB match | Merge; other differing PII joined with `;` |

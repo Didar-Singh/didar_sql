@@ -63,10 +63,12 @@ COL_SUFFIX = "Suffix"
 COL_DOB    = "Full Date of Birth (MM/DD/YYYY)"
 COL_SSN    = "Social Security Number"
 
-# PII fields used for Rule 3 (matching PII overrides a blank/"[Unknown]" name)
+# Identifier fields used for Rule 3 (a matching identifier overrides a
+# blank/"[Unknown]" name on one side)
 COL_DL       = "Driver's License Number"
 COL_PASSPORT = "Passport Number"
 COL_GOVID    = "Government-Issued ID Number"
+COL_EMPID    = "Employee Identification Number"
 
 # Address fields are handled specially (see ADDRESS_COLS below), not as
 # plain semicolon-merged columns - they need to stay together as one unit
@@ -103,7 +105,7 @@ OTHER_MERGE_COLS = [
     "Government- Issued Identification",
     COL_GOVID,
     "Health Related Information",
-    "Employee Identification Number",
+    COL_EMPID,
     "Work-Related Information",
     "Family Information",
     "Financial Account Information",
@@ -244,7 +246,7 @@ def norm_pii(v) -> str:
 # ------------------------------------------------------------
 class Rec:
     __slots__ = ("idx", "first", "last", "mid", "suf", "dob", "dob_raw",
-                 "ssn", "dl", "passport", "govid", "addr_key")
+                 "ssn", "dl", "passport", "govid", "empid", "addr_key")
 
     def __init__(self, idx):
         self.idx = idx
@@ -268,7 +270,8 @@ def build_records(df: pd.DataFrame):
     values = df.values  # numpy object array, fast positional access
     fi, la, mi, su, do, ss = (col_pos[COL_FIRST], col_pos[COL_LAST], col_pos[COL_MIDDLE],
                               col_pos[COL_SUFFIX], col_pos[COL_DOB], col_pos[COL_SSN])
-    dl, pp, gv = col_pos[COL_DL], col_pos[COL_PASSPORT], col_pos[COL_GOVID]
+    dl, pp, gv, ei = (col_pos[COL_DL], col_pos[COL_PASSPORT], col_pos[COL_GOVID],
+                      col_pos[COL_EMPID])
     docid_pos = col_pos[COL_DOCID]
     addr_pos = [col_pos[c] for c in ADDRESS_COLS]
     name_fields = ((COL_FIRST, fi), (COL_LAST, la), (COL_MIDDLE, mi))
@@ -285,6 +288,7 @@ def build_records(df: pd.DataFrame):
         r.dl = norm_pii(row[dl])
         r.passport = norm_pii(row[pp])
         r.govid = norm_pii(row[gv])
+        r.empid = norm_pii(row[ei])
         r.addr_key = tuple(norm_text(row[p]) for p in addr_pos)
         recs.append(r)
 
@@ -375,10 +379,11 @@ def ssn_same(r1: Rec, r2: Rec) -> bool:
 
 
 def identifier_match(r1: Rec, r2: Rec) -> bool:
-    """Rule 3's identifier check: matching PII (DL/Passport/Gov ID), OR a
-    fully-known (non-masked) SSN match. Masked SSNs are excluded here since
-    Rule 3 pairs a real identifier with a BLANK name on the other side, so
-    there is no name available to corroborate a masked/ambiguous SSN."""
+    """Rule 3's identifier check: matching PII (DL/Passport/Gov ID/Employee
+    ID), OR a fully-known (non-masked) SSN match. Masked SSNs are excluded
+    here since Rule 3 pairs a real identifier with a BLANK name on the other
+    side, so there is no name available to corroborate a masked/ambiguous
+    SSN."""
     return pii_match(r1, r2) or (
         bool(r1.ssn) and bool(r2.ssn)
         and "X" not in r1.ssn and "X" not in r2.ssn
@@ -402,6 +407,7 @@ def pii_match(r1: Rec, r2: Rec) -> bool:
         (r1.dl and r1.dl == r2.dl)
         or (r1.passport and r1.passport == r2.passport)
         or (r1.govid and r1.govid == r2.govid)
+        or (r1.empid and r1.empid == r2.empid)
     )
 
 
@@ -513,6 +519,8 @@ def bucket_candidate_pairs(recs):
             buckets[("passport", r.passport)].append(r.idx)
         if r.govid:
             buckets[("govid", r.govid)].append(r.idx)
+        if r.empid:
+            buckets[("empid", r.empid)].append(r.idx)
         if all(r.addr_key):
             buckets[("addr",) + r.addr_key].append(r.idx)
 
