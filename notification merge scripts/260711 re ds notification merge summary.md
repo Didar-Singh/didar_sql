@@ -21,8 +21,9 @@ and confirmed first.
 | 10 | Two different real SSNs, even if a similar name + matching DOB would otherwise corroborate (Rules 4–7) | **Do not merge** — different SSNs can never belong to one merged record |
 | 11 | SSN and DOB both match, but the two names are genuinely different (not a typo/prefix/initial) | **Do not merge** — flag for manual review (likely a fake/reused/incorrect SSN) |
 | 12 | SSN is partially masked/redacted (e.g. `123-45-XXXX`), known digits agree with the other row, **and** the names also match | Merge |
+| 13 | SSN **and** DOB are both missing on both rows, name matches/typo-matches, **and** the full address (street+city+state+zip+country) matches exactly | Merge; address is the only available corroboration |
 | — | SSN or DOB differs (even if name is identical) | **Do not merge** — different person |
-| — | No matching SSN+DOB and none of rules 1–7 apply | **Do not merge** — stays a separate row |
+| — | No matching SSN+DOB and none of rules 1–7/13 apply | **Do not merge** — stays a separate row |
 
 ## What counts as "the same person"
 
@@ -248,6 +249,27 @@ when the SSN is *fully known*, not masked.)
 If a masked SSN's known digits actually **disagree** with the other row's
 known digits (e.g. `123-45-6789` vs. `123-99-XXXX`), that's a real conflict
 (Rule 10) and blocks the merge entirely, regardless of name.
+
+**13. SSN and DOB are BOTH missing on both rows** — there is no identifier at
+all to confirm identity with. In this situation only, a matching/typo name
+**plus** a fully matching address (every part — street, city, state, zip,
+country — not just some of them) together stand in as proof. If either row
+actually has a real SSN or DOB, this rule does not apply — the normal
+SSN/DOB-based rules take over instead.
+
+| First Name | Last Name | SSN | DOB | Address |
+|---|---|---|---|---|
+| Brenda | Sklar | *(blank)* | *(blank)* | 12 Elm St, Chicago, IL, 60601, USA |
+| Brenda | Sklarczuk | *(blank)* | *(blank)* | 12 Elm St, Chicago, IL, 60601, USA |
+
+→ Merged into one person: `Brenda Sklarczuk` (fullest spelling of the last
+name kept), same address. "Sklar" is treated as a shortened/typo form of
+"Sklarczuk" here, same as the other partial-name rules — but this only
+kicks in because there's no SSN/DOB at all AND the full address matches.
+
+If the address didn't fully match too (even just a different Zip Code), or
+if either row had a real SSN or DOB present, these would **not** be merged
+under this rule.
 
 ## What counts as a "different person"
 

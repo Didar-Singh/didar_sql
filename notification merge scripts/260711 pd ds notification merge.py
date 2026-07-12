@@ -4,7 +4,7 @@
 Merge PII/PHI person records from an Excel export into one row per
 confirmed person, for the notification report. Implements the rules
 documented in "260711 re ds notification merge summary.md" (Base rule
-+ Rules 1-9).
++ Rules 1-13).
 
 INPUT  : an Excel workbook with the columns listed in EXPECTED_COLS below.
 OUTPUT : a new Excel workbook with three sheets:
@@ -27,9 +27,11 @@ This script does not touch the input file. Save the output only to the
 secured/authorized folder for this data (never a desktop) - it contains
 SSN, DOB, and other PII/PHI.
 
-Designed for large row counts (uses "blocking" - only compares rows
-that already share an exact SSN, exact (Last Name, First Initial), or
-exact PII value - instead of comparing every row to every other row).
+Designed for large row counts (uses "blocking" - only compares rows that
+already share an exact SSN, an exact (Last Name, First Initial), a 3-char
+Last Name prefix + First Initial (catches typo/partial last names like
+"Sklar"/"Sklarczuk"), an exact PII value, or a fully matching address -
+instead of comparing every row to every other row).
 
 Install once:
     pip install pandas openpyxl
@@ -242,7 +244,7 @@ def norm_pii(v) -> str:
 # ------------------------------------------------------------
 class Rec:
     __slots__ = ("idx", "first", "last", "mid", "suf", "dob", "dob_raw",
-                 "ssn", "dl", "passport", "govid")
+                 "ssn", "dl", "passport", "govid", "addr_key")
 
     def __init__(self, idx):
         self.idx = idx
@@ -268,6 +270,7 @@ def build_records(df: pd.DataFrame):
                               col_pos[COL_SUFFIX], col_pos[COL_DOB], col_pos[COL_SSN])
     dl, pp, gv = col_pos[COL_DL], col_pos[COL_PASSPORT], col_pos[COL_GOVID]
     docid_pos = col_pos[COL_DOCID]
+    addr_pos = [col_pos[c] for c in ADDRESS_COLS]
     name_fields = ((COL_FIRST, fi), (COL_LAST, la), (COL_MIDDLE, mi))
     for i in range(len(df)):
         row = values[i]
@@ -282,6 +285,7 @@ def build_records(df: pd.DataFrame):
         r.dl = norm_pii(row[dl])
         r.passport = norm_pii(row[pp])
         r.govid = norm_pii(row[gv])
+        r.addr_key = tuple(norm_text(row[p]) for p in addr_pos)
         recs.append(r)
 
         for label, pos in name_fields:
@@ -401,6 +405,25 @@ def pii_match(r1: Rec, r2: Rec) -> bool:
     )
 
 
+def address_full_match(r1: Rec, r2: Rec) -> bool:
+    """True only when EVERY address field (street, city, state, province,
+    zip, country) is present and matches exactly on both sides - a partial
+    or blank address never counts."""
+    return all(r1.addr_key) and r1.addr_key == r2.addr_key
+
+
+def no_id_address_match(r1: Rec, r2: Rec) -> bool:
+    """Rule 13: SSN and DOB are BOTH missing on both rows (no identifier to
+    corroborate with at all), so a matching/typo name PLUS a fully matching
+    address together stand in as the corroborating proof. Only applies when
+    there is truly nothing else to go on - if either row has a real SSN or
+    DOB, the normal rules (which require SSN/DOB corroboration) apply
+    instead of this address-only fallback."""
+    if r1.ssn or r2.ssn or r1.dob or r2.dob:
+        return False
+    return name_match(r1, r2) and address_full_match(r1, r2)
+
+
 def is_match(r1: Rec, r2: Rec) -> bool:
     if suffix_conflict(r1, r2) or ssn_conflict(r1, r2) or name_conflict(r1, r2):
         return False
@@ -433,6 +456,12 @@ def is_match(r1: Rec, r2: Rec) -> bool:
         if r1_blank != r2_blank:
             return True
 
+    # Rule 13: SSN and DOB both missing on both rows - a matching/typo name
+    # PLUS a fully matching address (street+city+state+zip+country) stands
+    # in as the corroborating proof, since there's nothing else to go on.
+    if no_id_address_match(r1, r2):
+        return True
+
     return False
 
 
@@ -457,10 +486,11 @@ class UnionFind:
 
 # ------------------------------------------------------------
 # 6) Blocking - only test pairs that already share something exact, so we
-#    never do a full N x N comparison. Candidate pairs come from five
+#    never do a full N x N comparison. Candidate pairs come from seven
 #    cheap buckets; is_match() then applies the real rules within each.
 # ------------------------------------------------------------
 MAX_BUCKET_SIZE = 300   # safety valve: skip pairwise test inside a bucket
+LAST_NAME_PREFIX_LEN = 3   # must match last_compat()'s minimum prefix length
 
 
 def bucket_candidate_pairs(recs):
@@ -470,12 +500,21 @@ def bucket_candidate_pairs(recs):
             buckets[("ssn", r.ssn)].append(r.idx)
         if r.last and r.first:
             buckets[("name", r.last, r.first[0])].append(r.idx)
+            # last_compat()/last name Rules (5/6/13) allow a >=3-char PREFIX
+            # match (e.g. "Sklar" -> "Sklarczuk", "Sin"/"Sing" -> "Singh"),
+            # which an EXACT-last-name bucket above would never surface -
+            # two rows with different-but-prefix-related last names would
+            # otherwise never even be compared. Bucket by the first 3
+            # characters of the last name instead to catch these.
+            buckets[("lastprefix", r.last[:LAST_NAME_PREFIX_LEN], r.first[0])].append(r.idx)
         if r.dl:
             buckets[("dl", r.dl)].append(r.idx)
         if r.passport:
             buckets[("passport", r.passport)].append(r.idx)
         if r.govid:
             buckets[("govid", r.govid)].append(r.idx)
+        if all(r.addr_key):
+            buckets[("addr",) + r.addr_key].append(r.idx)
 
     pairs = set()
     skipped = 0
