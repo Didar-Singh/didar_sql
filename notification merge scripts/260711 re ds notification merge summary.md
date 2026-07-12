@@ -20,6 +20,7 @@ and confirmed first.
 | 9 | Any suffix (Jr, Sr, II, III, IV, etc.) present on one row, blank on the other, everything else matches | Merge; non-blank suffix kept |
 | 10 | Two different real SSNs, even if a similar name + matching DOB would otherwise corroborate (Rules 4–7) | **Do not merge** — different SSNs can never belong to one merged record |
 | 11 | SSN and DOB both match, but the two names are genuinely different (not a typo/prefix/initial) | **Do not merge** — flag for manual review (likely a fake/reused/incorrect SSN) |
+| 12 | SSN is partially masked/redacted (e.g. `123-45-XXXX`), known digits agree with the other row, **and** the names also match | Merge |
 | — | SSN or DOB differs (even if name is identical) | **Do not merge** — different person |
 | — | No matching SSN+DOB and none of rules 1–7 apply | **Do not merge** — stays a separate row |
 
@@ -74,16 +75,27 @@ same person rather than contradicting each other.
 
 → Merged into one person: `Jonathan Smith, SSN 123-45-6789, DOB 01/02/1980`.
 
-**3. Matching PII (e.g. same Driver's License, Passport, or other government
-ID), where one row's name is captured as "[Unknown]" and the other row has an
-actual name.** These are merged, and the real name takes precedence over
-"[Unknown]" (the "[Unknown]" value is dropped, not kept alongside the real
-name).
+**3. Matching PII (same SSN, Driver's License, Passport, or other government
+ID), where one row's name is captured as "[Unknown]" (or is entirely blank)
+and the other row has an actual name.** These are merged, and the real name
+takes precedence over "[Unknown]" (the "[Unknown]" value is dropped, not kept
+alongside the real name).
 
 | Name | Driver's License |
 |---|---|
 | [Unknown] | D1234567 |
 | Jonathan Smith | D1234567 |
+
+This also covers a matching SSN with a blank/"[Unknown]" name on one side:
+
+| First Name | Last Name | SSN |
+|---|---|---|
+| [Unknown] | [Unknown] | 123-45-6789 |
+| Jonathan | Smith | 123-45-6789 |
+
+→ Merged into one person: `Jonathan Smith, SSN 123-45-6789`. (Note: this only
+applies when the SSN is fully known on both sides - see Rule 12 below for
+partially masked SSNs, which need a real name on both sides to corroborate.)
 
 → Merged into one person: `Jonathan Smith, Driver's License D1234567`.
 
@@ -208,6 +220,35 @@ silently merged (or silently having one name overwrite the other).
 name variants of each other, so a shared SSN+DOB here is a data-quality flag,
 not a same-person confirmation.
 
+**12. SSN is partially masked/redacted** (e.g. `123-45-XXXX`, `123-45-6XXX`
+— some digits hidden as X). A masked SSN is compared only on its **known**
+digits: if those agree with the other row's SSN, **and there's enough known
+digits to be meaningful, and the names also match**, the rows are merged. A
+masked SSN by itself (with no name to back it up) is treated as too weak to
+confirm identity, so it is NOT merged on its own.
+
+| First Name | Last Name | SSN | DOB |
+|---|---|---|---|
+| Didar | Singh | 123-45-6789 | 01/02/1980 |
+| Didar | Singh | 123-45-XXXX | 01/02/1980 |
+
+→ Merged into one person: known digits (`123-45`) agree, and the name matches
+too.
+
+| First Name | Last Name | SSN | DOB |
+|---|---|---|---|
+| Didar | Singh | 123-45-6789 | 01/02/1980 |
+| *(blank)* | *(blank)* | 123-45-XXXX | 01/02/1980 |
+
+→ **Not merged.** The masked SSN's known digits agree, but there's no name on
+the second row to corroborate it — a masked SSN alone isn't trusted as proof
+of identity. (Contrast this with Rule 3, where a blank name is still merged
+when the SSN is *fully known*, not masked.)
+
+If a masked SSN's known digits actually **disagree** with the other row's
+known digits (e.g. `123-45-6789` vs. `123-99-XXXX`), that's a real conflict
+(Rule 10) and blocks the merge entirely, regardless of name.
+
 ## What counts as a "different person"
 
 If SSN or DOB is different, it's a different person — **even if the name is
@@ -253,6 +294,45 @@ are combined into a single row:
 
 Note the Driver's License value `D1234567` only appears once, since it was
 repeated.
+
+## What happens with multiple addresses
+
+Address is treated differently from other PII/PHI fields, because an address
+is really several fields (street, city, state/province, zip, country) that
+only make sense **together** — merging each field separately with semicolons
+would break the link between, say, a city and the zip code that actually goes
+with it.
+
+Instead:
+
+- The **most common address** among the matched rows (street + city +
+  state/province + zip + country, all together) is kept as-is in the normal
+  Residential Address / City / State / Province / Zip / Country columns.
+- Every **other, different address** is combined into a single readable
+  string (e.g. `123 Oak Ave, Chicago, IL, 60601, USA`) and all such other
+  addresses go into one new column, **"Other Address"**, separated by
+  semicolons.
+
+**Example — before merge (3 rows, 2 different addresses):**
+
+| Name | SSN | Residential Address | City | State | Zip |
+|---|---|---|---|---|---|
+| Jon Smith | 123-45-6789 | 123 Main St | Springfield | IL | 62701 |
+| Jonathan Smith | 123-45-6789 | 123 Main St | Springfield | IL | 62701 |
+| Jonathan Smith | 123-45-6789 | 456 Oak Ave | Chicago | IL | 60601 |
+
+**Example — after merge (one row):**
+
+| Name | SSN | Residential Address | City | State | Zip | Other Address |
+|---|---|---|---|---|---|---|
+| Jon Smith; Jonathan Smith | 123-45-6789 | 123 Main St | Springfield | IL | 62701 | 456 Oak Ave, Chicago, IL, 60601 |
+
+"123 Main St, Springfield, IL 62701" was the majority address (2 out of 3
+rows), so it stays in the normal columns exactly as entered. The one
+different address ("456 Oak Ave, Chicago, IL 60601") is kept in full, in the
+new "Other Address" column, instead of having its city/state/zip scattered
+into separate semicolon lists where they'd lose their connection to each
+other.
 
 ## What stays separate
 

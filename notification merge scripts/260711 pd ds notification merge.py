@@ -1,4 +1,4 @@
-"""
+﻿"""
 260711 pd ds notification merge.py
 
 Merge PII/PHI person records from an Excel export into one row per
@@ -9,7 +9,11 @@ documented in "260711 re ds notification merge summary.md" (Base rule
 INPUT  : an Excel workbook with the columns listed in EXPECTED_COLS below.
 OUTPUT : a new Excel workbook, ONE ROW PER CONFIRMED PERSON. Rows that
          match are combined; PII/PHI fields keep every distinct value
-         seen, joined with "; ".
+         seen, joined with "; ". Address fields (Residential Address, City,
+         State, Province, Zip, Country) are kept TOGETHER as one unit: the
+         most common address stays in those columns as-is, and every OTHER
+         distinct address goes into a new "Other Address" column as one
+         combined string per address, semicolon-joined.
 
 This script does not touch the input file. Save the output only to the
 secured/authorized folder for this data (never a desktop) - it contains
@@ -29,6 +33,7 @@ Run:
 import sys
 import re
 import itertools
+import unicodedata
 from collections import defaultdict
 
 import pandas as pd
@@ -53,17 +58,27 @@ COL_DL       = "Driver's License Number"
 COL_PASSPORT = "Passport Number"
 COL_GOVID    = "Government-Issued ID Number"
 
+# Address fields are handled specially (see ADDRESS_COLS below), not as
+# plain semicolon-merged columns - they need to stay together as one unit
+# per address, not be shuffled independently per field.
+COL_ADDR    = "Residential Address"
+COL_CITY    = "City"
+COL_STATE   = "State of Residence (if US)"
+COL_PROVINCE = "Province of Residence (if Canada)"
+COL_ZIP     = "Zip Code"
+COL_COUNTRY = "Country of Residence"
+
+# The full set of fields that make up "one address". The MAJORITY (most
+# common) address among a merged person's rows is kept in these columns as-is;
+# every OTHER distinct address goes into the "Other Address" output column
+# as one combined string per address, semicolon-joined.
+ADDRESS_COLS = [COL_ADDR, COL_CITY, COL_STATE, COL_PROVINCE, COL_ZIP, COL_COUNTRY]
+
 # Every other column in the sheet - these get semicolon-merged as-is.
 # Edit this list if your real headers differ.
 OTHER_MERGE_COLS = [
     "Data Subject Type",
     "Birth Information",
-    "Residential Address",
-    "City",
-    "State of Residence (if US)",
-    "Province of Residence (if Canada)",
-    "Zip Code",
-    "Country of Residence",
     "Address Comments",
     "Email Address - Personal",
     "Phone Number",
@@ -91,7 +106,7 @@ OTHER_MERGE_COLS = [
 
 EXPECTED_COLS = (
     [COL_DOCID, COL_FIRST, COL_LAST, COL_MIDDLE, COL_SUFFIX, COL_DOB, COL_SSN]
-    + OTHER_MERGE_COLS
+    + ADDRESS_COLS + OTHER_MERGE_COLS
 )
 
 MERGE_SEP = "; "
@@ -115,10 +130,28 @@ SSN_PLACEHOLDERS = {
 # ------------------------------------------------------------
 # 2) Normalization helpers
 # ------------------------------------------------------------
+# Zero-width space (U+200B), zero-width non-joiner (U+200C), zero-width
+# joiner (U+200D), word joiner (U+2060), BOM (U+FEFF), non-breaking space
+# (U+00A0), soft hyphen (U+00AD) - common invisible characters in Excel/CSV
+# exports that make two values which LOOK identical fail an exact-string
+# comparison. Built from chr() codes (not literal characters pasted into
+# this file), so the source itself never contains an actual invisible char.
+_INVISIBLE_CODEPOINTS = (0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF, 0x00A0, 0x00AD)
+_INVISIBLE_CHARS = re.compile("[" + "".join(chr(c) for c in _INVISIBLE_CODEPOINTS) + "]")
+
+
 def norm_text(v) -> str:
+    """Used as the DEDUP KEY everywhere (semicolon_merge, address_key, name
+    matching). Normalizes unicode (NFKC - so visually-identical characters
+    with different encodings compare equal), strips invisible characters
+    (zero-width space/joiner, BOM, soft hyphen, non-breaking space) that are
+    common in Excel/CSV exports and otherwise make two values that LOOK the
+    same fail an exact-string dedup check, then collapses whitespace and
+    upper-cases."""
     if v is None:
         return ""
-    s = str(v).replace(" ", " ")
+    s = unicodedata.normalize("NFKC", str(v))
+    s = _INVISIBLE_CHARS.sub(" ", s)
     s = re.sub(r"\s+", " ", s).strip().upper()
     return "" if s.lower() in ("nan", "none", "null") else s
 
@@ -137,18 +170,48 @@ def norm_suffix(v) -> str:
     return norm_text(v).replace(".", "")
 
 
+SSN_MIN_KNOWN_OVERLAP = 4   # min matching KNOWN digits to trust a masked SSN
+
+
+def is_junk_ssn(d: str) -> bool:
+    """True for a 9-digit (fully known) SSN that can't belong to a real
+    person: all-same-digit, or a known fake/placeholder value."""
+    return len(set(d)) == 1 or d in SSN_PLACEHOLDERS
+
+
 def norm_ssn(v) -> str:
-    """9 numeric digits only, not a known junk/placeholder value, or ''."""
+    """Return a 9-character pattern of digits and 'X' (X = redacted digit),
+    or '' if unusable. Mask characters *, #, ? are treated as X, so
+        123-45-6789 -> '123456789'
+        123-45-XXXX -> '12345XXXX'
+        123-45-6XXX -> '123456XXX'
+    Rejected (-> ''): not 9 characters, a fully-known junk SSN (all-same-
+    digit / known placeholder), or a masked SSN with fewer than
+    SSN_MIN_KNOWN_OVERLAP known digits (too little information to trust)."""
     if v is None:
         return ""
-    digits = re.sub(r"[^0-9]", "", str(v))
-    if len(digits) != 9:
+    s = str(v).upper().replace("*", "X").replace("#", "X").replace("?", "X")
+    kept = re.sub(r"[^0-9X]", "", s)
+    if len(kept) != 9:
         return ""
-    if len(set(digits)) == 1:               # 000000000, 111111111, ...
-        return ""
-    if digits in SSN_PLACEHOLDERS:
-        return ""
-    return digits
+    if "X" not in kept:                                    # fully known
+        return "" if is_junk_ssn(kept) else kept
+    known = sum(c != "X" for c in kept)                     # masked
+    return kept if known >= SSN_MIN_KNOWN_OVERLAP else ""
+
+
+def ssn_cmp(a: str, b: str) -> str:
+    """Compare two 9-char SSN patterns, 'X' = wildcard. Returns:
+        'diff'    - a known digit disagrees (definitely different SSNs)
+        'same'    - known digits agree on >= SSN_MIN_KNOWN_OVERLAP positions
+        'unknown' - compatible but not enough overlap to be sure"""
+    overlap = 0
+    for ca, cb in zip(a, b):
+        if ca != "X" and cb != "X":
+            if ca != cb:
+                return "diff"
+            overlap += 1
+    return "same" if overlap >= SSN_MIN_KNOWN_OVERLAP else "unknown"
 
 
 def norm_dob(v) -> str:
@@ -256,8 +319,37 @@ def suffix_conflict(r1: Rec, r2: Rec) -> bool:
 def ssn_conflict(r1: Rec, r2: Rec) -> bool:
     """Two DIFFERENT real SSNs must never be merged, even if a fuzzy name
     and a matching DOB (Rules 4-7) would otherwise corroborate the pair.
-    A blank SSN on either side is not a conflict (Rule 2 still applies)."""
-    return bool(r1.ssn) and bool(r2.ssn) and r1.ssn != r2.ssn
+    A blank SSN on either side is not a conflict (Rule 2 still applies).
+    Uses ssn_cmp so a known digit disagreeing between a masked and a full
+    SSN still blocks the merge; masked SSNs with no overlapping known
+    digits ('unknown') are NOT treated as a conflict."""
+    return bool(r1.ssn) and bool(r2.ssn) and ssn_cmp(r1.ssn, r2.ssn) == "diff"
+
+
+def ssn_same(r1: Rec, r2: Rec) -> bool:
+    """True when both SSNs are usable and agree. A FULLY KNOWN SSN match is
+    trusted on its own. A MASKED SSN (either side has an 'X') additionally
+    requires the names to actually match - a redacted number alone is too
+    weak to confirm identity without name corroboration."""
+    if not r1.ssn or not r2.ssn:
+        return False
+    if ssn_cmp(r1.ssn, r2.ssn) != "same":
+        return False
+    if "X" in r1.ssn or "X" in r2.ssn:
+        return name_match(r1, r2)
+    return True
+
+
+def identifier_match(r1: Rec, r2: Rec) -> bool:
+    """Rule 3's identifier check: matching PII (DL/Passport/Gov ID), OR a
+    fully-known (non-masked) SSN match. Masked SSNs are excluded here since
+    Rule 3 pairs a real identifier with a BLANK name on the other side, so
+    there is no name available to corroborate a masked/ambiguous SSN."""
+    return pii_match(r1, r2) or (
+        bool(r1.ssn) and bool(r2.ssn)
+        and "X" not in r1.ssn and "X" not in r2.ssn
+        and r1.ssn == r2.ssn
+    )
 
 
 def name_conflict(r1: Rec, r2: Rec) -> bool:
@@ -283,16 +375,16 @@ def is_match(r1: Rec, r2: Rec) -> bool:
     if suffix_conflict(r1, r2) or ssn_conflict(r1, r2) or name_conflict(r1, r2):
         return False
 
-    ssn_same = bool(r1.ssn) and r1.ssn == r2.ssn
+    ssn_matched = ssn_same(r1, r2)
     dob_same = bool(r1.dob) and r1.dob == r2.dob
 
-    if ssn_same and dob_same:                      # Base rule
+    if ssn_matched and dob_same:                    # Base rule
         return True
 
     nm = name_match(r1, r2)
-    if ssn_same and nm:                             # Rule 1 (DOB may differ)
+    if ssn_matched and nm:                          # Rule 1 (DOB may differ)
         return True
-    if nm and (ssn_same or dob_same):               # Rules 4-7
+    if nm and (ssn_matched or dob_same):            # Rules 4-7
         return True
 
     # Rule 2: same exact name, complementary SSN/DOB (one has SSN only,
@@ -303,8 +395,9 @@ def is_match(r1: Rec, r2: Rec) -> bool:
         if ssn_complementary and dob_complementary:
             return True
 
-    # Rule 3: matching PII, one side's name is entirely blank/"[Unknown]"
-    if pii_match(r1, r2):
+    # Rule 3: matching identifier (PII, or a fully-known SSN), one side's
+    # name is entirely blank/"[Unknown]"
+    if identifier_match(r1, r2):
         r1_blank = not r1.first and not r1.last
         r2_blank = not r2.first and not r2.last
         if r1_blank != r2_blank:
@@ -416,6 +509,57 @@ def majority_dob(sub_recs) -> str:
     return raw_for[best]
 
 
+def address_key(values) -> tuple:
+    """Normalized tuple used to tell whether two rows have the SAME address
+    (all fields blank-insensitive) - used to find the majority address."""
+    return tuple(norm_text(v) for v in values)
+
+
+def format_full_address(values) -> str:
+    """One address, all its parts combined into a single readable string,
+    e.g. '123 ABC Ln, Springfield, IL, 62701, USA'. Blank parts are skipped."""
+    parts = []
+    for v in values:
+        s = "" if v is None else str(v).strip()
+        if s and s.lower() not in ("nan", "none", "null"):
+            parts.append(s)
+    return ", ".join(parts)
+
+
+def split_addresses(df, group_idxs):
+    """Returns (majority_values, other_address_string) for one merged group.
+    majority_values: the ADDRESS_COLS values (as originally entered) for the
+    address that appears most often among this group's rows - these go into
+    the normal Residential Address/City/State/Zip/Country columns unchanged.
+    other_address_string: every OTHER distinct address in this group,
+    combined into one string per address and semicolon-joined, for the
+    'Other Address' column. A row with no address at all doesn't count as
+    a "real" address unless it's the only kind of address in the group."""
+    counts = defaultdict(int)
+    first_values = {}
+    first_seen_order = []
+    for idx in group_idxs:
+        values = tuple(df.at[idx, c] for c in ADDRESS_COLS)
+        key = address_key(values)
+        counts[key] += 1
+        if key not in first_values:
+            first_values[key] = values
+            first_seen_order.append(key)
+
+    non_blank_keys = [k for k in counts if any(k)]
+    candidates = non_blank_keys or list(counts.keys())
+    order_rank = {k: i for i, k in enumerate(first_seen_order)}
+    majority_key = max(candidates, key=lambda k: (counts[k], -order_rank[k]))
+
+    other_strings = []
+    for key in first_seen_order:
+        if key == majority_key or not any(key):
+            continue
+        other_strings.append(format_full_address(first_values[key]))
+
+    return first_values[majority_key], MERGE_SEP.join(other_strings)
+
+
 # ------------------------------------------------------------
 # 8) Main
 # ------------------------------------------------------------
@@ -450,7 +594,7 @@ def main() -> None:
         r1, r2 = recs[a_idx], recs[b_idx]
         if is_match(r1, r2):
             uf.union(a_idx, b_idx)
-        elif (bool(r1.ssn) and r1.ssn == r2.ssn
+        elif (ssn_same(r1, r2)
               and bool(r1.dob) and r1.dob == r2.dob
               and name_conflict(r1, r2)):
             name_conflict_review.append((a_idx, b_idx))
@@ -486,6 +630,12 @@ def main() -> None:
             # is_match() guarantees every real SSN in this group is identical.
             COL_SSN: fullest_value(sub[COL_SSN], [r.ssn for r in sub_recs]),
         }
+
+        majority_addr_values, other_address = split_addresses(df, group_idxs)
+        for c, v in zip(ADDRESS_COLS, majority_addr_values):
+            row[c] = v
+        row["Other Address"] = other_address
+
         for c in OTHER_MERGE_COLS:
             row[c] = semicolon_merge(sub[c])
         row["Rows Merged"] = len(group_idxs)
