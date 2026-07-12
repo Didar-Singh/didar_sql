@@ -265,11 +265,26 @@ SSN/DOB-based rules take over instead.
 → Merged into one person: `Brenda Sklarczuk` (fullest spelling of the last
 name kept), same address. "Sklar" is treated as a shortened/typo form of
 "Sklarczuk" here, same as the other partial-name rules — but this only
-kicks in because there's no SSN/DOB at all AND the full address matches.
+kicks in because there's no SSN/DOB at all AND the address matches.
 
-If the address didn't fully match too (even just a different Zip Code), or
-if either row had a real SSN or DOB present, these would **not** be merged
-under this rule.
+**"Address matches" is blank-tolerant** — the same rule as middle name/
+suffix: a field that's missing on just ONE row (e.g. Zip Code entered on one
+row but blank on the other) is not a conflict. What DOES block it is any
+field where BOTH rows have a real value and they genuinely disagree (e.g.
+two different Zip Codes), and at least one field must actually match on both
+sides (two addresses that are both completely blank don't count as "the
+same address").
+
+| First Name | Last Name | Address | City | State | Zip |
+|---|---|---|---|---|---|
+| Tlm | Test | 12 Elm St | Chicago | IL | 60601 |
+| Tlm | Test | 12 Elm St | Chicago | IL | *(blank)* |
+
+→ Merged — street/city/state all agree, and the blank Zip Code on the second
+row isn't a conflict.
+
+If either row had a real SSN or DOB, or if any address field genuinely
+disagreed (not just missing), this rule would not apply.
 
 ## What counts as a "different person"
 

@@ -129,7 +129,7 @@ EXCEL_MAX_ROWS = 1_048_576
 # brackets/parens/periods, so "[Unknown]", "(unknown)", "N/A" all match.
 NAME_PLACEHOLDERS = {
     "UNKNOWN", "UNK", "UNKN", "NA", "NONE", "NULL", "NIL",
-    "TEST", "XXX", "XX", "X", "NMN", "NONAME", "NOTGIVEN", "NOTPROVIDED",
+    "XXX", "XX", "X", "NMN", "NONAME", "NOTGIVEN", "NOTPROVIDED",
 }
 
 # Fake / junk SSNs that must never be used to match people.
@@ -412,15 +412,25 @@ def pii_match(r1: Rec, r2: Rec) -> bool:
 
 
 def address_full_match(r1: Rec, r2: Rec) -> bool:
-    """True only when EVERY address field (street, city, state, province,
-    zip, country) is present and matches exactly on both sides - a partial
-    or blank address never counts."""
-    return all(r1.addr_key) and r1.addr_key == r2.addr_key
+    """True when the address fields (street, city, state, province, zip,
+    country) are compatible: no field where BOTH sides have a real value
+    that disagrees (e.g. different Zip Codes is a conflict), AND at least
+    ONE field has a real, matching value on both sides (so two addresses
+    that are both entirely blank don't vacuously "match" each other). A
+    field blank on just one side (e.g. Zip Code missing on one row) is not
+    a conflict - same tolerance as the middle name / suffix rules."""
+    real_match_found = False
+    for a, b in zip(r1.addr_key, r2.addr_key):
+        if a and b:
+            if a != b:
+                return False
+            real_match_found = True
+    return real_match_found
 
 
 def no_id_address_match(r1: Rec, r2: Rec) -> bool:
     """Rule 13: SSN and DOB are BOTH missing on both rows (no identifier to
-    corroborate with at all), so a matching/typo name PLUS a fully matching
+    corroborate with at all), so a matching/typo name PLUS a compatible
     address together stand in as the corroborating proof. Only applies when
     there is truly nothing else to go on - if either row has a real SSN or
     DOB, the normal rules (which require SSN/DOB corroboration) apply
