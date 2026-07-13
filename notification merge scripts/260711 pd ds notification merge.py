@@ -56,8 +56,19 @@ import re
 import itertools
 import unicodedata
 from collections import defaultdict
+from multiprocessing import Pool
 
 import pandas as pd
+
+# Worker processes for the pairwise clustering step (the slowest phase on
+# large files). Plain `threading` would NOT help here - is_match() is pure
+# CPU-bound Python, and the GIL serializes threads so they'd just take turns
+# instead of running in parallel. Separate processes actually parallelize it.
+PARALLEL_WORKERS = 4
+# Below this many candidate pairs, run single-process instead - spinning up
+# worker processes has real overhead (~tens of ms each) that isn't worth it
+# for a small/quick run.
+PARALLEL_THRESHOLD = 20_000
 
 # ------------------------------------------------------------
 # Progress bar - one line, updated in place, no per-item explanation.
@@ -340,6 +351,38 @@ def is_match(r1: Rec, r2: Rec) -> bool:
 
 
 # ------------------------------------------------------------
+# 4b) Multiprocessing workers for the pairwise clustering step. Must be
+#     module-level functions (not closures) so they can be pickled and sent
+#     to worker processes. _worker_recs is set once per worker via the Pool
+#     initializer, instead of re-sending the full `recs` list with every
+#     chunk.
+# ------------------------------------------------------------
+_worker_recs = None
+
+
+def _init_worker(recs):
+    global _worker_recs
+    _worker_recs = recs
+
+
+def _match_chunk(chunk):
+    """Runs in a worker process: tests every pair in this chunk, returns only
+    the ones that matched."""
+    return [(a, b) for a, b in chunk if is_match(_worker_recs[a], _worker_recs[b])]
+
+
+def _chunk_pairs(pairs_list, target_chunks=200, min_chunk_size=200):
+    """Splits pairs_list into roughly target_chunks pieces (never smaller
+    than min_chunk_size), so progress can update ~target_chunks times
+    regardless of how many pairs there are in total."""
+    n = len(pairs_list)
+    if n == 0:
+        return []
+    chunk_size = max(min_chunk_size, -(-n // target_chunks))   # ceil division
+    return [pairs_list[i:i + chunk_size] for i in range(0, n, chunk_size)]
+
+
+# ------------------------------------------------------------
 # 5) Union-Find (disjoint set) for transitive clustering
 # ------------------------------------------------------------
 class UnionFind:
@@ -526,12 +569,30 @@ def main() -> None:
     print(f"  {len(pairs):,} candidate pairs to test.")
 
     uf = UnionFind(len(recs))
-    total_pairs = len(pairs)
-    for tested, (a_idx, b_idx) in enumerate(pairs, 1):
-        r1, r2 = recs[a_idx], recs[b_idx]
-        if is_match(r1, r2):
-            uf.union(a_idx, b_idx)
-        progress("Clustering", tested, total_pairs)
+    pairs_list = list(pairs)
+    total_pairs = len(pairs_list)
+
+    if total_pairs < PARALLEL_THRESHOLD:
+        # Small run - not worth the process-startup overhead, just test
+        # in-process.
+        for tested, (a_idx, b_idx) in enumerate(pairs_list, 1):
+            if is_match(recs[a_idx], recs[b_idx]):
+                uf.union(a_idx, b_idx)
+            progress("Clustering", tested, total_pairs)
+    else:
+        # Large run - spread the pairwise is_match() tests across
+        # PARALLEL_WORKERS separate processes (real parallelism; a thread
+        # pool would not help here, see PARALLEL_WORKERS comment above).
+        # The actual uf.union() calls stay single-process afterward, since
+        # Union-Find is shared, mutable state that can't be split safely.
+        chunks = _chunk_pairs(pairs_list)
+        done = 0
+        with Pool(processes=PARALLEL_WORKERS, initializer=_init_worker, initargs=(recs,)) as pool:
+            for matched in pool.imap_unordered(_match_chunk, chunks):
+                for a_idx, b_idx in matched:
+                    uf.union(a_idx, b_idx)
+                done += 1
+                progress("Clustering", done, len(chunks))
 
     raw_groups = defaultdict(list)
     for r in recs:
