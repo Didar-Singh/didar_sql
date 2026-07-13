@@ -2,7 +2,7 @@
 260711 pd ds notification merge.py
 
 Merge PII/PHI person records from an Excel export into one row per
-confirmed person, for the notification report. Six rules, built step by
+confirmed person, for the notification report. Eight rules, built step by
 step:
 
   Rule 1 (SSN Exists): rows with the same (non-blank, non-junk) SSN
@@ -28,6 +28,17 @@ step:
                         License Number instead of Employee ID.
   Rule 6 (Passport Number, Name): same as Rule 4, but matched on Passport
                         Number instead of Employee ID.
+  Rule 7 (Phone Number, Name): same as Rule 4, but matched on Phone Number
+                        instead of Employee ID.
+  Rule 8 (Full Address, Name): Residential Address, City, State, Zip, and
+                        Province are each checked individually - blank on
+                        either side is fine, but a real, differing value in
+                        ANY of them blocks the merge, and at least one field
+                        must genuinely match on both sides. Unlike SSN,
+                        address is NEVER enough to override a name
+                        difference on its own - this also always requires
+                        an EXACT Name match and SSN/DOB to be
+                        matching-or-blank, same as Rules 4-7.
 
 Either rule matching is enough to merge, and the match is transitive (if
 A matches B and B matches C, all three end up in one merged row, even if
@@ -135,13 +146,14 @@ COL_SUFFIX = "Suffix"
 COL_DOB    = "Full Date of Birth (MM/DD/YYYY)"
 COL_SSN    = "Social Security Number"
 
-# COL_EMPID/COL_DL/COL_PASSPORT are used for matching (Rules 4-6). COL_GOVID
-# isn't used for matching - kept as a plain semicolon-merged column in
-# OTHER_MERGE_COLS below.
+# COL_EMPID/COL_DL/COL_PASSPORT/COL_PHONE are used for matching (Rules 4-7).
+# COL_GOVID isn't used for matching - kept as a plain semicolon-merged
+# column in OTHER_MERGE_COLS below.
 COL_DL       = "Driver's License Number"
 COL_PASSPORT = "Passport Number"
 COL_GOVID    = "Government-Issued ID Number"
 COL_EMPID    = "Employee Identification Number"
+COL_PHONE    = "Phone Number"
 
 # Address fields are handled specially (see ADDRESS_COLS below), not as
 # plain semicolon-merged columns - they need to stay together as one unit
@@ -166,7 +178,7 @@ OTHER_MERGE_COLS = [
     "Birth Information",
     "Address Comments",
     "Email Address - Personal",
-    "Phone Number",
+    COL_PHONE,
     "Contact Information",
     COL_DL,
     "DL Issuing Country",
@@ -351,7 +363,8 @@ def parse_id_tokens(v) -> frozenset:
 # ------------------------------------------------------------
 class Rec:
     __slots__ = ("idx", "first", "last", "mid", "dob", "dob_raw", "ssn",
-                 "empids", "dl_ids", "passport_ids")
+                 "empids", "dl_ids", "passport_ids", "phones",
+                 "addr", "city", "state", "zip", "province")
 
     def __init__(self, idx):
         self.idx = idx
@@ -371,9 +384,11 @@ def build_records(df: pd.DataFrame):
     ssn_review = []
     col_pos = {c: p for p, c in enumerate(df.columns)}
     values = df.values  # numpy object array, fast positional access
-    fi, la, mi, do, ss, ei, dl, pp = (
+    fi, la, mi, do, ss, ei, dl, pp, ph, ad, ci, st, zp, pv = (
         col_pos[COL_FIRST], col_pos[COL_LAST], col_pos[COL_MIDDLE], col_pos[COL_DOB],
         col_pos[COL_SSN], col_pos[COL_EMPID], col_pos[COL_DL], col_pos[COL_PASSPORT],
+        col_pos[COL_PHONE], col_pos[COL_ADDR], col_pos[COL_CITY], col_pos[COL_STATE],
+        col_pos[COL_ZIP], col_pos[COL_PROVINCE],
     )
     docid_pos = col_pos[COL_DOCID]
     for i in range(len(df)):
@@ -388,6 +403,12 @@ def build_records(df: pd.DataFrame):
         r.empids = parse_id_tokens(row[ei])
         r.dl_ids = parse_id_tokens(row[dl])
         r.passport_ids = parse_id_tokens(row[pp])
+        r.phones = parse_id_tokens(row[ph])
+        r.addr = norm_text(row[ad])
+        r.city = norm_text(row[ci])
+        r.state = norm_text(row[st])
+        r.zip = norm_text(row[zp])
+        r.province = norm_text(row[pv])
         recs.append(r)
 
         reason = classify_ssn_issue(row[ss])
@@ -480,12 +501,27 @@ def has_no_identifiers(r: Rec) -> bool:
     return not r.ssn and not r.dob
 
 
+def address_conflict(r1: Rec, r2: Rec) -> bool:
+    """True when Residential Address, City, State, Zip, or Province has a
+    real, DIFFERING value on both sides (blank on either side is never a
+    conflict here). Used to block Step 3 from merging two same-named people
+    whose addresses actively disagree, with no SSN/DOB to corroborate
+    either way - matching name alone isn't enough when the address itself
+    contradicts it."""
+    fields1 = (r1.addr, r1.city, r1.state, r1.zip, r1.province)
+    fields2 = (r2.addr, r2.city, r2.state, r2.zip, r2.province)
+    return any(a and b and a != b for a, b in zip(fields1, fields2))
+
+
 def no_identifier_name_match(r1: Rec, r2: Rec) -> bool:
     """Step 3 - 'Name-Only, No Identifiers': only applies when at least one
     side has no SSN and no DOB at all (see has_no_identifiers()) - otherwise
     Rule 2 already covers rows that both have a DOB. Matches on Last Name
     (exact) plus a compatible First Name (exact match, or blank on either
-    side - a blank First Name is never treated as a conflict). This is
+    side - a blank First Name is never treated as a conflict), AS LONG AS
+    the address doesn't actively conflict (see address_conflict()) - two
+    same-named people with genuinely different addresses and nothing else
+    to go on should stay separate, not merge on name alone. This is
     intentionally weaker evidence than Rules 1/2 (name alone, no SSN/DOB
     backing it up), so it's a last-resort fallback for bare-bones records.
     The group-level SSN-consistency check in main() still applies - if this
@@ -496,6 +532,8 @@ def no_identifier_name_match(r1: Rec, r2: Rec) -> bool:
     if not r1.last or not r2.last or r1.last != r2.last:
         return False
     if r1.first and r2.first and r1.first != r2.first:
+        return False
+    if address_conflict(r1, r2):
         return False
     return True
 
@@ -535,6 +573,34 @@ def passport_name_match(r1: Rec, r2: Rec) -> bool:
     return _id_name_match(r1.passport_ids, r2.passport_ids, r1, r2)
 
 
+def phone_name_match(r1: Rec, r2: Rec) -> bool:
+    """Step 7 - 'Phone Number, Name' (see _id_name_match())."""
+    return _id_name_match(r1.phones, r2.phones, r1, r2)
+
+
+def address_name_match(r1: Rec, r2: Rec) -> bool:
+    """Step 8 - 'Full Address, Name': Residential Address, City, State,
+    Zip, and Province are each checked individually - blank on either side
+    is fine, but a real, differing value in ANY of them is a conflict that
+    blocks the merge. At least one of these fields must have a genuine
+    matching value on BOTH sides (two addresses that are entirely blank on
+    one side never 'match' just because nothing conflicts).
+
+    Unlike SSN (Rule 1), address is NEVER enough on its own to override a
+    name difference - an EXACT Name match is always required here too,
+    plus SSN/DOB each being matching-or-blank (compatible()), same as
+    Rules 4-7."""
+    if address_conflict(r1, r2):
+        return False
+    fields1 = (r1.addr, r1.city, r1.state, r1.zip, r1.province)
+    fields2 = (r2.addr, r2.city, r2.state, r2.zip, r2.province)
+    if not any(a and b and a == b for a, b in zip(fields1, fields2)):
+        return False   # nothing real actually overlaps - not a match
+    if not (r1.first and r1.last and r1.first == r2.first and r1.last == r2.last):
+        return False
+    return compatible(r1.ssn, r2.ssn) and compatible(r1.dob, r2.dob)
+
+
 def is_match(r1: Rec, r2: Rec) -> bool:
     return (
         ssn_exists_match(r1, r2)
@@ -543,6 +609,8 @@ def is_match(r1: Rec, r2: Rec) -> bool:
         or empid_name_match(r1, r2)
         or dl_name_match(r1, r2)
         or passport_name_match(r1, r2)
+        or phone_name_match(r1, r2)
+        or address_name_match(r1, r2)
     )
 
 
@@ -642,6 +710,23 @@ def bucket_candidate_pairs(recs):
         if r.passport_ids and r.first and r.last:      # Rule 6: Passport Number, Name
             for tok in r.passport_ids:
                 buckets[("ppname", tok, r.first, r.last)].append(r.idx)
+        if r.phones and r.first and r.last:            # Rule 7: Phone Number, Name
+            for tok in r.phones:
+                buckets[("phonename", tok, r.first, r.last)].append(r.idx)
+        # Rule 8: Full Address, Name - bucket by each address FIELD
+        # individually (not the whole address as one key), since
+        # address_name_match() only needs ONE field to genuinely overlap.
+        # is_match() then does the real per-field compatibility check.
+        if r.addr:
+            buckets[("addrfield", "addr", r.addr)].append(r.idx)
+        if r.city:
+            buckets[("addrfield", "city", r.city)].append(r.idx)
+        if r.state:
+            buckets[("addrfield", "state", r.state)].append(r.idx)
+        if r.zip:
+            buckets[("addrfield", "zip", r.zip)].append(r.idx)
+        if r.province:
+            buckets[("addrfield", "province", r.province)].append(r.idx)
 
     for (kind, last, first), rep_idx in lastfirst_reps.items():
         blank_key = ("lastblank", last)
@@ -673,27 +758,15 @@ def bucket_candidate_pairs(recs):
 # ------------------------------------------------------------
 def semicolon_merge(values) -> str:
     """Distinct, non-blank values joined with '; ', first-seen order,
-    original casing preserved; dedup key is upper/trimmed."""
-    seen = set()
-    out = []
-    for v in values:
-        raw = "" if v is None else str(v).strip()
-        key = norm_text(raw)
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        out.append(raw)
-    return MERGE_SEP.join(out)
-
-
-def merge_id_tokens(values) -> str:
-    """Like semicolon_merge(), but for Employee ID / Driver's License /
-    Passport Number: a cell can ALREADY contain multiple semicolon-joined
-    IDs (e.g. '12345; 12346' or '12345;12346' - inconsistent spacing in the
-    source data), so this splits every cell into individual tokens FIRST
-    and dedupes at the token level. Plain semicolon_merge() dedupes whole-
-    cell strings, which would leave literal repeats like
-    '12345; 12345; 12346; 12346;12347' instead of '12345; 12346; 12347'."""
+    original casing preserved; dedup key is upper/trimmed. Splits every
+    cell on ';' FIRST and dedupes at that token level (not just whole-cell
+    strings) - source cells can already contain multiple semicolon-joined
+    sub-values themselves (e.g. '12345; 12346', or '12345;12346' with
+    inconsistent spacing, or a literal repeat like '123;456;123'), and
+    whole-cell-only dedup would leave those repeats sitting in the output
+    untouched. Applies uniformly to every semicolon-merged column, not just
+    the ID fields, since this repeated-token pattern can turn up in any
+    column depending on how the source data was entered."""
     seen = set()
     out = []
     for v in values:
@@ -868,13 +941,16 @@ def main() -> None:
             refused_ssn += 1
             return   # would combine two different real SSNs - refused
         r1, r2 = recs[a_idx], recs[b_idx]
-        # Rules 2/4/5/6 all require an EXACT First+Last match between r1/r2
+        # Rules 2, 4-8 all require an EXACT First+Last match between r1/r2
         # directly, so they can never themselves introduce a first-name
-        # conflict - only Rule 3 (blank-First fallback) can, hence the guard
-        # below only matters when none of the stronger rules also apply.
+        # conflict. Only Rule 3 (blank-First fallback) can actually
+        # introduce one, hence the guard below only matters when none of
+        # the stronger rules also apply.
         if not (
             ssn_exists_match(r1, r2) or exact_name_dob_match(r1, r2)
-            or empid_name_match(r1, r2) or dl_name_match(r1, r2) or passport_name_match(r1, r2)
+            or empid_name_match(r1, r2) or dl_name_match(r1, r2)
+            or passport_name_match(r1, r2) or phone_name_match(r1, r2)
+            or address_name_match(r1, r2)
         ):
             fa, fb = group_first[ra], group_first[rb]
             if fa and fb and fa.isdisjoint(fb):
@@ -927,8 +1003,7 @@ def main() -> None:
               f"Name-Only fallback rule.")
 
     print("Building merged output ...")
-    TOKEN_ID_COLS = [COL_EMPID, COL_DL, COL_PASSPORT]
-    SEMICOLON_COLS = [COL_DOCID] + [c for c in OTHER_MERGE_COLS if c not in TOKEN_ID_COLS]
+    SEMICOLON_COLS = [COL_DOCID] + OTHER_MERGE_COLS
     total_groups = len(groups)
     out_rows = []
     for n, group_idxs in enumerate(groups, 1):
@@ -943,8 +1018,6 @@ def main() -> None:
         row[COL_SUFFIX] = fullest_value(sub[COL_SUFFIX], [norm_text(v) for v in sub[COL_SUFFIX]])
         row[COL_SSN] = fullest_value(sub[COL_SSN], [r.ssn for r in sub_recs])
         row[COL_DOB] = majority_dob(sub_recs)
-        for c in TOKEN_ID_COLS:
-            row[c] = merge_id_tokens(sub[c])
 
         majority_addr_values, other_address = split_addresses(df, group_idxs)
         for c, v in zip(ADDRESS_COLS, majority_addr_values):
