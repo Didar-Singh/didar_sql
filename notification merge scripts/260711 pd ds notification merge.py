@@ -863,10 +863,26 @@ def has_variation(raw_values) -> bool:
     return len({norm_text(v) for v in raw_values if norm_text(v)}) > 1
 
 
+def zip_key(v) -> str:
+    """Normalized comparison key for a ZIP/postal code: the 5-digit prefix
+    for a US-style ZIP (so '12345' and '12345-1234' compare equal), or the
+    plain normalized text for anything else (e.g. non-US postal codes that
+    don't have 5+ digits to extract a prefix from)."""
+    z5 = zip5(norm_text(v))
+    return z5 if z5 else norm_text(v)
+
+
 def address_key(values) -> tuple:
     """Normalized tuple used to tell whether two rows have the SAME address
-    (all fields blank-insensitive) - used to find the majority address."""
-    return tuple(norm_text(v) for v in values)
+    (all fields blank-insensitive) - used to find the majority address.
+    ADDRESS_COLS order is Residential Address, City, State, Province, Zip,
+    Country - Zip is compared via zip_key() (5-digit prefix) so a plain
+    5-digit ZIP and its ZIP+4 form count as the SAME address here, matching
+    how they're already treated during merging (see zip5())."""
+    return tuple(
+        zip_key(v) if col == COL_ZIP else norm_text(v)
+        for col, v in zip(ADDRESS_COLS, values)
+    )
 
 
 def format_full_address(values) -> str:
