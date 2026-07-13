@@ -324,9 +324,45 @@ def build_records(df: pd.DataFrame):
 #    Add each newly confirmed rule here as its own small function, then
 #    call it from is_match() below.
 # ------------------------------------------------------------
+def _name_compat(a: str, b: str) -> bool:
+    """Loose compatibility check used ONLY by identity_conflict() below:
+    blank on either side, exact match, or one is a text prefix of the other
+    (covers initials/nicknames like 'D'/'Didar', 'Jon'/'Jonathan'). This is
+    intentionally more forgiving than Rule 2's exact-only matching, since
+    here it's just deciding whether a name difference LOOKS like ordinary
+    spelling variation vs. a genuinely different name."""
+    if not a or not b:
+        return True
+    if a == b:
+        return True
+    short, long_ = (a, b) if len(a) <= len(b) else (b, a)
+    return long_.startswith(short)
+
+
+def identity_conflict(r1: Rec, r2: Rec) -> bool:
+    """True when EVERY other available signal disagrees: both First and
+    Last Name are present on both sides and genuinely unrelated (not exact,
+    not an initial/prefix match - e.g. 'James Ebersole' vs 'Jose Gallegos'),
+    AND both DOBs are present and different. This means a shared SSN is
+    more likely itself wrong/reused/fake than proof of the same identity, so
+    it blocks Step 1 (SSN Exists) for this specific pair. If DOB is blank on
+    either side, or the names are merely spelling variants, this does NOT
+    fire - Rule 1 still merges purely on a shared SSN as usual."""
+    if not (r1.first and r1.last and r2.first and r2.last):
+        return False
+    if _name_compat(r1.first, r2.first) and _name_compat(r1.last, r2.last):
+        return False
+    return bool(r1.dob) and bool(r2.dob) and r1.dob != r2.dob
+
+
 def ssn_exists_match(r1: Rec, r2: Rec) -> bool:
     """Step 1 - 'SSN Exists': both rows have a usable (non-blank, non-junk)
-    SSN and it's the same value. Name is NOT considered here at all."""
+    SSN and it's the same value. Name is NOT considered here at all, UNLESS
+    identity_conflict() also finds the DOB disagreeing on top of a
+    genuinely unrelated name - in that case the shared SSN alone isn't
+    trusted (see identity_conflict())."""
+    if identity_conflict(r1, r2):
+        return False
     return bool(r1.ssn) and bool(r2.ssn) and r1.ssn == r2.ssn
 
 
