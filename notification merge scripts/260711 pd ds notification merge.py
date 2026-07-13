@@ -2,8 +2,8 @@
 260711 pd ds notification merge.py
 
 Merge PII/PHI person records from an Excel export into one row per
-confirmed person, for the notification report. Two rules only, built
-step by step:
+confirmed person, for the notification report. Three rules, built step by
+step:
 
   Rule 1 (SSN Exists): rows with the same (non-blank, non-junk) SSN
                         are merged.
@@ -11,6 +11,13 @@ step by step:
                         (exact text match) AND the same DOB are merged,
                         as long as their SSNs don't conflict (blank on
                         either/both sides is fine).
+  Rule 3 (Name-Only, No Identifiers): if EITHER row has no usable SSN and
+                        no DOB at all (nothing to corroborate identity),
+                        fall back to matching on Last Name (exact) +
+                        compatible First Name (exact match, or blank on
+                        either side). This lets a bare-bones record with
+                        no SSN/DOB still attach to a fuller record by name
+                        alone.
 
 Either rule matching is enough to merge, and the match is transitive (if
 A matches B and B matches C, all three end up in one merged row, even if
@@ -346,8 +353,38 @@ def exact_name_dob_match(r1: Rec, r2: Rec) -> bool:
     )
 
 
+def has_no_identifiers(r: Rec) -> bool:
+    """True when a row has NEITHER a usable SSN NOR a DOB - nothing at all
+    to corroborate identity with."""
+    return not r.ssn and not r.dob
+
+
+def no_identifier_name_match(r1: Rec, r2: Rec) -> bool:
+    """Step 3 - 'Name-Only, No Identifiers': only applies when at least one
+    side has no SSN and no DOB at all (see has_no_identifiers()) - otherwise
+    Rule 2 already covers rows that both have a DOB. Matches on Last Name
+    (exact) plus a compatible First Name (exact match, or blank on either
+    side - a blank First Name is never treated as a conflict). This is
+    intentionally weaker evidence than Rules 1/2 (name alone, no SSN/DOB
+    backing it up), so it's a last-resort fallback for bare-bones records.
+    The group-level SSN-consistency check in main() still applies - if this
+    rule ever bridges two records that turn out to have different real
+    SSNs, the whole group is un-merged again."""
+    if not (has_no_identifiers(r1) or has_no_identifiers(r2)):
+        return False
+    if not r1.last or not r2.last or r1.last != r2.last:
+        return False
+    if r1.first and r2.first and r1.first != r2.first:
+        return False
+    return True
+
+
 def is_match(r1: Rec, r2: Rec) -> bool:
-    return ssn_exists_match(r1, r2) or exact_name_dob_match(r1, r2)
+    return (
+        ssn_exists_match(r1, r2)
+        or exact_name_dob_match(r1, r2)
+        or no_identifier_name_match(r1, r2)
+    )
 
 
 # ------------------------------------------------------------
@@ -416,6 +453,8 @@ def bucket_candidate_pairs(recs):
             buckets[("ssn", r.ssn)].append(r.idx)
         if r.first and r.last and r.dob:              # Rule 2: Exact Name, DOB
             buckets[("namedob", r.first, r.last, r.dob)].append(r.idx)
+        if r.last:                                    # Rule 3: Name-Only, No Identifiers
+            buckets[("lastname", r.last)].append(r.idx)
 
     pairs = set()
     skipped_buckets = 0
