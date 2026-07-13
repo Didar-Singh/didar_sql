@@ -5,8 +5,13 @@ Merge PII/PHI person records from an Excel export into one row per
 confirmed person, for the notification report. Eight rules, built step by
 step:
 
-  Rule 1 (SSN Exists): rows with the same (non-blank, non-junk) SSN
-                        are merged.
+  Rule 1 (SSN Exists): rows with the same (non-blank, non-junk) SSN are
+                        merged (Name is not considered), UNLESS both rows
+                        also have a real DOB and it genuinely disagrees
+                        (dob_conflict()) - two different real DOBs mean the
+                        shared SSN is more likely wrong/reused than proof
+                        of the same identity, so those two rows are kept
+                        separate rather than merged.
   Rule 2 (Exact Name, DOB): rows with the same First Name + Last Name
                         (exact text match) AND the same DOB are merged,
                         as long as their SSNs don't conflict (blank on
@@ -58,7 +63,10 @@ OUTPUT : a new Excel workbook with two sheets:
              fullest/most complete value among the merged rows (placeholder
              values like "[Unknown]" are never picked).
            - Suffix: the single fullest non-blank value.
-           - DOB: the most frequent (majority) value among the merged rows.
+           - DOB: every distinct value seen among the merged rows, joined
+             with "; " (Rule 1 doesn't require DOB to match, so a merged
+             group can legitimately contain more than one DOB value - all
+             of them are kept, not collapsed to a single "winner").
            - Employee ID, Driver's License, and Passport Number: every
              distinct ID TOKEN seen (cells can already contain multiple
              semicolon-joined IDs - see parse_id_tokens()), deduplicated
@@ -372,7 +380,7 @@ def parse_id_tokens(v) -> frozenset:
 #    (this loop runs millions of times, so dict-key lookups add up)
 # ------------------------------------------------------------
 class Rec:
-    __slots__ = ("idx", "first", "last", "mid", "dob", "dob_raw", "ssn",
+    __slots__ = ("idx", "first", "last", "mid", "dob", "ssn",
                  "empids", "dl_ids", "passport_ids", "phones",
                  "addr", "city", "state", "zip", "province")
 
@@ -407,7 +415,6 @@ def build_records(df: pd.DataFrame):
         r.first = norm_name(row[fi])
         r.last = norm_name(row[la])
         r.mid = norm_name(row[mi])
-        r.dob_raw = row[do]
         r.dob = norm_dob(row[do])
         r.ssn = norm_ssn(row[ss])
         r.empids = parse_id_tokens(row[ei])
@@ -437,44 +444,25 @@ def build_records(df: pd.DataFrame):
 #    Add each newly confirmed rule here as its own small function, then
 #    call it from is_match() below.
 # ------------------------------------------------------------
-def _name_compat(a: str, b: str) -> bool:
-    """Loose compatibility check used ONLY by identity_conflict() below:
-    blank on either side, exact match, or one is a text prefix of the other
-    (covers initials/nicknames like 'D'/'Didar', 'Jon'/'Jonathan'). This is
-    intentionally more forgiving than Rule 2's exact-only matching, since
-    here it's just deciding whether a name difference LOOKS like ordinary
-    spelling variation vs. a genuinely different name."""
-    if not a or not b:
-        return True
-    if a == b:
-        return True
-    short, long_ = (a, b) if len(a) <= len(b) else (b, a)
-    return long_.startswith(short)
-
-
-def identity_conflict(r1: Rec, r2: Rec) -> bool:
-    """True when EVERY other available signal disagrees: both First and
-    Last Name are present on both sides and genuinely unrelated (not exact,
-    not an initial/prefix match - e.g. 'James Ebersole' vs 'Jose Gallegos'),
-    AND both DOBs are present and different. This means a shared SSN is
-    more likely itself wrong/reused/fake than proof of the same identity, so
-    it blocks Step 1 (SSN Exists) for this specific pair. If DOB is blank on
-    either side, or the names are merely spelling variants, this does NOT
-    fire - Rule 1 still merges purely on a shared SSN as usual."""
-    if not (r1.first and r1.last and r2.first and r2.last):
-        return False
-    if _name_compat(r1.first, r2.first) and _name_compat(r1.last, r2.last):
-        return False
+def dob_conflict(r1: Rec, r2: Rec) -> bool:
+    """True when BOTH rows have a usable DOB and it genuinely disagrees.
+    Blocks Step 1 (SSN Exists) - a matching SSN is NOT trusted enough to
+    override two different real DOBs, regardless of whether the names
+    match, are spelling variants, or are unrelated. Two rows with the same
+    SSN but different DOBs are kept as separate entities rather than
+    merged into one row with multiple DOB values. Blank DOB on either side
+    is not a conflict - Rule 1 still merges purely on a shared SSN then, as
+    usual."""
     return bool(r1.dob) and bool(r2.dob) and r1.dob != r2.dob
 
 
 def ssn_exists_match(r1: Rec, r2: Rec) -> bool:
     """Step 1 - 'SSN Exists': both rows have a usable (non-blank, non-junk)
-    SSN and it's the same value. Name is NOT considered here at all, UNLESS
-    identity_conflict() also finds the DOB disagreeing on top of a
-    genuinely unrelated name - in that case the shared SSN alone isn't
-    trusted (see identity_conflict())."""
-    if identity_conflict(r1, r2):
+    SSN and it's the same value. Name is NOT considered here at all, but a
+    genuinely differing DOB on both sides blocks the merge (dob_conflict())
+    - a shared SSN alone isn't trusted enough to override two different
+    real DOBs."""
+    if dob_conflict(r1, r2):
         return False
     return bool(r1.ssn) and bool(r2.ssn) and r1.ssn == r2.ssn
 
@@ -511,15 +499,25 @@ def has_no_identifiers(r: Rec) -> bool:
     return not r.ssn and not r.dob
 
 
+def zip5(v: str) -> str:
+    """First 5 digits of a ZIP code, ignoring hyphens/spaces and any ZIP+4
+    suffix - so '62701' and '62701-1234' compare as the SAME base ZIP
+    instead of a conflict. '' if fewer than 5 digits (not ZIP-shaped)."""
+    digits = re.sub(r"[^0-9]", "", v)
+    return digits[:5] if len(digits) >= 5 else ""
+
+
 def address_conflict(r1: Rec, r2: Rec) -> bool:
     """True when Residential Address, City, State, Zip, or Province has a
     real, DIFFERING value on both sides (blank on either side is never a
-    conflict here). Used to block Step 3 from merging two same-named people
-    whose addresses actively disagree, with no SSN/DOB to corroborate
-    either way - matching name alone isn't enough when the address itself
-    contradicts it."""
-    fields1 = (r1.addr, r1.city, r1.state, r1.zip, r1.province)
-    fields2 = (r2.addr, r2.city, r2.state, r2.zip, r2.province)
+    conflict here). Zip is compared by its 5-digit prefix (zip5()), so a
+    plain 5-digit ZIP and its ZIP+4 form are never treated as conflicting.
+    Used to block Step 3 from merging two same-named people whose
+    addresses actively disagree, with no SSN/DOB to corroborate either way
+    - matching name alone isn't enough when the address itself contradicts
+    it."""
+    fields1 = (r1.addr, r1.city, r1.state, zip5(r1.zip), r1.province)
+    fields2 = (r2.addr, r2.city, r2.state, zip5(r2.zip), r2.province)
     return any(a and b and a != b for a, b in zip(fields1, fields2))
 
 
@@ -599,11 +597,13 @@ def address_name_match(r1: Rec, r2: Rec) -> bool:
     Unlike SSN (Rule 1), address is NEVER enough on its own to override a
     name difference - an EXACT Name match is always required here too,
     plus SSN/DOB each being matching-or-blank (compatible()), same as
-    Rules 4-7."""
+    Rules 4-7. Zip is compared by its 5-digit prefix (zip5()), so a plain
+    5-digit ZIP and its ZIP+4 form count as the same value, not a conflict
+    and not a missed overlap."""
     if address_conflict(r1, r2):
         return False
-    fields1 = (r1.addr, r1.city, r1.state, r1.zip, r1.province)
-    fields2 = (r2.addr, r2.city, r2.state, r2.zip, r2.province)
+    fields1 = (r1.addr, r1.city, r1.state, zip5(r1.zip), r1.province)
+    fields2 = (r2.addr, r2.city, r2.state, zip5(r2.zip), r2.province)
     if not any(a and b and a == b for a, b in zip(fields1, fields2)):
         return False   # nothing real actually overlaps - not a match
     if not (r1.first and r1.last and r1.first == r2.first and r1.last == r2.last):
@@ -856,22 +856,6 @@ def fullest_value(raw_values, norm_values) -> str:
     return best
 
 
-def majority_dob(sub_recs) -> str:
-    """Most frequent normalized DOB among the group wins (Rule 1 doesn't
-    require DOB to match, so a merged group can legitimately contain more
-    than one DOB value); '' if none present."""
-    counts = defaultdict(int)
-    raw_for = {}
-    for r in sub_recs:
-        if r.dob:
-            counts[r.dob] += 1
-            raw_for.setdefault(r.dob, r.dob_raw)
-    if not counts:
-        return ""
-    best = max(counts.items(), key=lambda kv: (kv[1], kv[0]))[0]
-    return raw_for[best]
-
-
 def has_variation(raw_values) -> bool:
     """True if the group had 2+ distinct real values for this field, even
     though only one (the fullest) was kept in the output - used for the
@@ -987,11 +971,35 @@ def main() -> None:
     # override a name difference on their own (e.g. same SSN, different
     # spelled name, is supposed to merge).
     group_first = [({r.first} if r.first else set()) for r in recs]
+    # group_dob[root] = every DISTINCT known DOB currently inside that
+    # root's group. Same bridging risk as group_ssn: a blank-DOB row can
+    # pairwise-match two OTHER rows (via Rules 1/4-8, which all treat a
+    # blank DOB as non-conflicting) that have different real DOBs from each
+    # other, transitively merging two genuinely different DOBs into one
+    # group even though those two rows would directly fail dob_conflict().
+    group_dob = [({r.dob} if r.dob else set()) for r in recs]
+    # group_addr[root] = 5 sets (one per address field: Street, City, State,
+    # Zip, Province), each holding every DISTINCT known value currently in
+    # that root's group. Same bridging risk again: Rule 8 itself can't
+    # bridge through a blank address (it requires a genuine value match on
+    # both sides), but a DIFFERENT rule (e.g. Rule 1 via SSN, or Rule 3 via
+    # name) can still connect a blank-address row to two OTHER rows that
+    # have genuinely conflicting addresses with each other - and since
+    # those rules don't check address at all, nothing else would catch it.
+    group_addr = [
+        (({r.addr} if r.addr else set()), ({r.city} if r.city else set()),
+         ({r.state} if r.state else set()),
+         ({zip5(r.zip)} if zip5(r.zip) else set()),   # 5-digit prefix, so ZIP/ZIP+4 don't falsely conflict
+         ({r.province} if r.province else set()))
+        for r in recs
+    ]
     refused_ssn = 0
     refused_name = 0
+    refused_dob = 0
+    refused_addr = 0
 
     def try_union(a_idx, b_idx):
-        nonlocal refused_ssn, refused_name
+        nonlocal refused_ssn, refused_name, refused_dob, refused_addr
         ra, rb = uf.find(a_idx), uf.find(b_idx)
         if ra == rb:
             return
@@ -999,6 +1007,14 @@ def main() -> None:
         if sa and sb and sa.isdisjoint(sb):
             refused_ssn += 1
             return   # would combine two different real SSNs - refused
+        da, db = group_dob[ra], group_dob[rb]
+        if da and db and da.isdisjoint(db):
+            refused_dob += 1
+            return   # would combine two different real DOBs - refused
+        aa, ab = group_addr[ra], group_addr[rb]
+        if any(fa and fb and fa.isdisjoint(fb) for fa, fb in zip(aa, ab)):
+            refused_addr += 1
+            return   # would combine two conflicting real addresses - refused
         r1, r2 = recs[a_idx], recs[b_idx]
         # Rules 2, 4-8 all require an EXACT First+Last match between r1/r2
         # directly, so they can never themselves introduce a first-name
@@ -1018,6 +1034,8 @@ def main() -> None:
         uf.union(a_idx, b_idx)
         merged_root = min(ra, rb)
         group_ssn[merged_root] = sa | sb
+        group_dob[merged_root] = da | db
+        group_addr[merged_root] = tuple(fa | fb for fa, fb in zip(aa, ab))
         group_first[merged_root] = group_first[ra] | group_first[rb]
 
     pairs_list = list(pairs)
@@ -1060,9 +1078,15 @@ def main() -> None:
         print(f"  {refused_name:,} candidate merge(s) were refused - would have "
               f"combined 2+ different real First Names into one group via the "
               f"Name-Only fallback rule.")
+    if refused_dob:
+        print(f"  {refused_dob:,} candidate merge(s) were refused - would have "
+              f"combined 2+ different real DOBs into one group.")
+    if refused_addr:
+        print(f"  {refused_addr:,} candidate merge(s) were refused - would have "
+              f"combined 2+ conflicting real addresses into one group.")
 
     print("Building merged output ...")
-    SEMICOLON_COLS = [COL_DOCID] + OTHER_MERGE_COLS
+    SEMICOLON_COLS = [COL_DOCID, COL_DOB] + OTHER_MERGE_COLS
     total_groups = len(groups)
     out_rows = []
     docid_overflow_groups = 0
@@ -1091,7 +1115,6 @@ def main() -> None:
         row[COL_MIDDLE] = fullest_value(sub[COL_MIDDLE], [r.mid for r in sub_recs])
         row[COL_SUFFIX] = fullest_value(sub[COL_SUFFIX], [norm_text(v) for v in sub[COL_SUFFIX]])
         row[COL_SSN] = fullest_value(sub[COL_SSN], [r.ssn for r in sub_recs])
-        row[COL_DOB] = majority_dob(sub_recs)
 
         majority_addr_values, other_address = split_addresses(df, group_idxs)
         for c, v in zip(ADDRESS_COLS, majority_addr_values):
