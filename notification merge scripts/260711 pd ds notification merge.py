@@ -47,6 +47,13 @@ step:
   Rule 9 (Email, Name): same as Rule 4, but matched on Email Address -
                         Personal instead of Employee ID.
 
+NOTE: a "Rule 10 (Full Name Match)" second pass - for the same person
+scattered across rows that each carry a DIFFERENT single piece of
+corroborating info (one row has only a DOB, another only an SSN, another
+only an Address, etc.), with nothing shared to anchor Rules 1-9 on directly
+- lives in a SEPARATE script that runs on THIS script's output. See
+"260714 pd ds final merge script.py".
+
 Either rule matching is enough to merge, and the match is transitive (if
 A matches B and B matches C, all three end up in one merged row, even if
 A and C don't directly match each other) - EXCEPT that a merge is refused
@@ -59,7 +66,7 @@ that would cross real SSNs is refused - so e.g. 5 rows sharing one SSN and
 main()).
 
 INPUT  : an Excel workbook with the columns listed in EXPECTED_COLS below.
-OUTPUT : a new Excel workbook with two sheets:
+OUTPUT : a new Excel workbook with four sheets:
          - "Merged Notification Data": ONE ROW PER CONFIRMED PERSON.
            - First Name, Middle Name, Last Name, and SSN: the single
              fullest/most complete value among the merged rows (placeholder
@@ -500,10 +507,10 @@ def build_records(df: pd.DataFrame):
     col_pos = {c: p for p, c in enumerate(df.columns)}
     values = df.values  # numpy object array, fast positional access
     fi, la, mi, do, ss, ei, dl, pp, ph, em, ad, ci, st, zp, pv = (
-        col_pos[COL_FIRST], col_pos[COL_LAST], col_pos[COL_MIDDLE], col_pos[COL_DOB],
-        col_pos[COL_SSN], col_pos[COL_EMPID], col_pos[COL_DL], col_pos[COL_PASSPORT],
-        col_pos[COL_PHONE], col_pos[COL_EMAIL], col_pos[COL_ADDR], col_pos[COL_CITY],
-        col_pos[COL_STATE], col_pos[COL_ZIP], col_pos[COL_PROVINCE],
+        col_pos[COL_FIRST], col_pos[COL_LAST], col_pos[COL_MIDDLE],
+        col_pos[COL_DOB], col_pos[COL_SSN], col_pos[COL_EMPID], col_pos[COL_DL],
+        col_pos[COL_PASSPORT], col_pos[COL_PHONE], col_pos[COL_EMAIL], col_pos[COL_ADDR],
+        col_pos[COL_CITY], col_pos[COL_STATE], col_pos[COL_ZIP], col_pos[COL_PROVINCE],
     )
     docid_pos = col_pos[COL_DOCID]
     for i in range(len(df)):
