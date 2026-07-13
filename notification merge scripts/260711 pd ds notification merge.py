@@ -303,11 +303,26 @@ def ssn_exists_match(r1: Rec, r2: Rec) -> bool:
     return bool(r1.ssn) and bool(r2.ssn) and r1.ssn == r2.ssn
 
 
+def ssn_conflict(r1: Rec, r2: Rec) -> bool:
+    """True when BOTH rows have a usable, known SSN and it genuinely
+    disagrees. Used to block Step 2 (Name+DOB) from merging two different
+    real people who happen to share a name and DOB - without this guard,
+    Union-Find's transitive clustering can chain unrelated SSNs together
+    through a shared-name-and-DOB row (e.g. A<->B via SSN, B<->C via
+    Name+DOB even though A and C have different SSNs), contaminating a
+    single merged record with several different people's SSNs."""
+    return bool(r1.ssn) and bool(r2.ssn) and r1.ssn != r2.ssn
+
+
 def exact_name_dob_match(r1: Rec, r2: Rec) -> bool:
     """Step 2 - 'Exact Name, DOB': both rows have the same First Name AND
     the same Last Name (exact text match, no typo/prefix tolerance) AND the
-    same DOB. Middle Name/Suffix are NOT part of the match - they just get
-    semicolon-merged like every other column when this rule fires."""
+    same DOB, AND their SSNs don't conflict (blank on either/both sides is
+    fine, but two different known SSNs block the merge). Middle Name/Suffix
+    are NOT part of the match - they just get semicolon-merged like every
+    other column when this rule fires."""
+    if ssn_conflict(r1, r2):
+        return False
     return (
         bool(r1.first) and bool(r1.last) and bool(r1.dob)
         and r1.first == r2.first and r1.last == r2.last and r1.dob == r2.dob
