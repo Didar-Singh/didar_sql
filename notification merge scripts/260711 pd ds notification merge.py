@@ -64,7 +64,10 @@ OUTPUT : a new Excel workbook with two sheets:
              semicolon-joined IDs - see parse_id_tokens()), deduplicated
              and joined with "; ".
            - Every OTHER column (DOCIDs, Gov ID, etc.): every distinct
-             value seen, joined with "; ".
+             value seen, joined with "; ". If a group's merged DOCID list
+             would exceed Excel's 32,767-char cell limit, it spills into
+             extra "DOCIDs 2", "DOCIDs 3", ... columns, splitting only at
+             "; " boundaries (see split_docid_chunks()).
            - Address fields (Residential Address, City, State, Province,
              Zip, Country) are kept TOGETHER as one unit: the most common
              address stays in those columns as-is, and every OTHER distinct
@@ -75,6 +78,13 @@ OUTPUT : a new Excel workbook with two sheets:
            123-45-6789, all-same-digit, or a masked SSN with too few known
            digits) - so a real-looking SSN that got silently treated as
            blank doesn't go unnoticed (see classify_ssn_issue()).
+         - "Large Group Review": every merged group with more than 50 rows -
+           usually a sign of a shared junk value (e.g. a fake SSN), worth a
+           manual check before trusting the output.
+         - "Skipped Bucket Review": a breakdown, BY FIELD TYPE (not raw
+           value - bucket keys can contain real PII), of every oversized
+           bucket (>MAX_BUCKET_SIZE rows sharing one value) that got
+           skipped during blocking instead of being exhaustively compared.
 
 This script does not touch the input file. Save the output only to the
 secured/authorized folder for this data (never a desktop) - it contains
@@ -717,16 +727,20 @@ def bucket_candidate_pairs(recs):
         # individually (not the whole address as one key), since
         # address_name_match() only needs ONE field to genuinely overlap.
         # is_match() then does the real per-field compatibility check.
+        # State/Province deliberately excluded here (though still checked
+        # for conflicts by address_name_match() itself) - they're too
+        # low-cardinality for large files (e.g. "CA" alone can be shared by
+        # tens of thousands of unrelated rows), which blows a bucket way
+        # past MAX_BUCKET_SIZE and gets it skipped entirely - silently
+        # losing candidate pairs for Street/City/Zip too, not just State.
+        # A real matching address almost always also shares City or Zip,
+        # so this loses very little real coverage.
         if r.addr:
             buckets[("addrfield", "addr", r.addr)].append(r.idx)
         if r.city:
             buckets[("addrfield", "city", r.city)].append(r.idx)
-        if r.state:
-            buckets[("addrfield", "state", r.state)].append(r.idx)
         if r.zip:
             buckets[("addrfield", "zip", r.zip)].append(r.idx)
-        if r.province:
-            buckets[("addrfield", "province", r.province)].append(r.idx)
 
     for (kind, last, first), rep_idx in lastfirst_reps.items():
         blank_key = ("lastblank", last)
@@ -736,6 +750,10 @@ def bucket_candidate_pairs(recs):
     pairs = set()
     skipped_buckets = 0
     skipped_rows = 0
+    # Breakdown by bucket TYPE (not raw value - bucket keys can contain real
+    # PII like SSN/Name/State, which shouldn't get printed to the console).
+    # This still tells you exactly which rule/field is driving the skips.
+    skipped_by_type = defaultdict(lambda: [0, 0])   # kind -> [bucket_count, row_count]
     total = len(buckets)
     for n, (key, idxs) in enumerate(buckets.items(), 1):
         progress("Bucketing", n, total, extra=f"skipped={skipped_buckets}")
@@ -744,13 +762,24 @@ def bucket_candidate_pairs(recs):
         if len(idxs) > MAX_BUCKET_SIZE:
             skipped_buckets += 1
             skipped_rows += len(idxs)
+            kind = f"{key[0]}/{key[1]}" if key[0] == "addrfield" else key[0]
+            entry = skipped_by_type[kind]
+            entry[0] += 1
+            entry[1] += len(idxs)
             continue
         for a, b in itertools.combinations(sorted(idxs), 2):
             pairs.add((a, b))
+    skipped_summary = []
     if skipped_buckets:
         print(f"  Skipped {skipped_buckets:,} oversized bucket(s) "
               f"({skipped_rows:,} rows, likely a shared junk value) - review manually.")
-    return pairs
+        print("  Breakdown by field (bucket type -> buckets skipped, rows involved):")
+        for kind, (cnt, rows) in sorted(skipped_by_type.items(), key=lambda kv: -kv[1][1]):
+            print(f"    {kind:<14} {cnt:>5,} bucket(s)  {rows:>10,} rows")
+            skipped_summary.append({
+                "Bucket Type": kind, "Buckets Skipped": cnt, "Rows Involved": rows,
+            })
+    return pairs, skipped_summary
 
 
 # ------------------------------------------------------------
@@ -780,6 +809,36 @@ def semicolon_merge(values) -> str:
             seen.add(key)
             out.append(raw)
     return MERGE_SEP.join(out)
+
+
+DOCID_CHUNK_SIZE = 20_000   # keep well under Excel's 32,767-char cell limit
+
+
+def split_docid_chunks(docid_str, max_chars=DOCID_CHUNK_SIZE):
+    """Splits an already-merged DOCID string ('DOC001; DOC002; ...') into
+    chunks no longer than max_chars, breaking ONLY at '; ' boundaries (never
+    mid-DOCID). A group merging tens of thousands of rows can produce a
+    DOCID string longer than Excel's 32,767-character cell limit, which
+    Excel silently truncates - splitting across extra 'DOCIDs 2', 'DOCIDs
+    3', ... columns instead keeps every DOCID intact and visible."""
+    if len(docid_str) <= max_chars:
+        return [docid_str]
+    parts = docid_str.split(MERGE_SEP)
+    chunks = []
+    current = []
+    current_len = 0
+    for part in parts:
+        added_len = len(part) + (len(MERGE_SEP) if current else 0)
+        if current and current_len + added_len > max_chars:
+            chunks.append(MERGE_SEP.join(current))
+            current = [part]
+            current_len = len(part)
+        else:
+            current.append(part)
+            current_len += added_len
+    if current:
+        chunks.append(MERGE_SEP.join(current))
+    return chunks
 
 
 def fullest_value(raw_values, norm_values) -> str:
@@ -895,7 +954,7 @@ def main() -> None:
               f"- see the 'Junk SSN Review' sheet.")
 
     print("Clustering (blocked comparison) ...")
-    pairs = bucket_candidate_pairs(recs)
+    pairs, skipped_bucket_summary = bucket_candidate_pairs(recs)
     print(f"  {len(pairs):,} candidate pairs to test.")
 
     uf = UnionFind(len(recs))
@@ -1006,12 +1065,27 @@ def main() -> None:
     SEMICOLON_COLS = [COL_DOCID] + OTHER_MERGE_COLS
     total_groups = len(groups)
     out_rows = []
+    docid_overflow_groups = 0
+    max_docid_cols = 1
     for n, group_idxs in enumerate(groups, 1):
         progress("Building output", n, total_groups)
         sub = df.iloc[group_idxs]           # O(group size), not O(n)
         sub_recs = [recs[i] for i in group_idxs]
 
         row = {c: semicolon_merge(sub[c]) for c in SEMICOLON_COLS}
+
+        # A group merging enough rows can produce a DOCID string longer than
+        # Excel's 32,767-char cell limit (silently truncated otherwise) -
+        # split it across 'DOCIDs', 'DOCIDs 2', 'DOCIDs 3', ... columns,
+        # breaking only at '; ' boundaries so no DOCID is ever cut in half.
+        docid_chunks = split_docid_chunks(row[COL_DOCID])
+        row[COL_DOCID] = docid_chunks[0]
+        for extra_i, chunk in enumerate(docid_chunks[1:], start=2):
+            row[f"{COL_DOCID} {extra_i}"] = chunk
+        if len(docid_chunks) > 1:
+            docid_overflow_groups += 1
+            max_docid_cols = max(max_docid_cols, len(docid_chunks))
+
         row[COL_FIRST] = fullest_value(sub[COL_FIRST], [r.first for r in sub_recs])
         row[COL_LAST] = fullest_value(sub[COL_LAST], [r.last for r in sub_recs])
         row[COL_MIDDLE] = fullest_value(sub[COL_MIDDLE], [r.mid for r in sub_recs])
@@ -1029,25 +1103,42 @@ def main() -> None:
         out_rows.append(row)
 
     df_out = pd.DataFrame(out_rows)
+
+    # Put any 'DOCIDs 2', 'DOCIDs 3', ... overflow columns right after
+    # 'DOCIDs' - dict-key insertion order would otherwise scatter them
+    # wherever the first overflowing group happened to appear.
+    docid_extra_cols = [f"{COL_DOCID} {i}" for i in range(2, max_docid_cols + 1)]
+    docid_pos = list(df_out.columns).index(COL_DOCID)
+    other_cols = [c for c in df_out.columns if c not in docid_extra_cols]
+    new_order = other_cols[:docid_pos + 1] + docid_extra_cols + other_cols[docid_pos + 1:]
+    df_out = df_out[new_order]
+
     df_out = df_out.sort_values(["Rows Merged"], ascending=False).reset_index(drop=True)
+
+    if docid_overflow_groups:
+        print(f"  {docid_overflow_groups:,} group(s) had a DOCID list too long for one "
+              f"cell (> {DOCID_CHUNK_SIZE:,} chars) - split across up to "
+              f"{max_docid_cols} '{COL_DOCID}' columns.")
 
     n_multi = (df_out["Rows Merged"] > 1).sum()
     print(f"  {n_multi:,} merged groups combine 2+ original rows.")
     biggest = df_out["Rows Merged"].max()
     print(f"  Largest merged group: {biggest:,} rows.")
-    if biggest > 50:
-        print("  WARNING: a group >50 rows usually means a shared junk value "
-              "(e.g. a fake SSN). Inspect the top groups below before "
-              "trusting the output.")
-        print(df_out.sort_values("Rows Merged", ascending=False).head(10)
-              [[COL_FIRST, COL_LAST, COL_SSN, "Rows Merged"]].to_string())
+    df_large_groups = df_out[df_out["Rows Merged"] > 50].sort_values("Rows Merged", ascending=False)
+    if len(df_large_groups):
+        print(f"  WARNING: {len(df_large_groups):,} group(s) merged >50 rows - "
+              f"usually a shared junk value (e.g. a fake SSN). See the "
+              f"'Large Group Review' sheet before trusting the output.")
 
     df_ssn_review = pd.DataFrame(ssn_review)
+    df_skipped_buckets = pd.DataFrame(skipped_bucket_summary)
 
     print(f"Writing {OUTPUT_XLSX} ...")
     _write_workbook(OUTPUT_XLSX, {
         "Merged Notification Data": df_out,
         "Junk SSN Review": df_ssn_review,
+        "Large Group Review": df_large_groups,
+        "Skipped Bucket Review": df_skipped_buckets,
     })
     print(f"Done -> {OUTPUT_XLSX}")
     print("Reminder: save the output only to the secured/authorized folder for "
