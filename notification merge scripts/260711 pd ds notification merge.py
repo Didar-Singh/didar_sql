@@ -2,7 +2,7 @@
 260711 pd ds notification merge.py
 
 Merge PII/PHI person records from an Excel export into one row per
-confirmed person, for the notification report. Eight rules, built step by
+confirmed person, for the notification report. Nine rules, built step by
 step:
 
   Rule 1 (SSN Exists): rows with the same (non-blank, non-junk) SSN are
@@ -44,6 +44,8 @@ step:
                         difference on its own - this also always requires
                         an EXACT Name match and SSN/DOB to be
                         matching-or-blank, same as Rules 4-7.
+  Rule 9 (Email, Name): same as Rule 4, but matched on Email Address -
+                        Personal instead of Employee ID.
 
 Either rule matching is enough to merge, and the match is transitive (if
 A matches B and B matches C, all three end up in one merged row, even if
@@ -164,14 +166,15 @@ COL_SUFFIX = "Suffix"
 COL_DOB    = "Full Date of Birth (MM/DD/YYYY)"
 COL_SSN    = "Social Security Number"
 
-# COL_EMPID/COL_DL/COL_PASSPORT/COL_PHONE are used for matching (Rules 4-7).
-# COL_GOVID isn't used for matching - kept as a plain semicolon-merged
-# column in OTHER_MERGE_COLS below.
+# COL_EMPID/COL_DL/COL_PASSPORT/COL_PHONE/COL_EMAIL are used for matching
+# (Rules 4-7, 9). COL_GOVID isn't used for matching - kept as a plain
+# semicolon-merged column in OTHER_MERGE_COLS below.
 COL_DL       = "Driver's License Number"
 COL_PASSPORT = "Passport Number"
 COL_GOVID    = "Government-Issued ID Number"
 COL_EMPID    = "Employee Identification Number"
 COL_PHONE    = "Phone Number"
+COL_EMAIL    = "Email Address - Personal"
 
 # Address fields are handled specially (see ADDRESS_COLS below), not as
 # plain semicolon-merged columns - they need to stay together as one unit
@@ -195,7 +198,7 @@ OTHER_MERGE_COLS = [
     "Data Subject Type",
     "Birth Information",
     "Address Comments",
-    "Email Address - Personal",
+    COL_EMAIL,
     COL_PHONE,
     "Contact Information",
     COL_DL,
@@ -269,6 +272,100 @@ def norm_text(v) -> str:
     s = _INVISIBLE_CHARS.sub(" ", s)
     s = re.sub(r"\s+", " ", s).strip().upper()
     return "" if s.lower() in ("nan", "none", "null") else s
+
+
+# Street-address abbreviation map: each variant -> one canonical token, so a
+# street written with a full word and one written with the USPS abbreviation
+# ("123 West Lane" vs "123 W Ln") normalize to the same value. Covers the
+# common directionals and street-type suffixes; anything not listed is left
+# unchanged. Only applied to the Residential Address (street) field.
+_STREET_TOKEN_MAP = {
+    # Directionals
+    "NORTH": "N", "N": "N",
+    "SOUTH": "S", "S": "S",
+    "EAST": "E", "E": "E",
+    "WEST": "W", "W": "W",
+    "NORTHEAST": "NE", "NE": "NE",
+    "NORTHWEST": "NW", "NW": "NW",
+    "SOUTHEAST": "SE", "SE": "SE",
+    "SOUTHWEST": "SW", "SW": "SW",
+    # Street-type suffixes
+    "STREET": "ST", "ST": "ST",
+    "AVENUE": "AVE", "AVE": "AVE", "AV": "AVE",
+    "BOULEVARD": "BLVD", "BLVD": "BLVD",
+    "ROAD": "RD", "RD": "RD",
+    "LANE": "LN", "LN": "LN",
+    "DRIVE": "DR", "DR": "DR",
+    "COURT": "CT", "CT": "CT",
+    "CIRCLE": "CIR", "CIR": "CIR",
+    "PLACE": "PL", "PL": "PL",
+    "TERRACE": "TER", "TERR": "TER", "TER": "TER",
+    "PARKWAY": "PKWY", "PKWY": "PKWY",
+    "HIGHWAY": "HWY", "HWY": "HWY",
+    "SQUARE": "SQ", "SQ": "SQ",
+    "TRAIL": "TRL", "TRL": "TRL",
+    "WAY": "WAY",
+    "LOOP": "LOOP",
+    "COVE": "CV", "CV": "CV",
+    "POINT": "PT", "PT": "PT",
+    "CROSSING": "XING", "XING": "XING",
+    "PLAZA": "PLZ", "PLZ": "PLZ",
+    "EXPRESSWAY": "EXPY", "EXPY": "EXPY",
+    "FREEWAY": "FWY", "FWY": "FWY",
+    "ROUTE": "RTE", "RTE": "RTE",
+    "JUNCTION": "JCT", "JCT": "JCT",
+    "MOUNT": "MT", "MT": "MT",
+    "MOUNTAIN": "MTN", "MTN": "MTN",
+    # Unit / secondary designators
+    "APARTMENT": "APT", "APT": "APT",
+    "SUITE": "STE", "STE": "STE",
+    "BUILDING": "BLDG", "BLDG": "BLDG",
+    "FLOOR": "FL", "FL": "FL",
+    "UNIT": "UNIT",
+}
+
+_UNIT_DESIGNATORS = {"APT", "STE", "UNIT", "BLDG", "FL"}
+# Directional abbreviations - used to tell a real directional ("203 W Shore
+# Rd") apart from a bare unit letter loosely attached to the house number
+# ("203 A West Shore Rd" - 'A' isn't a direction, so it must be a unit).
+_DIRECTIONAL_TOKENS = {"N", "S", "E", "W", "NE", "NW", "SE", "SW"}
+_HOUSE_UNIT_RE = re.compile(r"^(\d+)([A-Z])$")
+
+
+def norm_street(v) -> str:
+    """Canonicalizes a street address so common formatting/abbreviation
+    differences don't look like different addresses:
+    - Directionals (West/W, North/N, ...) and street-type suffixes
+      (Lane/Ln, Street/St, Avenue/Ave, ...) are each mapped to one standard
+      token, and a trailing '.' on any token is dropped ('St.' -> 'ST').
+      So '123 West Lane', '123 W Ln', and '123 W Ln.' all normalize to
+      '123 W LN'.
+    - A unit letter loosely attached to the house number - either jammed
+      against it ('203A ...') or as its own token right after it
+      ('203 A ...', where 'A' isn't a directional like 'W' or 'NE') - is
+      pulled out and moved to the end as a normal 'UNIT <letter>' suffix.
+      So '203A West Shore Rd', '203 A West Shore Rd', and '203 W Shore Rd
+      Apt A' all normalize to the same base + unit (see split_street_unit(),
+      street_compat())."""
+    s = norm_text(v)
+    if not s:
+        return ""
+    tokens = s.split(" ")
+    unit_letter = ""
+    m = _HOUSE_UNIT_RE.match(tokens[0])
+    if m:
+        tokens[0] = m.group(1)
+        unit_letter = m.group(2)
+    elif (len(tokens) > 1 and tokens[0].isdigit()
+          and len(tokens[1]) == 1 and tokens[1] not in _DIRECTIONAL_TOKENS):
+        unit_letter = tokens.pop(1)
+
+    out = [_STREET_TOKEN_MAP.get(tok.rstrip("."), tok.rstrip(".")) for tok in tokens]
+
+    if unit_letter and not any(t in _UNIT_DESIGNATORS for t in out):
+        out += ["UNIT", unit_letter]
+
+    return " ".join(out)
 
 
 def norm_name(v) -> str:
@@ -380,8 +477,8 @@ def parse_id_tokens(v) -> frozenset:
 #    (this loop runs millions of times, so dict-key lookups add up)
 # ------------------------------------------------------------
 class Rec:
-    __slots__ = ("idx", "first", "last", "mid", "dob", "ssn",
-                 "empids", "dl_ids", "passport_ids", "phones",
+    __slots__ = ("idx", "first", "last", "mid", "dob", "ssn", "ssn_present",
+                 "empids", "dl_ids", "passport_ids", "phones", "emails",
                  "addr", "city", "state", "zip", "province")
 
     def __init__(self, idx):
@@ -402,11 +499,11 @@ def build_records(df: pd.DataFrame):
     ssn_review = []
     col_pos = {c: p for p, c in enumerate(df.columns)}
     values = df.values  # numpy object array, fast positional access
-    fi, la, mi, do, ss, ei, dl, pp, ph, ad, ci, st, zp, pv = (
+    fi, la, mi, do, ss, ei, dl, pp, ph, em, ad, ci, st, zp, pv = (
         col_pos[COL_FIRST], col_pos[COL_LAST], col_pos[COL_MIDDLE], col_pos[COL_DOB],
         col_pos[COL_SSN], col_pos[COL_EMPID], col_pos[COL_DL], col_pos[COL_PASSPORT],
-        col_pos[COL_PHONE], col_pos[COL_ADDR], col_pos[COL_CITY], col_pos[COL_STATE],
-        col_pos[COL_ZIP], col_pos[COL_PROVINCE],
+        col_pos[COL_PHONE], col_pos[COL_EMAIL], col_pos[COL_ADDR], col_pos[COL_CITY],
+        col_pos[COL_STATE], col_pos[COL_ZIP], col_pos[COL_PROVINCE],
     )
     docid_pos = col_pos[COL_DOCID]
     for i in range(len(df)):
@@ -417,11 +514,20 @@ def build_records(df: pd.DataFrame):
         r.mid = norm_name(row[mi])
         r.dob = norm_dob(row[do])
         r.ssn = norm_ssn(row[ss])
+        # Distinct from r.ssn: TRUE if the raw cell had any real text at
+        # all, even if norm_ssn() rejected it as junk/unusable. A junk SSN
+        # is not trusted for MATCHING (r.ssn stays '' so it can't falsely
+        # confirm two rows are the same person) - but it's still evidence
+        # the row ISN'T a bare, nothing-to-corroborate-with record, so it
+        # must not be treated as "no identifiers" by has_no_identifiers()
+        # (which would wrongly let Rule 3 pull it into an unrelated group).
+        r.ssn_present = bool(classify_ssn_issue(row[ss])) or bool(r.ssn)
         r.empids = parse_id_tokens(row[ei])
         r.dl_ids = parse_id_tokens(row[dl])
         r.passport_ids = parse_id_tokens(row[pp])
         r.phones = parse_id_tokens(row[ph])
-        r.addr = norm_text(row[ad])
+        r.emails = parse_id_tokens(row[em])
+        r.addr = norm_street(row[ad])
         r.city = norm_text(row[ci])
         r.state = norm_text(row[st])
         r.zip = norm_text(row[zp])
@@ -495,8 +601,13 @@ def exact_name_dob_match(r1: Rec, r2: Rec) -> bool:
 
 def has_no_identifiers(r: Rec) -> bool:
     """True when a row has NEITHER a usable SSN NOR a DOB - nothing at all
-    to corroborate identity with."""
-    return not r.ssn and not r.dob
+    to corroborate identity with. Checks ssn_present (not r.ssn) so a row
+    whose SSN got blanked for being junk/placeholder still counts as
+    HAVING an SSN here - it's just not trusted for matching. Without this
+    distinction, a junk SSN would make the row look like a bare record with
+    nothing to go on, wrongly letting Rule 3 (Name-Only) pull it into an
+    unrelated group that happens to share the same name."""
+    return not r.ssn_present and not r.dob
 
 
 def zip5(v: str) -> str:
@@ -507,17 +618,58 @@ def zip5(v: str) -> str:
     return digits[:5] if len(digits) >= 5 else ""
 
 
+def split_street_unit(s: str) -> tuple:
+    """Splits a normalized street (see norm_street()) into (base, unit):
+    'base' is everything before a unit/apartment designator token (APT,
+    STE, UNIT, BLDG, FL, or a bare '#123'-style token), 'unit' is just the
+    VALUE after that designator - the designator WORD itself is dropped, so
+    'APT A' and 'UNIT A' both give unit 'A' (same physical unit, different
+    label word - norm_street() already funnels a bare unit letter through
+    to a 'UNIT <letter>' suffix, so this keeps that consistent with an
+    explicit 'Apt A' in the source data). If no designator token appears,
+    base is the whole string and unit is ''."""
+    tokens = s.split(" ") if s else []
+    for i, tok in enumerate(tokens):
+        if tok in _UNIT_DESIGNATORS:
+            return " ".join(tokens[:i]), " ".join(tokens[i + 1:])
+        if tok.startswith("#") and len(tok) > 1:
+            return " ".join(tokens[:i]), " ".join([tok[1:]] + tokens[i + 1:])
+    return s, ""
+
+
+def street_compat(a: str, b: str) -> bool:
+    """True if two normalized streets are equal, blank on either side, or
+    the SAME base street with a unit/apartment suffix present on only ONE
+    side (e.g. '123 ABC LN' vs '123 ABC LN APT 1' - one row is simply
+    missing the unit detail, not a different address). If BOTH sides have
+    a real unit and it disagrees (e.g. 'APT 1' vs 'APT 2'), that IS treated
+    as a genuine conflict - different specific units at the same street,
+    not the same address."""
+    if not a or not b or a == b:
+        return True
+    base_a, unit_a = split_street_unit(a)
+    base_b, unit_b = split_street_unit(b)
+    if not base_a or base_a != base_b:
+        return False
+    return not (unit_a and unit_b and unit_a != unit_b)
+
+
 def address_conflict(r1: Rec, r2: Rec) -> bool:
     """True when Residential Address, City, State, Zip, or Province has a
     real, DIFFERING value on both sides (blank on either side is never a
     conflict here). Zip is compared by its 5-digit prefix (zip5()), so a
     plain 5-digit ZIP and its ZIP+4 form are never treated as conflicting.
-    Used to block Step 3 from merging two same-named people whose
-    addresses actively disagree, with no SSN/DOB to corroborate either way
-    - matching name alone isn't enough when the address itself contradicts
-    it."""
-    fields1 = (r1.addr, r1.city, r1.state, zip5(r1.zip), r1.province)
-    fields2 = (r2.addr, r2.city, r2.state, zip5(r2.zip), r2.province)
+    Street is compared via street_compat(), so a bare street and the same
+    street with an added apartment/unit suffix are never treated as
+    conflicting either - only a genuinely different base street, or two
+    real but DIFFERENT unit numbers, count as a conflict. Used to block
+    Step 3 from merging two same-named people whose addresses actively
+    disagree, with no SSN/DOB to corroborate either way - matching name
+    alone isn't enough when the address itself contradicts it."""
+    if not street_compat(r1.addr, r2.addr):
+        return True
+    fields1 = (r1.city, r1.state, zip5(r1.zip), r1.province)
+    fields2 = (r2.city, r2.state, zip5(r2.zip), r2.province)
     return any(a and b and a != b for a, b in zip(fields1, fields2))
 
 
@@ -586,6 +738,11 @@ def phone_name_match(r1: Rec, r2: Rec) -> bool:
     return _id_name_match(r1.phones, r2.phones, r1, r2)
 
 
+def email_name_match(r1: Rec, r2: Rec) -> bool:
+    """Step 9 - 'Email, Name' (see _id_name_match())."""
+    return _id_name_match(r1.emails, r2.emails, r1, r2)
+
+
 def address_name_match(r1: Rec, r2: Rec) -> bool:
     """Step 8 - 'Full Address, Name': Residential Address, City, State,
     Zip, and Province are each checked individually - blank on either side
@@ -599,12 +756,20 @@ def address_name_match(r1: Rec, r2: Rec) -> bool:
     plus SSN/DOB each being matching-or-blank (compatible()), same as
     Rules 4-7. Zip is compared by its 5-digit prefix (zip5()), so a plain
     5-digit ZIP and its ZIP+4 form count as the same value, not a conflict
-    and not a missed overlap."""
+    and not a missed overlap. Street is compared via street_compat(), so
+    '123 Abc Lane' vs '123 Abc Lane Apt 1' (unit detail on only one side)
+    counts as a genuine overlap too, not a conflict and not a miss."""
     if address_conflict(r1, r2):
         return False
-    fields1 = (r1.addr, r1.city, r1.state, zip5(r1.zip), r1.province)
-    fields2 = (r2.addr, r2.city, r2.state, zip5(r2.zip), r2.province)
-    if not any(a and b and a == b for a, b in zip(fields1, fields2)):
+    # address_conflict() already confirmed the street is compatible (equal,
+    # blank on one side, or same base street) - so both sides having ANY
+    # real street text is itself genuine overlap evidence, even when the
+    # exact text differs (e.g. one side adds "APT 1").
+    street_overlap = bool(r1.addr) and bool(r2.addr)
+    other_fields1 = (r1.city, r1.state, zip5(r1.zip), r1.province)
+    other_fields2 = (r2.city, r2.state, zip5(r2.zip), r2.province)
+    other_overlap = any(a and b and a == b for a, b in zip(other_fields1, other_fields2))
+    if not (street_overlap or other_overlap):
         return False   # nothing real actually overlaps - not a match
     if not (r1.first and r1.last and r1.first == r2.first and r1.last == r2.last):
         return False
@@ -621,6 +786,7 @@ def is_match(r1: Rec, r2: Rec) -> bool:
         or passport_name_match(r1, r2)
         or phone_name_match(r1, r2)
         or address_name_match(r1, r2)
+        or email_name_match(r1, r2)
     )
 
 
@@ -723,6 +889,9 @@ def bucket_candidate_pairs(recs):
         if r.phones and r.first and r.last:            # Rule 7: Phone Number, Name
             for tok in r.phones:
                 buckets[("phonename", tok, r.first, r.last)].append(r.idx)
+        if r.emails and r.first and r.last:             # Rule 9: Email, Name
+            for tok in r.emails:
+                buckets[("emailname", tok, r.first, r.last)].append(r.idx)
         # Rule 8: Full Address, Name - bucket by each address FIELD
         # individually (not the whole address as one key), since
         # address_name_match() only needs ONE field to genuinely overlap.
@@ -876,13 +1045,18 @@ def address_key(values) -> tuple:
     """Normalized tuple used to tell whether two rows have the SAME address
     (all fields blank-insensitive) - used to find the majority address.
     ADDRESS_COLS order is Residential Address, City, State, Province, Zip,
-    Country - Zip is compared via zip_key() (5-digit prefix) so a plain
-    5-digit ZIP and its ZIP+4 form count as the SAME address here, matching
-    how they're already treated during merging (see zip5())."""
-    return tuple(
-        zip_key(v) if col == COL_ZIP else norm_text(v)
-        for col, v in zip(ADDRESS_COLS, values)
-    )
+    Country - Zip is compared via zip_key() (5-digit prefix) and the street
+    via norm_street() (abbreviation-canonicalized), so a plain 5-digit ZIP
+    vs its ZIP+4 form, and '123 West Lane' vs '123 W Ln', each count as the
+    SAME address here - matching how they're already treated during merging
+    (see zip5() / norm_street())."""
+    def _key(col, v):
+        if col == COL_ZIP:
+            return zip_key(v)
+        if col == COL_ADDR:
+            return norm_street(v)
+        return norm_text(v)
+    return tuple(_key(col, v) for col, v in zip(ADDRESS_COLS, values))
 
 
 def format_full_address(values) -> str:
@@ -1003,7 +1177,8 @@ def main() -> None:
     # have genuinely conflicting addresses with each other - and since
     # those rules don't check address at all, nothing else would catch it.
     group_addr = [
-        (({r.addr} if r.addr else set()), ({r.city} if r.city else set()),
+        (({split_street_unit(r.addr)[0]} if r.addr else set()),   # base street, so a unit/apt suffix doesn't falsely conflict
+         ({r.city} if r.city else set()),
          ({r.state} if r.state else set()),
          ({zip5(r.zip)} if zip5(r.zip) else set()),   # 5-digit prefix, so ZIP/ZIP+4 don't falsely conflict
          ({r.province} if r.province else set()))
@@ -1032,7 +1207,7 @@ def main() -> None:
             refused_addr += 1
             return   # would combine two conflicting real addresses - refused
         r1, r2 = recs[a_idx], recs[b_idx]
-        # Rules 2, 4-8 all require an EXACT First+Last match between r1/r2
+        # Rules 2, 4-9 all require an EXACT First+Last match between r1/r2
         # directly, so they can never themselves introduce a first-name
         # conflict. Only Rule 3 (blank-First fallback) can actually
         # introduce one, hence the guard below only matters when none of
@@ -1041,7 +1216,7 @@ def main() -> None:
             ssn_exists_match(r1, r2) or exact_name_dob_match(r1, r2)
             or empid_name_match(r1, r2) or dl_name_match(r1, r2)
             or passport_name_match(r1, r2) or phone_name_match(r1, r2)
-            or address_name_match(r1, r2)
+            or address_name_match(r1, r2) or email_name_match(r1, r2)
         ):
             fa, fb = group_first[ra], group_first[rb]
             if fa and fb and fa.isdisjoint(fb):
