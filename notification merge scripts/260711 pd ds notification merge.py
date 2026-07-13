@@ -8,27 +8,33 @@ step by step:
   Rule 1 (SSN Exists): rows with the same (non-blank, non-junk) SSN
                         are merged.
   Rule 2 (Exact Name, DOB): rows with the same First Name + Last Name
-                        (exact text match) AND the same DOB are merged.
+                        (exact text match) AND the same DOB are merged,
+                        as long as their SSNs don't conflict (blank on
+                        either/both sides is fine).
 
-Either rule matching is enough to merge (and the match is transitive: if
+Either rule matching is enough to merge, and the match is transitive (if
 A matches B and B matches C, all three end up in one merged row, even if
-A and C don't directly match each other).
+A and C don't directly match each other) - EXCEPT that a group that ends up
+containing 2+ DIFFERENT known SSNs (usually via a blank-SSN "bridge" row
+that matches two otherwise-unrelated people by Name+DOB) is a genuine
+conflict: instead of a partial/best-effort merge, EVERY row in that group is
+kept as its own separate, unmerged row (see main()).
 
 INPUT  : an Excel workbook with the columns listed in EXPECTED_COLS below.
-OUTPUT : a new Excel workbook with two sheets:
-         - "Merged Notification Data": ONE ROW PER CONFIRMED PERSON. Every
-           column - including First/Middle/Last Name, Suffix, DOB, and SSN -
-           keeps every distinct value seen among the merged rows, joined
-           with "; ". Address fields (Residential Address, City, State,
-           Province, Zip, Country) are kept TOGETHER as one unit: the most
-           common address stays in those columns as-is, and every OTHER
-           distinct address goes into a new "Other Address" column as one
-           combined string per address, semicolon-joined.
-         - "Placeholder Name Review": every First/Last/Middle Name value that
-           had real text but got blanked as a placeholder ("[Unknown]",
-           "nan", etc.) - so a genuine short name that happens to collide
-           with a placeholder pattern (e.g. "Nan") can be spotted, not
-           silently dropped.
+OUTPUT : a new Excel workbook with one sheet, "Merged Notification Data":
+         ONE ROW PER CONFIRMED PERSON.
+         - First Name, Middle Name, Last Name, and SSN: the single fullest/
+           most complete value among the merged rows (placeholder values
+           like "[Unknown]" are never picked).
+         - Suffix: the single fullest non-blank value.
+         - DOB: the most frequent (majority) value among the merged rows.
+         - Every OTHER column (DOCIDs, Driver's License, Gov ID, Employee ID,
+           etc.): every distinct value seen, joined with "; ".
+         - Address fields (Residential Address, City, State, Province, Zip,
+           Country) are kept TOGETHER as one unit: the most common address
+           stays in those columns as-is, and every OTHER distinct address
+           goes into a new "Other Address" column as one combined string per
+           address, semicolon-joined.
 
 This script does not touch the input file. Save the output only to the
 secured/authorized folder for this data (never a desktop) - it contains
@@ -242,7 +248,7 @@ def norm_dob(v) -> str:
 #    (this loop runs millions of times, so dict-key lookups add up)
 # ------------------------------------------------------------
 class Rec:
-    __slots__ = ("idx", "first", "last", "mid", "dob", "ssn")
+    __slots__ = ("idx", "first", "last", "mid", "dob", "dob_raw", "ssn")
 
     def __init__(self, idx):
         self.idx = idx
@@ -252,44 +258,23 @@ def build_records(df: pd.DataFrame):
     """df MUST already have a 0..n-1 RangeIndex (see main()) - idx doubles
     as the record's position, so no separate index->position map is needed.
     Uses positional numpy-array access (df.values) rather than itertuples(),
-    since itertuples() mangles column names with spaces/punctuation.
-
-    Also returns placeholder_review: every (row, field, original value) where
-    the field had REAL text in it but norm_name() blanked it out as a
-    placeholder (matches NAME_PLACEHOLDERS, or is a literal 'nan'/'none'/
-    'null' string) - so a genuine short name (e.g. "Nan" as a real nickname)
-    that happens to collide with a placeholder pattern can be spotted and
-    reviewed instead of silently disappearing."""
+    since itertuples() mangles column names with spaces/punctuation."""
     recs = []
-    placeholder_review = []
     col_pos = {c: p for p, c in enumerate(df.columns)}
     values = df.values  # numpy object array, fast positional access
     fi, la, mi, do, ss = (col_pos[COL_FIRST], col_pos[COL_LAST], col_pos[COL_MIDDLE],
                           col_pos[COL_DOB], col_pos[COL_SSN])
-    docid_pos = col_pos[COL_DOCID]
-    name_fields = ((COL_FIRST, fi), (COL_LAST, la), (COL_MIDDLE, mi))
     for i in range(len(df)):
         row = values[i]
         r = Rec(i)
         r.first = norm_name(row[fi])
         r.last = norm_name(row[la])
         r.mid = norm_name(row[mi])
+        r.dob_raw = row[do]
         r.dob = norm_dob(row[do])
         r.ssn = norm_ssn(row[ss])
         recs.append(r)
-
-        for label, pos in name_fields:
-            raw_val = row[pos]
-            raw_str = "" if raw_val is None else str(raw_val).strip()
-            normed = {fi: r.first, la: r.last, mi: r.mid}[pos]
-            if raw_str and not normed:
-                placeholder_review.append({
-                    "DOCID": row[docid_pos],
-                    "Field": label,
-                    "Original Value": raw_str,
-                    "First Name": row[fi], "Last Name": row[la],
-                })
-    return recs, placeholder_review
+    return recs
 
 
 # ------------------------------------------------------------
@@ -404,6 +389,44 @@ def semicolon_merge(values) -> str:
     return MERGE_SEP.join(out)
 
 
+def fullest_value(raw_values, norm_values) -> str:
+    """Longest raw value whose norm form is non-blank (placeholders/blanks
+    are skipped); '' if every value is blank/placeholder. Used for First/
+    Middle/Last Name, Suffix, and SSN - these keep ONE final value per
+    merged person, not every variant."""
+    best, best_len = "", -1
+    for raw, norm in zip(raw_values, norm_values):
+        if not norm:
+            continue
+        raw = "" if raw is None else str(raw).strip()
+        if len(raw) > best_len:
+            best, best_len = raw, len(raw)
+    return best
+
+
+def majority_dob(sub_recs) -> str:
+    """Most frequent normalized DOB among the group wins (Rule 1 doesn't
+    require DOB to match, so a merged group can legitimately contain more
+    than one DOB value); '' if none present."""
+    counts = defaultdict(int)
+    raw_for = {}
+    for r in sub_recs:
+        if r.dob:
+            counts[r.dob] += 1
+            raw_for.setdefault(r.dob, r.dob_raw)
+    if not counts:
+        return ""
+    best = max(counts.items(), key=lambda kv: (kv[1], kv[0]))[0]
+    return raw_for[best]
+
+
+def has_variation(raw_values) -> bool:
+    """True if the group had 2+ distinct real values for this field, even
+    though only one (the fullest) was kept in the output - used for the
+    'Names Differ' review flag."""
+    return len({norm_text(v) for v in raw_values if norm_text(v)}) > 1
+
+
 def address_key(values) -> tuple:
     """Normalized tuple used to tell whether two rows have the SAME address
     (all fields blank-insensitive) - used to find the majority address."""
@@ -473,12 +496,7 @@ def main() -> None:
         )
     print(f"  {len(df):,} rows read.")
 
-    recs, placeholder_review = build_records(df)   # recs[i].idx == i == df row position
-    if placeholder_review:
-        print(f"  {len(placeholder_review):,} name value(s) were treated as a "
-              f"placeholder ('[Unknown]', 'nan', etc.) and blanked - see the "
-              f"'Placeholder Name Review' sheet to confirm none of these were "
-              f"actually real names.")
+    recs = build_records(df)   # recs[i].idx == i == df row position
 
     print("Clustering (blocked comparison) ...")
     pairs = bucket_candidate_pairs(recs)
@@ -494,26 +512,47 @@ def main() -> None:
         if tested % 1_000_000 == 0:
             print(f"  ... {tested:,} / {len(pairs):,} pairs tested")
 
-    groups = defaultdict(list)
+    raw_groups = defaultdict(list)
     for r in recs:
-        groups[uf.find(r.idx)].append(r.idx)
+        raw_groups[uf.find(r.idx)].append(r.idx)
+
+    # A group that ends up with 2+ DIFFERENT known SSNs is a genuine conflict
+    # - it can only happen via a blank-SSN "bridge" row (a direct pairwise
+    # SSN conflict already can't produce a match, see ssn_conflict()). Rather
+    # than silently keeping a partial/best-effort merge through that bridge
+    # row, EVERY row in a conflicting group is backed out to its own separate,
+    # unmerged row.
+    groups = []
+    conflict_rows = 0
+    for group_idxs in raw_groups.values():
+        known_ssns = {recs[i].ssn for i in group_idxs if recs[i].ssn}
+        if len(known_ssns) > 1:
+            conflict_rows += len(group_idxs)
+            groups.extend([i] for i in group_idxs)
+        else:
+            groups.append(group_idxs)
 
     print(f"  {len(df):,} rows -> {len(groups):,} merged people "
           f"({len(df) - len(groups):,} rows collapsed by a match).")
+    if conflict_rows:
+        print(f"  WARNING: {conflict_rows:,} row(s) were part of a group with "
+              f"2+ conflicting SSNs - none of those rows were merged (kept "
+              f"as separate rows). Review manually.")
 
     print("Building merged output ...")
-    # Columns merged as-is: every distinct value seen in the group, joined
-    # with '; '. Name/DOB/SSN are included here too (Step 1/2 don't pick a
-    # single "best" value - they keep every variant, same as any other field).
-    SEMICOLON_COLS = (
-        [COL_DOCID, COL_FIRST, COL_LAST, COL_MIDDLE, COL_SUFFIX, COL_DOB, COL_SSN]
-        + OTHER_MERGE_COLS
-    )
+    SEMICOLON_COLS = [COL_DOCID] + OTHER_MERGE_COLS
     out_rows = []
-    for group_idxs in groups.values():
-        sub = df.iloc[group_idxs]   # O(group size), not O(n)
+    for group_idxs in groups:
+        sub = df.iloc[group_idxs]           # O(group size), not O(n)
+        sub_recs = [recs[i] for i in group_idxs]
 
         row = {c: semicolon_merge(sub[c]) for c in SEMICOLON_COLS}
+        row[COL_FIRST] = fullest_value(sub[COL_FIRST], [r.first for r in sub_recs])
+        row[COL_LAST] = fullest_value(sub[COL_LAST], [r.last for r in sub_recs])
+        row[COL_MIDDLE] = fullest_value(sub[COL_MIDDLE], [r.mid for r in sub_recs])
+        row[COL_SUFFIX] = fullest_value(sub[COL_SUFFIX], [norm_text(v) for v in sub[COL_SUFFIX]])
+        row[COL_SSN] = fullest_value(sub[COL_SSN], [r.ssn for r in sub_recs])
+        row[COL_DOB] = majority_dob(sub_recs)
 
         majority_addr_values, other_address = split_addresses(df, group_idxs)
         for c, v in zip(ADDRESS_COLS, majority_addr_values):
@@ -521,7 +560,7 @@ def main() -> None:
         row["Other Address"] = other_address
 
         row["Rows Merged"] = len(group_idxs)
-        row["Names Differ"] = ";" in row[COL_FIRST] or ";" in row[COL_LAST]
+        row["Names Differ"] = has_variation(sub[COL_FIRST]) or has_variation(sub[COL_LAST])
         out_rows.append(row)
 
     df_out = pd.DataFrame(out_rows)
@@ -538,12 +577,9 @@ def main() -> None:
         print(df_out.sort_values("Rows Merged", ascending=False).head(10)
               [[COL_FIRST, COL_LAST, COL_SSN, "Rows Merged"]].to_string())
 
-    df_placeholder = pd.DataFrame(placeholder_review)
-
     print(f"Writing {OUTPUT_XLSX} ...")
     _write_workbook(OUTPUT_XLSX, {
         "Merged Notification Data": df_out,
-        "Placeholder Name Review": df_placeholder,
     })
     print(f"Done -> {OUTPUT_XLSX}")
     print("Reminder: save the output only to the secured/authorized folder for "
