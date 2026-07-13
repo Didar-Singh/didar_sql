@@ -18,6 +18,12 @@ step:
                         either side). This lets a bare-bones record with
                         no SSN/DOB still attach to a fuller record by name
                         alone.
+  Rule 4 (Employee ID, Name): rows sharing at least one common Employee ID
+                        (a cell can already contain multiple semicolon-
+                        joined IDs) AND the same exact First+Last Name are
+                        merged, as long as SSN and DOB are each either
+                        matching or blank on both sides (a real, differing
+                        value on both sides blocks it).
 
 Either rule matching is enough to merge, and the match is transitive (if
 A matches B and B matches C, all three end up in one merged row, even if
@@ -51,8 +57,8 @@ secured/authorized folder for this data (never a desktop) - it contains
 SSN, DOB, and other PII/PHI.
 
 Designed for large row counts (uses "blocking" - only compares rows that
-already share an exact SSN, or an exact First+Last Name+DOB - instead of
-comparing every row to every other row).
+already share an exact SSN, an exact First+Last Name+DOB, a Last Name, or
+an Employee ID + Name - instead of comparing every row to every other row).
 
 Install once:
     pip install pandas openpyxl
@@ -116,8 +122,8 @@ COL_SUFFIX = "Suffix"
 COL_DOB    = "Full Date of Birth (MM/DD/YYYY)"
 COL_SSN    = "Social Security Number"
 
-# Not used for matching (Steps 1-2 only use SSN and Name+DOB) - kept as
-# plain semicolon-merged columns in OTHER_MERGE_COLS below.
+# COL_EMPID is used for matching (Rule 4). The others aren't used for
+# matching - kept as plain semicolon-merged columns in OTHER_MERGE_COLS below.
 COL_DL       = "Driver's License Number"
 COL_PASSPORT = "Passport Number"
 COL_GOVID    = "Government-Issued ID Number"
@@ -285,12 +291,23 @@ def norm_dob(v) -> str:
     return "" if pd.isna(ts) else ts.strftime("%Y%m%d")
 
 
+def parse_empids(v) -> frozenset:
+    """Splits an Employee ID cell into individual ID tokens. Cells may
+    already contain multiple semicolon-joined IDs from an earlier merge
+    (e.g. '12345; 12346' OR '12345;12346' - space after the ';' is
+    optional/inconsistent in the source data), so this splits on ';'
+    regardless of spacing and normalizes each token."""
+    if v is None:
+        return frozenset()
+    return frozenset(norm_text(p) for p in str(v).split(";") if norm_text(p))
+
+
 # ------------------------------------------------------------
 # 3) Record type - __slots__ for fast attribute access at scale
 #    (this loop runs millions of times, so dict-key lookups add up)
 # ------------------------------------------------------------
 class Rec:
-    __slots__ = ("idx", "first", "last", "mid", "dob", "dob_raw", "ssn")
+    __slots__ = ("idx", "first", "last", "mid", "dob", "dob_raw", "ssn", "empids")
 
     def __init__(self, idx):
         self.idx = idx
@@ -304,8 +321,8 @@ def build_records(df: pd.DataFrame):
     recs = []
     col_pos = {c: p for p, c in enumerate(df.columns)}
     values = df.values  # numpy object array, fast positional access
-    fi, la, mi, do, ss = (col_pos[COL_FIRST], col_pos[COL_LAST], col_pos[COL_MIDDLE],
-                          col_pos[COL_DOB], col_pos[COL_SSN])
+    fi, la, mi, do, ss, ei = (col_pos[COL_FIRST], col_pos[COL_LAST], col_pos[COL_MIDDLE],
+                              col_pos[COL_DOB], col_pos[COL_SSN], col_pos[COL_EMPID])
     for i in range(len(df)):
         row = values[i]
         r = Rec(i)
@@ -315,6 +332,7 @@ def build_records(df: pd.DataFrame):
         r.dob_raw = row[do]
         r.dob = norm_dob(row[do])
         r.ssn = norm_ssn(row[ss])
+        r.empids = parse_empids(row[ei])
         recs.append(r)
     return recs
 
@@ -418,11 +436,32 @@ def no_identifier_name_match(r1: Rec, r2: Rec) -> bool:
     return True
 
 
+def compatible(a: str, b: str) -> bool:
+    """True if either side is blank, or both sides are equal. Used for
+    Rule 4's SSN/DOB check - blank never conflicts, matching is fine, but a
+    real, differing value on both sides is a conflict."""
+    return not a or not b or a == b
+
+
+def empid_name_match(r1: Rec, r2: Rec) -> bool:
+    """Step 4 - 'Employee ID, Name': rows share at least one common
+    Employee ID token (see parse_empids() - a cell can already contain
+    multiple semicolon-joined IDs) AND have the same exact First+Last Name,
+    AND SSN and DOB are each either matching or blank on both sides (a
+    real, differing value on either blocks the merge)."""
+    if not (r1.empids and r2.empids and not r1.empids.isdisjoint(r2.empids)):
+        return False
+    if not (r1.first and r1.last and r1.first == r2.first and r1.last == r2.last):
+        return False
+    return compatible(r1.ssn, r2.ssn) and compatible(r1.dob, r2.dob)
+
+
 def is_match(r1: Rec, r2: Rec) -> bool:
     return (
         ssn_exists_match(r1, r2)
         or exact_name_dob_match(r1, r2)
         or no_identifier_name_match(r1, r2)
+        or empid_name_match(r1, r2)
     )
 
 
@@ -513,6 +552,9 @@ def bucket_candidate_pairs(recs):
                 buckets[key].append(r.idx)
             else:
                 buckets[("lastblank", r.last)].append(r.idx)
+        if r.empids and r.first and r.last:           # Rule 4: Employee ID, Name
+            for tok in r.empids:
+                buckets[("empidname", tok, r.first, r.last)].append(r.idx)
 
     for (kind, last, first), rep_idx in lastfirst_reps.items():
         blank_key = ("lastblank", last)
@@ -554,6 +596,29 @@ def semicolon_merge(values) -> str:
             continue
         seen.add(key)
         out.append(raw)
+    return MERGE_SEP.join(out)
+
+
+def merge_empid_tokens(values) -> str:
+    """Like semicolon_merge(), but for Employee ID: a cell can ALREADY
+    contain multiple semicolon-joined IDs (e.g. '12345; 12346' or
+    '12345;12346' - inconsistent spacing in the source data), so this
+    splits every cell into individual tokens FIRST and dedupes at the
+    token level. Plain semicolon_merge() dedupes whole-cell strings, which
+    would leave literal repeats like '12345; 12345; 12346; 12346;12347'
+    instead of '12345; 12346; 12347'."""
+    seen = set()
+    out = []
+    for v in values:
+        if v is None:
+            continue
+        for tok in str(v).split(";"):
+            raw = tok.strip()
+            key = norm_text(raw)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(raw)
     return MERGE_SEP.join(out)
 
 
@@ -765,7 +830,7 @@ def main() -> None:
               f"Name-Only fallback rule.")
 
     print("Building merged output ...")
-    SEMICOLON_COLS = [COL_DOCID] + OTHER_MERGE_COLS
+    SEMICOLON_COLS = [COL_DOCID] + [c for c in OTHER_MERGE_COLS if c != COL_EMPID]
     total_groups = len(groups)
     out_rows = []
     for n, group_idxs in enumerate(groups, 1):
@@ -780,6 +845,7 @@ def main() -> None:
         row[COL_SUFFIX] = fullest_value(sub[COL_SUFFIX], [norm_text(v) for v in sub[COL_SUFFIX]])
         row[COL_SSN] = fullest_value(sub[COL_SSN], [r.ssn for r in sub_recs])
         row[COL_DOB] = majority_dob(sub_recs)
+        row[COL_EMPID] = merge_empid_tokens(sub[COL_EMPID])
 
         majority_addr_values, other_address = split_addresses(df, group_idxs)
         for c, v in zip(ADDRESS_COLS, majority_addr_values):
