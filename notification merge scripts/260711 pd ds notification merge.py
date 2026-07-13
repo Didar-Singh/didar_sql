@@ -2,7 +2,7 @@
 260711 pd ds notification merge.py
 
 Merge PII/PHI person records from an Excel export into one row per
-confirmed person, for the notification report. Three rules, built step by
+confirmed person, for the notification report. Six rules, built step by
 step:
 
   Rule 1 (SSN Exists): rows with the same (non-blank, non-junk) SSN
@@ -24,6 +24,10 @@ step:
                         merged, as long as SSN and DOB are each either
                         matching or blank on both sides (a real, differing
                         value on both sides blocks it).
+  Rule 5 (Driver's License, Name): same as Rule 4, but matched on Driver's
+                        License Number instead of Employee ID.
+  Rule 6 (Passport Number, Name): same as Rule 4, but matched on Passport
+                        Number instead of Employee ID.
 
 Either rule matching is enough to merge, and the match is transitive (if
 A matches B and B matches C, all three end up in one merged row, even if
@@ -37,20 +41,29 @@ that would cross real SSNs is refused - so e.g. 5 rows sharing one SSN and
 main()).
 
 INPUT  : an Excel workbook with the columns listed in EXPECTED_COLS below.
-OUTPUT : a new Excel workbook with one sheet, "Merged Notification Data":
-         ONE ROW PER CONFIRMED PERSON.
-         - First Name, Middle Name, Last Name, and SSN: the single fullest/
-           most complete value among the merged rows (placeholder values
-           like "[Unknown]" are never picked).
-         - Suffix: the single fullest non-blank value.
-         - DOB: the most frequent (majority) value among the merged rows.
-         - Every OTHER column (DOCIDs, Driver's License, Gov ID, Employee ID,
-           etc.): every distinct value seen, joined with "; ".
-         - Address fields (Residential Address, City, State, Province, Zip,
-           Country) are kept TOGETHER as one unit: the most common address
-           stays in those columns as-is, and every OTHER distinct address
-           goes into a new "Other Address" column as one combined string per
-           address, semicolon-joined.
+OUTPUT : a new Excel workbook with two sheets:
+         - "Merged Notification Data": ONE ROW PER CONFIRMED PERSON.
+           - First Name, Middle Name, Last Name, and SSN: the single
+             fullest/most complete value among the merged rows (placeholder
+             values like "[Unknown]" are never picked).
+           - Suffix: the single fullest non-blank value.
+           - DOB: the most frequent (majority) value among the merged rows.
+           - Employee ID, Driver's License, and Passport Number: every
+             distinct ID TOKEN seen (cells can already contain multiple
+             semicolon-joined IDs - see parse_id_tokens()), deduplicated
+             and joined with "; ".
+           - Every OTHER column (DOCIDs, Gov ID, etc.): every distinct
+             value seen, joined with "; ".
+           - Address fields (Residential Address, City, State, Province,
+             Zip, Country) are kept TOGETHER as one unit: the most common
+             address stays in those columns as-is, and every OTHER distinct
+             address goes into a new "Other Address" column as one combined
+             string per address, semicolon-joined.
+         - "Junk SSN Review": every row where a non-blank SSN value was
+           ignored as unusable (a known fake/placeholder SSN like
+           123-45-6789, all-same-digit, or a masked SSN with too few known
+           digits) - so a real-looking SSN that got silently treated as
+           blank doesn't go unnoticed (see classify_ssn_issue()).
 
 This script does not touch the input file. Save the output only to the
 secured/authorized folder for this data (never a desktop) - it contains
@@ -122,8 +135,9 @@ COL_SUFFIX = "Suffix"
 COL_DOB    = "Full Date of Birth (MM/DD/YYYY)"
 COL_SSN    = "Social Security Number"
 
-# COL_EMPID is used for matching (Rule 4). The others aren't used for
-# matching - kept as plain semicolon-merged columns in OTHER_MERGE_COLS below.
+# COL_EMPID/COL_DL/COL_PASSPORT are used for matching (Rules 4-6). COL_GOVID
+# isn't used for matching - kept as a plain semicolon-merged column in
+# OTHER_MERGE_COLS below.
 COL_DL       = "Driver's License Number"
 COL_PASSPORT = "Passport Number"
 COL_GOVID    = "Government-Issued ID Number"
@@ -267,6 +281,35 @@ def norm_ssn(v) -> str:
     return kept if known >= SSN_MIN_KNOWN_OVERLAP else ""
 
 
+def classify_ssn_issue(v) -> str:
+    """Returns a short human-readable reason if a NON-BLANK SSN value was
+    rejected by norm_ssn() (all-same-digit, a known fake/placeholder value
+    like 123-45-6789, wrong length, or a masked SSN with too few known
+    digits) - '' if the value was already blank/empty, or was accepted as
+    usable. Used to build the 'Junk SSN Review' sheet so a real-looking SSN
+    that got silently treated as blank doesn't go unnoticed."""
+    if v is None:
+        return ""
+    raw = str(v).strip()
+    if not raw or raw.lower() in ("nan", "none", "null"):
+        return ""
+    s = raw.upper().replace("*", "X").replace("#", "X").replace("?", "X")
+    kept = re.sub(r"[^0-9X]", "", s)
+    if len(kept) != 9:
+        return ""   # not 9 digits at all - not SSN-shaped, not flagged as "junk"
+    if "X" not in kept:
+        if len(set(kept)) == 1:
+            return "All-same-digit SSN - ignored as junk"
+        if kept in SSN_PLACEHOLDERS:
+            return "Known fake/placeholder SSN - ignored as junk"
+        return ""   # fully valid
+    known = sum(c != "X" for c in kept)
+    if known < SSN_MIN_KNOWN_OVERLAP:
+        return (f"Masked SSN with only {known} known digit(s) "
+                f"(< {SSN_MIN_KNOWN_OVERLAP} required) - too little to trust")
+    return ""   # masked but enough known digits - fine
+
+
 def ssn_cmp(a: str, b: str) -> str:
     """Compare two 9-char SSN patterns, 'X' = wildcard. Returns:
         'diff'    - a known digit disagrees (definitely different SSNs)
@@ -291,12 +334,12 @@ def norm_dob(v) -> str:
     return "" if pd.isna(ts) else ts.strftime("%Y%m%d")
 
 
-def parse_empids(v) -> frozenset:
-    """Splits an Employee ID cell into individual ID tokens. Cells may
-    already contain multiple semicolon-joined IDs from an earlier merge
-    (e.g. '12345; 12346' OR '12345;12346' - space after the ';' is
-    optional/inconsistent in the source data), so this splits on ';'
-    regardless of spacing and normalizes each token."""
+def parse_id_tokens(v) -> frozenset:
+    """Splits an Employee ID / Driver's License / Passport cell into
+    individual ID tokens. Cells may already contain multiple semicolon-
+    joined IDs from an earlier merge (e.g. '12345; 12346' OR '12345;12346'
+    - space after the ';' is optional/inconsistent in the source data), so
+    this splits on ';' regardless of spacing and normalizes each token."""
     if v is None:
         return frozenset()
     return frozenset(norm_text(p) for p in str(v).split(";") if norm_text(p))
@@ -307,7 +350,8 @@ def parse_empids(v) -> frozenset:
 #    (this loop runs millions of times, so dict-key lookups add up)
 # ------------------------------------------------------------
 class Rec:
-    __slots__ = ("idx", "first", "last", "mid", "dob", "dob_raw", "ssn", "empids")
+    __slots__ = ("idx", "first", "last", "mid", "dob", "dob_raw", "ssn",
+                 "empids", "dl_ids", "passport_ids")
 
     def __init__(self, idx):
         self.idx = idx
@@ -317,12 +361,21 @@ def build_records(df: pd.DataFrame):
     """df MUST already have a 0..n-1 RangeIndex (see main()) - idx doubles
     as the record's position, so no separate index->position map is needed.
     Uses positional numpy-array access (df.values) rather than itertuples(),
-    since itertuples() mangles column names with spaces/punctuation."""
+    since itertuples() mangles column names with spaces/punctuation.
+
+    Also returns ssn_review: every (DOCID, Original SSN, Reason) where a
+    non-blank SSN value was rejected by norm_ssn() (junk/placeholder,
+    all-same-digit, or a masked SSN with too few known digits) - so a real-
+    looking SSN that got silently treated as blank doesn't go unnoticed."""
     recs = []
+    ssn_review = []
     col_pos = {c: p for p, c in enumerate(df.columns)}
     values = df.values  # numpy object array, fast positional access
-    fi, la, mi, do, ss, ei = (col_pos[COL_FIRST], col_pos[COL_LAST], col_pos[COL_MIDDLE],
-                              col_pos[COL_DOB], col_pos[COL_SSN], col_pos[COL_EMPID])
+    fi, la, mi, do, ss, ei, dl, pp = (
+        col_pos[COL_FIRST], col_pos[COL_LAST], col_pos[COL_MIDDLE], col_pos[COL_DOB],
+        col_pos[COL_SSN], col_pos[COL_EMPID], col_pos[COL_DL], col_pos[COL_PASSPORT],
+    )
+    docid_pos = col_pos[COL_DOCID]
     for i in range(len(df)):
         row = values[i]
         r = Rec(i)
@@ -332,9 +385,20 @@ def build_records(df: pd.DataFrame):
         r.dob_raw = row[do]
         r.dob = norm_dob(row[do])
         r.ssn = norm_ssn(row[ss])
-        r.empids = parse_empids(row[ei])
+        r.empids = parse_id_tokens(row[ei])
+        r.dl_ids = parse_id_tokens(row[dl])
+        r.passport_ids = parse_id_tokens(row[pp])
         recs.append(r)
-    return recs
+
+        reason = classify_ssn_issue(row[ss])
+        if reason:
+            ssn_review.append({
+                "DOCID": row[docid_pos],
+                "First Name": row[fi], "Last Name": row[la],
+                "Original SSN": row[ss],
+                "Remarks": reason,
+            })
+    return recs, ssn_review
 
 
 # ------------------------------------------------------------
@@ -438,22 +502,37 @@ def no_identifier_name_match(r1: Rec, r2: Rec) -> bool:
 
 def compatible(a: str, b: str) -> bool:
     """True if either side is blank, or both sides are equal. Used for
-    Rule 4's SSN/DOB check - blank never conflicts, matching is fine, but a
-    real, differing value on both sides is a conflict."""
+    Rules 4-6's SSN/DOB check - blank never conflicts, matching is fine,
+    but a real, differing value on both sides is a conflict."""
     return not a or not b or a == b
 
 
-def empid_name_match(r1: Rec, r2: Rec) -> bool:
-    """Step 4 - 'Employee ID, Name': rows share at least one common
-    Employee ID token (see parse_empids() - a cell can already contain
-    multiple semicolon-joined IDs) AND have the same exact First+Last Name,
-    AND SSN and DOB are each either matching or blank on both sides (a
-    real, differing value on either blocks the merge)."""
-    if not (r1.empids and r2.empids and not r1.empids.isdisjoint(r2.empids)):
+def _id_name_match(ids1: frozenset, ids2: frozenset, r1: Rec, r2: Rec) -> bool:
+    """Shared logic for Rules 4-6: rows share at least one common ID token
+    (from whichever ID field is being checked - see parse_id_tokens(), a
+    cell can already contain multiple semicolon-joined IDs) AND have the
+    same exact First+Last Name, AND SSN and DOB are each either matching or
+    blank on both sides (a real, differing value on either blocks it)."""
+    if not (ids1 and ids2 and not ids1.isdisjoint(ids2)):
         return False
     if not (r1.first and r1.last and r1.first == r2.first and r1.last == r2.last):
         return False
     return compatible(r1.ssn, r2.ssn) and compatible(r1.dob, r2.dob)
+
+
+def empid_name_match(r1: Rec, r2: Rec) -> bool:
+    """Step 4 - 'Employee ID, Name' (see _id_name_match())."""
+    return _id_name_match(r1.empids, r2.empids, r1, r2)
+
+
+def dl_name_match(r1: Rec, r2: Rec) -> bool:
+    """Step 5 - 'Driver's License, Name' (see _id_name_match())."""
+    return _id_name_match(r1.dl_ids, r2.dl_ids, r1, r2)
+
+
+def passport_name_match(r1: Rec, r2: Rec) -> bool:
+    """Step 6 - 'Passport Number, Name' (see _id_name_match())."""
+    return _id_name_match(r1.passport_ids, r2.passport_ids, r1, r2)
 
 
 def is_match(r1: Rec, r2: Rec) -> bool:
@@ -462,6 +541,8 @@ def is_match(r1: Rec, r2: Rec) -> bool:
         or exact_name_dob_match(r1, r2)
         or no_identifier_name_match(r1, r2)
         or empid_name_match(r1, r2)
+        or dl_name_match(r1, r2)
+        or passport_name_match(r1, r2)
     )
 
 
@@ -555,6 +636,12 @@ def bucket_candidate_pairs(recs):
         if r.empids and r.first and r.last:           # Rule 4: Employee ID, Name
             for tok in r.empids:
                 buckets[("empidname", tok, r.first, r.last)].append(r.idx)
+        if r.dl_ids and r.first and r.last:            # Rule 5: Driver's License, Name
+            for tok in r.dl_ids:
+                buckets[("dlname", tok, r.first, r.last)].append(r.idx)
+        if r.passport_ids and r.first and r.last:      # Rule 6: Passport Number, Name
+            for tok in r.passport_ids:
+                buckets[("ppname", tok, r.first, r.last)].append(r.idx)
 
     for (kind, last, first), rep_idx in lastfirst_reps.items():
         blank_key = ("lastblank", last)
@@ -599,14 +686,14 @@ def semicolon_merge(values) -> str:
     return MERGE_SEP.join(out)
 
 
-def merge_empid_tokens(values) -> str:
-    """Like semicolon_merge(), but for Employee ID: a cell can ALREADY
-    contain multiple semicolon-joined IDs (e.g. '12345; 12346' or
-    '12345;12346' - inconsistent spacing in the source data), so this
-    splits every cell into individual tokens FIRST and dedupes at the
-    token level. Plain semicolon_merge() dedupes whole-cell strings, which
-    would leave literal repeats like '12345; 12345; 12346; 12346;12347'
-    instead of '12345; 12346; 12347'."""
+def merge_id_tokens(values) -> str:
+    """Like semicolon_merge(), but for Employee ID / Driver's License /
+    Passport Number: a cell can ALREADY contain multiple semicolon-joined
+    IDs (e.g. '12345; 12346' or '12345;12346' - inconsistent spacing in the
+    source data), so this splits every cell into individual tokens FIRST
+    and dedupes at the token level. Plain semicolon_merge() dedupes whole-
+    cell strings, which would leave literal repeats like
+    '12345; 12345; 12346; 12346;12347' instead of '12345; 12346; 12347'."""
     seen = set()
     out = []
     for v in values:
@@ -729,7 +816,10 @@ def main() -> None:
         )
     print(f"  {len(df):,} rows read.")
 
-    recs = build_records(df)   # recs[i].idx == i == df row position
+    recs, ssn_review = build_records(df)   # recs[i].idx == i == df row position
+    if ssn_review:
+        print(f"  {len(ssn_review):,} SSN value(s) were ignored as junk/unusable "
+              f"- see the 'Junk SSN Review' sheet.")
 
     print("Clustering (blocked comparison) ...")
     pairs = bucket_candidate_pairs(recs)
@@ -778,7 +868,14 @@ def main() -> None:
             refused_ssn += 1
             return   # would combine two different real SSNs - refused
         r1, r2 = recs[a_idx], recs[b_idx]
-        if not (ssn_exists_match(r1, r2) or exact_name_dob_match(r1, r2)):
+        # Rules 2/4/5/6 all require an EXACT First+Last match between r1/r2
+        # directly, so they can never themselves introduce a first-name
+        # conflict - only Rule 3 (blank-First fallback) can, hence the guard
+        # below only matters when none of the stronger rules also apply.
+        if not (
+            ssn_exists_match(r1, r2) or exact_name_dob_match(r1, r2)
+            or empid_name_match(r1, r2) or dl_name_match(r1, r2) or passport_name_match(r1, r2)
+        ):
             fa, fb = group_first[ra], group_first[rb]
             if fa and fb and fa.isdisjoint(fb):
                 refused_name += 1
@@ -830,7 +927,8 @@ def main() -> None:
               f"Name-Only fallback rule.")
 
     print("Building merged output ...")
-    SEMICOLON_COLS = [COL_DOCID] + [c for c in OTHER_MERGE_COLS if c != COL_EMPID]
+    TOKEN_ID_COLS = [COL_EMPID, COL_DL, COL_PASSPORT]
+    SEMICOLON_COLS = [COL_DOCID] + [c for c in OTHER_MERGE_COLS if c not in TOKEN_ID_COLS]
     total_groups = len(groups)
     out_rows = []
     for n, group_idxs in enumerate(groups, 1):
@@ -845,7 +943,8 @@ def main() -> None:
         row[COL_SUFFIX] = fullest_value(sub[COL_SUFFIX], [norm_text(v) for v in sub[COL_SUFFIX]])
         row[COL_SSN] = fullest_value(sub[COL_SSN], [r.ssn for r in sub_recs])
         row[COL_DOB] = majority_dob(sub_recs)
-        row[COL_EMPID] = merge_empid_tokens(sub[COL_EMPID])
+        for c in TOKEN_ID_COLS:
+            row[c] = merge_id_tokens(sub[c])
 
         majority_addr_values, other_address = split_addresses(df, group_idxs)
         for c, v in zip(ADDRESS_COLS, majority_addr_values):
@@ -870,9 +969,12 @@ def main() -> None:
         print(df_out.sort_values("Rows Merged", ascending=False).head(10)
               [[COL_FIRST, COL_LAST, COL_SSN, "Rows Merged"]].to_string())
 
+    df_ssn_review = pd.DataFrame(ssn_review)
+
     print(f"Writing {OUTPUT_XLSX} ...")
     _write_workbook(OUTPUT_XLSX, {
         "Merged Notification Data": df_out,
+        "Junk SSN Review": df_ssn_review,
     })
     print(f"Done -> {OUTPUT_XLSX}")
     print("Reminder: save the output only to the secured/authorized folder for "
