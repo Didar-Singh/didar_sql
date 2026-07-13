@@ -21,9 +21,20 @@ and confirmed first.
 | 10 | Two different real SSNs, even if a similar name + matching DOB would otherwise corroborate (Rules 4–7) | **Do not merge** — different SSNs can never belong to one merged record |
 | 11 | SSN and DOB both match, but the two names are genuinely different (not a typo/prefix/initial) | **Do not merge** — flag for manual review (likely a fake/reused/incorrect SSN) |
 | 12 | SSN is partially masked/redacted (e.g. `123-45-XXXX`), known digits agree with the other row, **and** the names also match | Merge |
-| 13 | SSN **and** DOB are both missing on both rows, name matches/typo-matches, **and** the full address (street+city+state+zip+country) matches exactly | Merge; address is the only available corroboration |
+| 13 | SSN **and** DOB are both missing on both rows, name matches/typo-matches, **and** at least ONE address field matches | Merge; address is the only available corroboration |
 | — | SSN or DOB differs (even if name is identical) | **Do not merge** — different person |
 | — | No matching SSN+DOB and none of rules 1–7/13 apply | **Do not merge** — stays a separate row |
+
+**Only three things can ever BLOCK a merge that would otherwise happen: a
+genuine SSN conflict (Rule 10), a genuine name conflict (Rule 11), or a
+genuine suffix conflict (Rule 8).** Every other identifier — Driver's
+License, Passport, Government ID, and **Employee ID** — is used only as
+*positive* evidence (something that can help confirm a match); a mismatch
+or difference in any of these never blocks a merge by itself. So two rows
+with the same name and no SSN/DOB, but two different Employee IDs, can still
+merge under Rule 13 if the address also lines up — the differing Employee
+ID is simply carried forward as two semicolon-joined values, not treated as
+a conflict.
 
 ## What counts as "the same person"
 
@@ -252,10 +263,10 @@ known digits (e.g. `123-45-6789` vs. `123-99-XXXX`), that's a real conflict
 
 **13. SSN and DOB are BOTH missing on both rows** — there is no identifier at
 all to confirm identity with. In this situation only, a matching/typo name
-**plus** a fully matching address (every part — street, city, state, zip,
-country — not just some of them) together stand in as proof. If either row
-actually has a real SSN or DOB, this rule does not apply — the normal
-SSN/DOB-based rules take over instead.
+**plus at least ONE matching address field** (street, city, state, province,
+zip, or country — just one of them, not all) together stand in as proof. If
+either row actually has a real SSN or DOB, this rule does not apply — the
+normal SSN/DOB-based rules take over instead.
 
 | First Name | Last Name | SSN | DOB | Address |
 |---|---|---|---|---|
@@ -267,24 +278,29 @@ name kept), same address. "Sklar" is treated as a shortened/typo form of
 "Sklarczuk" here, same as the other partial-name rules — but this only
 kicks in because there's no SSN/DOB at all AND the address matches.
 
-**"Address matches" is blank-tolerant** — the same rule as middle name/
-suffix: a field that's missing on just ONE row (e.g. Zip Code entered on one
-row but blank on the other) is not a conflict. What DOES block it is any
-field where BOTH rows have a real value and they genuinely disagree (e.g.
-two different Zip Codes), and at least one field must actually match on both
-sides (two addresses that are both completely blank don't count as "the
-same address").
+⚠️ **"Address matches" is intentionally loose (by explicit request), not
+just blank-tolerant.** Only ONE address field needs to agree — the other
+fields do NOT need to agree, and are not even required to be blank. They can
+genuinely differ and it still counts as a match.
 
 | First Name | Last Name | Address | City | State | Zip |
 |---|---|---|---|---|---|
 | Tlm | Test | 12 Elm St | Chicago | IL | 60601 |
-| Tlm | Test | 12 Elm St | Chicago | IL | *(blank)* |
+| Tlm | Test | 45 Oak Ave | Chicago | NY | 10001 |
 
-→ Merged — street/city/state all agree, and the blank Zip Code on the second
-row isn't a conflict.
+→ **Merged** — only the City ("Chicago") matches; Street, State, and Zip are
+all genuinely different, but that's still enough under this rule.
 
-If either row had a real SSN or DOB, or if any address field genuinely
-disagreed (not just missing), this rule would not apply.
+**Tradeoff to be aware of:** this makes Rule 13 the most permissive rule in
+the report. Two different real people who happen to share the same name and
+just one address field (very plausible for a common City) will now be
+merged, purely because neither had an SSN or DOB on file. If this proves too
+aggressive once real output is reviewed, tightening it back to "the address
+must fully agree" (or "no field may actively disagree") is a one-line change
+in the script.
+
+If either row had a real SSN or DOB, this rule would not apply at all —
+the normal SSN/DOB-based rules take over instead.
 
 ## What counts as a "different person"
 

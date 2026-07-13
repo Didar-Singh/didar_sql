@@ -243,13 +243,12 @@ CROSS APPLY (
         END AS overlap
 ) ssncmp
 CROSS APPLY (
-    -- Address comparison across all 6 fields at once: conflict = any field
-    -- where BOTH sides have a real value that disagrees (e.g. different Zip
-    -- Codes); real_match = at least one field where both sides agree on a
-    -- real value. A field blank on just one side is neither - same
-    -- tolerance as the middle name/suffix rules.
+    -- Address comparison across all 6 fields at once: real_match = AT LEAST
+    -- ONE field where both sides agree on a real value (e.g. same City
+    -- alone is enough). Intentionally loose (by request) - does NOT require
+    -- the other fields to agree or be blank; two same-named people sharing
+    -- just a City will be merged under Rule 13 - accepted tradeoff.
     SELECT
-        MAX(CASE WHEN f.va <> '' AND f.vb <> '' AND f.va <> f.vb THEN 1 ELSE 0 END) AS conflict,
         MAX(CASE WHEN f.va <> '' AND f.vb <> '' AND f.va = f.vb THEN 1 ELSE 0 END) AS real_match
     FROM (
         SELECT UPPER(LTRIM(RTRIM(ISNULL(a.[Residential Address], '')))) AS va, UPPER(LTRIM(RTRIM(ISNULL(b.[Residential Address], '')))) AS vb
@@ -334,13 +333,12 @@ AND (
        )
 
     -- Rule 13: SSN and DOB both missing on both rows - a matching/typo name
-    -- PLUS a compatible address (Zip Code etc. may be blank on one side;
-    -- see addrcmp above) stands in as the corroborating proof, since
-    -- there's nothing else to go on.
+    -- PLUS at least ONE matching address field (see addrcmp above) stands
+    -- in as the corroborating proof, since there's nothing else to go on.
     OR (
         a.n_ssn IS NULL AND b.n_ssn IS NULL AND a.n_dob IS NULL AND b.n_dob IS NULL
         AND nm.name_match = 1
-        AND addrcmp.conflict = 0 AND addrcmp.real_match = 1
+        AND addrcmp.real_match = 1
        )
 
     -- Rule 9 is implicit: a blank suffix never triggers the Rule 8 guard

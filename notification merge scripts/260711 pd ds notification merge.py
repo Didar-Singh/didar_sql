@@ -412,20 +412,14 @@ def pii_match(r1: Rec, r2: Rec) -> bool:
 
 
 def address_full_match(r1: Rec, r2: Rec) -> bool:
-    """True when the address fields (street, city, state, province, zip,
-    country) are compatible: no field where BOTH sides have a real value
-    that disagrees (e.g. different Zip Codes is a conflict), AND at least
-    ONE field has a real, matching value on both sides (so two addresses
-    that are both entirely blank don't vacuously "match" each other). A
-    field blank on just one side (e.g. Zip Code missing on one row) is not
-    a conflict - same tolerance as the middle name / suffix rules."""
-    real_match_found = False
-    for a, b in zip(r1.addr_key, r2.addr_key):
-        if a and b:
-            if a != b:
-                return False
-            real_match_found = True
-    return real_match_found
+    """True when AT LEAST ONE address field (street, city, state, province,
+    zip, country) has a real, matching value on both sides - e.g. same City
+    alone is enough, even if Street/State/Zip are blank OR genuinely
+    different. This is intentionally loose (by request) - it does NOT
+    require the other fields to agree or even be blank; only ONE field
+    needs to match. Two same-named people who happen to share just a City
+    will be merged under this rule - accepted tradeoff, not a bug."""
+    return any(a and b and a == b for a, b in zip(r1.addr_key, r2.addr_key))
 
 
 def no_id_address_match(r1: Rec, r2: Rec) -> bool:
