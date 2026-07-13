@@ -2,21 +2,28 @@
 260711 pd ds notification merge.py
 
 Merge PII/PHI person records from an Excel export into one row per
-confirmed person, for the notification report. Implements the rules
-documented in "260711 re ds notification merge summary.md" (Base rule
-+ Rules 1-13).
+confirmed person, for the notification report. Two rules only, built
+step by step:
+
+  Rule 1 (SSN Exists): rows with the same (non-blank, non-junk) SSN
+                        are merged.
+  Rule 2 (Exact Name, DOB): rows with the same First Name + Last Name
+                        (exact text match) AND the same DOB are merged.
+
+Either rule matching is enough to merge (and the match is transitive: if
+A matches B and B matches C, all three end up in one merged row, even if
+A and C don't directly match each other).
 
 INPUT  : an Excel workbook with the columns listed in EXPECTED_COLS below.
-OUTPUT : a new Excel workbook with three sheets:
-         - "Merged Notification Data": ONE ROW PER CONFIRMED PERSON. Rows
-           that match are combined; PII/PHI fields keep every distinct value
-           seen, joined with "; ". Address fields (Residential Address, City,
-           State, Province, Zip, Country) are kept TOGETHER as one unit: the
-           most common address stays in those columns as-is, and every OTHER
+OUTPUT : a new Excel workbook with two sheets:
+         - "Merged Notification Data": ONE ROW PER CONFIRMED PERSON. Every
+           column - including First/Middle/Last Name, Suffix, DOB, and SSN -
+           keeps every distinct value seen among the merged rows, joined
+           with "; ". Address fields (Residential Address, City, State,
+           Province, Zip, Country) are kept TOGETHER as one unit: the most
+           common address stays in those columns as-is, and every OTHER
            distinct address goes into a new "Other Address" column as one
            combined string per address, semicolon-joined.
-         - "Name Conflict Review": row pairs that share an SSN+DOB but have
-           genuinely conflicting names - NOT merged, needs manual review.
          - "Placeholder Name Review": every First/Last/Middle Name value that
            had real text but got blanked as a placeholder ("[Unknown]",
            "nan", etc.) - so a genuine short name that happens to collide
@@ -28,10 +35,8 @@ secured/authorized folder for this data (never a desktop) - it contains
 SSN, DOB, and other PII/PHI.
 
 Designed for large row counts (uses "blocking" - only compares rows that
-already share an exact SSN, an exact (Last Name, First Initial), a 3-char
-Last Name prefix + First Initial (catches typo/partial last names like
-"Sklar"/"Sklarczuk"), an exact PII value, or a fully matching address -
-instead of comparing every row to every other row).
+already share an exact SSN, or an exact First+Last Name+DOB - instead of
+comparing every row to every other row).
 
 Install once:
     pip install pandas openpyxl
@@ -63,8 +68,8 @@ COL_SUFFIX = "Suffix"
 COL_DOB    = "Full Date of Birth (MM/DD/YYYY)"
 COL_SSN    = "Social Security Number"
 
-# Identifier fields used for Rule 3 (a matching identifier overrides a
-# blank/"[Unknown]" name on one side)
+# Not used for matching (Steps 1-2 only use SSN and Name+DOB) - kept as
+# plain semicolon-merged columns in OTHER_MERGE_COLS below.
 COL_DL       = "Driver's License Number"
 COL_PASSPORT = "Passport Number"
 COL_GOVID    = "Government-Issued ID Number"
@@ -178,10 +183,6 @@ def norm_name(v) -> str:
     return s
 
 
-def norm_suffix(v) -> str:
-    return norm_text(v).replace(".", "")
-
-
 SSN_MIN_KNOWN_OVERLAP = 4   # min matching KNOWN digits to trust a masked SSN
 
 
@@ -236,17 +237,12 @@ def norm_dob(v) -> str:
     return "" if pd.isna(ts) else ts.strftime("%Y%m%d")
 
 
-def norm_pii(v) -> str:
-    return norm_text(v)
-
-
 # ------------------------------------------------------------
 # 3) Record type - __slots__ for fast attribute access at scale
 #    (this loop runs millions of times, so dict-key lookups add up)
 # ------------------------------------------------------------
 class Rec:
-    __slots__ = ("idx", "first", "last", "mid", "suf", "dob", "dob_raw",
-                 "ssn", "dl", "passport", "govid", "empid", "addr_key")
+    __slots__ = ("idx", "first", "last", "mid", "dob", "ssn")
 
     def __init__(self, idx):
         self.idx = idx
@@ -268,12 +264,9 @@ def build_records(df: pd.DataFrame):
     placeholder_review = []
     col_pos = {c: p for p, c in enumerate(df.columns)}
     values = df.values  # numpy object array, fast positional access
-    fi, la, mi, su, do, ss = (col_pos[COL_FIRST], col_pos[COL_LAST], col_pos[COL_MIDDLE],
-                              col_pos[COL_SUFFIX], col_pos[COL_DOB], col_pos[COL_SSN])
-    dl, pp, gv, ei = (col_pos[COL_DL], col_pos[COL_PASSPORT], col_pos[COL_GOVID],
-                      col_pos[COL_EMPID])
+    fi, la, mi, do, ss = (col_pos[COL_FIRST], col_pos[COL_LAST], col_pos[COL_MIDDLE],
+                          col_pos[COL_DOB], col_pos[COL_SSN])
     docid_pos = col_pos[COL_DOCID]
-    addr_pos = [col_pos[c] for c in ADDRESS_COLS]
     name_fields = ((COL_FIRST, fi), (COL_LAST, la), (COL_MIDDLE, mi))
     for i in range(len(df)):
         row = values[i]
@@ -281,15 +274,8 @@ def build_records(df: pd.DataFrame):
         r.first = norm_name(row[fi])
         r.last = norm_name(row[la])
         r.mid = norm_name(row[mi])
-        r.suf = norm_suffix(row[su])
-        r.dob_raw = row[do]
         r.dob = norm_dob(row[do])
         r.ssn = norm_ssn(row[ss])
-        r.dl = norm_pii(row[dl])
-        r.passport = norm_pii(row[pp])
-        r.govid = norm_pii(row[gv])
-        r.empid = norm_pii(row[ei])
-        r.addr_key = tuple(norm_text(row[p]) for p in addr_pos)
         recs.append(r)
 
         for label, pos in name_fields:
@@ -307,172 +293,29 @@ def build_records(df: pd.DataFrame):
 
 
 # ------------------------------------------------------------
-# 4) Pairwise matching rules (Base + Rules 1-9 from the summary doc)
+# 4) Pairwise matching rules - built STEP BY STEP.
+#    Add each newly confirmed rule here as its own small function, then
+#    call it from is_match() below.
 # ------------------------------------------------------------
-def first_compat(a: str, b: str) -> bool:
-    """Exact, or one is a prefix of the other (covers 'H'->'Harish' and
-    'Did'->'Didar' with no minimum length - identity is corroborated by
-    SSN/DOB in every rule that calls this, so a short prefix is safe)."""
-    if not a or not b:
-        return False
-    if a == b:
-        return True
-    short, long_ = (a, b) if len(a) <= len(b) else (b, a)
-    return long_.startswith(short)
+def ssn_exists_match(r1: Rec, r2: Rec) -> bool:
+    """Step 1 - 'SSN Exists': both rows have a usable (non-blank, non-junk)
+    SSN and it's the same value. Name is NOT considered here at all."""
+    return bool(r1.ssn) and bool(r2.ssn) and r1.ssn == r2.ssn
 
 
-def last_compat(a: str, b: str) -> bool:
-    """Exact, or a >=3 char prefix/typo-tolerant match (covers 'Sin'/'Sing'
-    -> 'Singh')."""
-    if not a or not b:
-        return False
-    if a == b:
-        return True
-    short, long_ = (a, b) if len(a) <= len(b) else (b, a)
-    return len(short) >= 3 and long_.startswith(short)
-
-
-def middle_compat(a: str, b: str) -> bool:
-    """Equal, either blank, or one is a prefix of the other (Rule 7)."""
-    if a == b or not a or not b:
-        return True
-    short, long_ = (a, b) if len(a) <= len(b) else (b, a)
-    return long_.startswith(short)
-
-
-def name_match(r1: Rec, r2: Rec) -> bool:
+def exact_name_dob_match(r1: Rec, r2: Rec) -> bool:
+    """Step 2 - 'Exact Name, DOB': both rows have the same First Name AND
+    the same Last Name (exact text match, no typo/prefix tolerance) AND the
+    same DOB. Middle Name/Suffix are NOT part of the match - they just get
+    semicolon-merged like every other column when this rule fires."""
     return (
-        r1.last and r2.last and last_compat(r1.last, r2.last)
-        and first_compat(r1.first, r2.first)
-        and middle_compat(r1.mid, r2.mid)
+        bool(r1.first) and bool(r1.last) and bool(r1.dob)
+        and r1.first == r2.first and r1.last == r2.last and r1.dob == r2.dob
     )
-
-
-def suffix_conflict(r1: Rec, r2: Rec) -> bool:
-    """Rule 8: a real, differing suffix blocks EVERY rule below, even the
-    base SSN+DOB match. Rule 9 (blank vs. a real suffix) is NOT a conflict."""
-    return bool(r1.suf) and bool(r2.suf) and r1.suf != r2.suf
-
-
-def ssn_conflict(r1: Rec, r2: Rec) -> bool:
-    """Two DIFFERENT real SSNs must never be merged, even if a fuzzy name
-    and a matching DOB (Rules 4-7) would otherwise corroborate the pair.
-    A blank SSN on either side is not a conflict (Rule 2 still applies).
-    Uses ssn_cmp so a known digit disagreeing between a masked and a full
-    SSN still blocks the merge; masked SSNs with no overlapping known
-    digits ('unknown') are NOT treated as a conflict."""
-    return bool(r1.ssn) and bool(r2.ssn) and ssn_cmp(r1.ssn, r2.ssn) == "diff"
-
-
-def ssn_same(r1: Rec, r2: Rec) -> bool:
-    """True when both SSNs are usable and agree. A FULLY KNOWN SSN match is
-    trusted on its own. A MASKED SSN (either side has an 'X') additionally
-    requires the names to actually match - a redacted number alone is too
-    weak to confirm identity without name corroboration."""
-    if not r1.ssn or not r2.ssn:
-        return False
-    if ssn_cmp(r1.ssn, r2.ssn) != "same":
-        return False
-    if "X" in r1.ssn or "X" in r2.ssn:
-        return name_match(r1, r2)
-    return True
-
-
-def identifier_match(r1: Rec, r2: Rec) -> bool:
-    """Rule 3's identifier check: matching PII (DL/Passport/Gov ID/Employee
-    ID), OR a fully-known (non-masked) SSN match. Masked SSNs are excluded
-    here since Rule 3 pairs a real identifier with a BLANK name on the other
-    side, so there is no name available to corroborate a masked/ambiguous
-    SSN."""
-    return pii_match(r1, r2) or (
-        bool(r1.ssn) and bool(r2.ssn)
-        and "X" not in r1.ssn and "X" not in r2.ssn
-        and r1.ssn == r2.ssn
-    )
-
-
-def name_conflict(r1: Rec, r2: Rec) -> bool:
-    """True when BOTH rows have a real first+last name and they don't even
-    weakly match (not exact, not a typo/prefix, not an initial) - i.e. two
-    genuinely different names. A matching SSN+DOB alongside a real name
-    conflict usually means a fake/reused/incorrect SSN, not the same
-    person - so this blocks the Base rule too, not just the fuzzy rules."""
-    if not (r1.first and r1.last and r2.first and r2.last):
-        return False
-    return not name_match(r1, r2)
-
-
-def pii_match(r1: Rec, r2: Rec) -> bool:
-    return (
-        (r1.dl and r1.dl == r2.dl)
-        or (r1.passport and r1.passport == r2.passport)
-        or (r1.govid and r1.govid == r2.govid)
-        or (r1.empid and r1.empid == r2.empid)
-    )
-
-
-def address_full_match(r1: Rec, r2: Rec) -> bool:
-    """True when AT LEAST ONE address field (street, city, state, province,
-    zip, country) has a real, matching value on both sides - e.g. same City
-    alone is enough, even if Street/State/Zip are blank OR genuinely
-    different. This is intentionally loose (by request) - it does NOT
-    require the other fields to agree or even be blank; only ONE field
-    needs to match. Two same-named people who happen to share just a City
-    will be merged under this rule - accepted tradeoff, not a bug."""
-    return any(a and b and a == b for a, b in zip(r1.addr_key, r2.addr_key))
-
-
-def no_id_address_match(r1: Rec, r2: Rec) -> bool:
-    """Rule 13: SSN and DOB are BOTH missing on both rows (no identifier to
-    corroborate with at all), so a matching/typo name PLUS a compatible
-    address together stand in as the corroborating proof. Only applies when
-    there is truly nothing else to go on - if either row has a real SSN or
-    DOB, the normal rules (which require SSN/DOB corroboration) apply
-    instead of this address-only fallback."""
-    if r1.ssn or r2.ssn or r1.dob or r2.dob:
-        return False
-    return name_match(r1, r2) and address_full_match(r1, r2)
 
 
 def is_match(r1: Rec, r2: Rec) -> bool:
-    if suffix_conflict(r1, r2) or ssn_conflict(r1, r2) or name_conflict(r1, r2):
-        return False
-
-    ssn_matched = ssn_same(r1, r2)
-    dob_same = bool(r1.dob) and r1.dob == r2.dob
-
-    if ssn_matched and dob_same:                    # Base rule
-        return True
-
-    nm = name_match(r1, r2)
-    if ssn_matched and nm:                          # Rule 1 (DOB may differ)
-        return True
-    if nm and (ssn_matched or dob_same):            # Rules 4-7
-        return True
-
-    # Rule 2: same exact name, complementary SSN/DOB (one has SSN only,
-    # the other DOB only)
-    if r1.first and r1.first == r2.first and r1.last and r1.last == r2.last:
-        ssn_complementary = bool(r1.ssn) != bool(r2.ssn)
-        dob_complementary = bool(r1.dob) != bool(r2.dob)
-        if ssn_complementary and dob_complementary:
-            return True
-
-    # Rule 3: matching identifier (PII, or a fully-known SSN), one side's
-    # name is entirely blank/"[Unknown]"
-    if identifier_match(r1, r2):
-        r1_blank = not r1.first and not r1.last
-        r2_blank = not r2.first and not r2.last
-        if r1_blank != r2_blank:
-            return True
-
-    # Rule 13: SSN and DOB both missing on both rows - a matching/typo name
-    # PLUS a fully matching address (street+city+state+zip+country) stands
-    # in as the corroborating proof, since there's nothing else to go on.
-    if no_id_address_match(r1, r2):
-        return True
-
-    return False
+    return ssn_exists_match(r1, r2) or exact_name_dob_match(r1, r2)
 
 
 # ------------------------------------------------------------
@@ -496,37 +339,19 @@ class UnionFind:
 
 # ------------------------------------------------------------
 # 6) Blocking - only test pairs that already share something exact, so we
-#    never do a full N x N comparison. Candidate pairs come from seven
-#    cheap buckets; is_match() then applies the real rules within each.
+#    never do a full N x N comparison. Candidate pairs come from one bucket
+#    per active rule; is_match() then applies the real rules within each.
 # ------------------------------------------------------------
 MAX_BUCKET_SIZE = 300   # safety valve: skip pairwise test inside a bucket
-LAST_NAME_PREFIX_LEN = 3   # must match last_compat()'s minimum prefix length
 
 
 def bucket_candidate_pairs(recs):
     buckets = defaultdict(list)
     for r in recs:
-        if r.ssn:
+        if r.ssn:                                    # Rule 1: SSN Exists
             buckets[("ssn", r.ssn)].append(r.idx)
-        if r.last and r.first:
-            buckets[("name", r.last, r.first[0])].append(r.idx)
-            # last_compat()/last name Rules (5/6/13) allow a >=3-char PREFIX
-            # match (e.g. "Sklar" -> "Sklarczuk", "Sin"/"Sing" -> "Singh"),
-            # which an EXACT-last-name bucket above would never surface -
-            # two rows with different-but-prefix-related last names would
-            # otherwise never even be compared. Bucket by the first 3
-            # characters of the last name instead to catch these.
-            buckets[("lastprefix", r.last[:LAST_NAME_PREFIX_LEN], r.first[0])].append(r.idx)
-        if r.dl:
-            buckets[("dl", r.dl)].append(r.idx)
-        if r.passport:
-            buckets[("passport", r.passport)].append(r.idx)
-        if r.govid:
-            buckets[("govid", r.govid)].append(r.idx)
-        if r.empid:
-            buckets[("empid", r.empid)].append(r.idx)
-        if all(r.addr_key):
-            buckets[("addr",) + r.addr_key].append(r.idx)
+        if r.first and r.last and r.dob:              # Rule 2: Exact Name, DOB
+            buckets[("namedob", r.first, r.last, r.dob)].append(r.idx)
 
     pairs = set()
     skipped = 0
@@ -562,32 +387,6 @@ def semicolon_merge(values) -> str:
         seen.add(key)
         out.append(raw)
     return MERGE_SEP.join(out)
-
-
-def fullest_value(values, norm_values) -> str:
-    """Longest non-blank/non-placeholder value (Rules 4/5/6/7/9)."""
-    best, best_len = "", -1
-    for raw, norm in zip(values, norm_values):
-        if not norm:
-            continue
-        raw = "" if raw is None else str(raw).strip()
-        if len(raw) > best_len:
-            best, best_len = raw, len(raw)
-    return best
-
-
-def majority_dob(sub_recs) -> str:
-    """Rule 1: most frequent normalized DOB wins; '' if none present."""
-    counts = defaultdict(int)
-    raw_for = {}
-    for r in sub_recs:
-        if r.dob:
-            counts[r.dob] += 1
-            raw_for.setdefault(r.dob, r.dob_raw)
-    if not counts:
-        return ""
-    best = max(counts.items(), key=lambda kv: (kv[1], kv[0]))[0]
-    return raw_for[best]
 
 
 def address_key(values) -> tuple:
@@ -671,19 +470,11 @@ def main() -> None:
     print(f"  {len(pairs):,} candidate pairs to test.")
 
     uf = UnionFind(len(recs))
-    # SSN+DOB matched but the names are genuinely conflicting (Rule 8/name-
-    # conflict guard blocked it) - surfaced for manual review, not silently
-    # merged or silently dropped.
-    name_conflict_review = []
     tested = 0
     for a_idx, b_idx in pairs:
         r1, r2 = recs[a_idx], recs[b_idx]
         if is_match(r1, r2):
             uf.union(a_idx, b_idx)
-        elif (ssn_same(r1, r2)
-              and bool(r1.dob) and r1.dob == r2.dob
-              and name_conflict(r1, r2)):
-            name_conflict_review.append((a_idx, b_idx))
         tested += 1
         if tested % 1_000_000 == 0:
             print(f"  ... {tested:,} / {len(pairs):,} pairs tested")
@@ -694,36 +485,26 @@ def main() -> None:
 
     print(f"  {len(df):,} rows -> {len(groups):,} merged people "
           f"({len(df) - len(groups):,} rows collapsed by a match).")
-    if name_conflict_review:
-        print(f"  WARNING: {len(name_conflict_review):,} row pair(s) share an "
-              f"SSN+DOB but have conflicting names - NOT merged, flagged for "
-              f"manual review (see the 'Name Conflict Review' sheet).")
 
     print("Building merged output ...")
+    # Columns merged as-is: every distinct value seen in the group, joined
+    # with '; '. Name/DOB/SSN are included here too (Step 1/2 don't pick a
+    # single "best" value - they keep every variant, same as any other field).
+    SEMICOLON_COLS = (
+        [COL_DOCID, COL_FIRST, COL_LAST, COL_MIDDLE, COL_SUFFIX, COL_DOB, COL_SSN]
+        + OTHER_MERGE_COLS
+    )
     out_rows = []
     for group_idxs in groups.values():
-        sub = df.iloc[group_idxs]                       # O(group size), not O(n)
-        sub_recs = [recs[i] for i in group_idxs]         # O(group size), not O(n)
+        sub = df.iloc[group_idxs]   # O(group size), not O(n)
 
-        row = {
-            COL_DOCID: semicolon_merge(sub[COL_DOCID]),
-            COL_FIRST: fullest_value(sub[COL_FIRST], [r.first for r in sub_recs]),
-            COL_LAST:  fullest_value(sub[COL_LAST],  [r.last for r in sub_recs]),
-            COL_MIDDLE: fullest_value(sub[COL_MIDDLE], [r.mid for r in sub_recs]),
-            COL_SUFFIX: fullest_value(sub[COL_SUFFIX], [r.suf for r in sub_recs]),
-            COL_DOB: majority_dob(sub_recs),
-            # A single value, not semicolon-joined: the ssn_conflict guard in
-            # is_match() guarantees every real SSN in this group is identical.
-            COL_SSN: fullest_value(sub[COL_SSN], [r.ssn for r in sub_recs]),
-        }
+        row = {c: semicolon_merge(sub[c]) for c in SEMICOLON_COLS}
 
         majority_addr_values, other_address = split_addresses(df, group_idxs)
         for c, v in zip(ADDRESS_COLS, majority_addr_values):
             row[c] = v
         row["Other Address"] = other_address
 
-        for c in OTHER_MERGE_COLS:
-            row[c] = semicolon_merge(sub[c])
         row["Rows Merged"] = len(group_idxs)
         row["Names Differ"] = ";" in row[COL_FIRST] or ";" in row[COL_LAST]
         out_rows.append(row)
@@ -737,27 +518,16 @@ def main() -> None:
     print(f"  Largest merged group: {biggest:,} rows.")
     if biggest > 50:
         print("  WARNING: a group >50 rows usually means a shared junk value "
-              "(e.g. a fake SSN or a common PII placeholder). Inspect the top "
-              "groups below before trusting the output.")
+              "(e.g. a fake SSN). Inspect the top groups below before "
+              "trusting the output.")
         print(df_out.sort_values("Rows Merged", ascending=False).head(10)
               [[COL_FIRST, COL_LAST, COL_SSN, "Rows Merged"]].to_string())
 
-    review_rows = []
-    for a_idx, b_idx in name_conflict_review:
-        ra, rb = recs[a_idx], recs[b_idx]
-        review_rows.append({
-            "DOCID A": df.at[a_idx, COL_DOCID], "First Name A": df.at[a_idx, COL_FIRST],
-            "Last Name A": df.at[a_idx, COL_LAST], "SSN A": df.at[a_idx, COL_SSN],
-            "DOCID B": df.at[b_idx, COL_DOCID], "First Name B": df.at[b_idx, COL_FIRST],
-            "Last Name B": df.at[b_idx, COL_LAST], "SSN B": df.at[b_idx, COL_SSN],
-        })
-    df_review = pd.DataFrame(review_rows)
     df_placeholder = pd.DataFrame(placeholder_review)
 
     print(f"Writing {OUTPUT_XLSX} ...")
     _write_workbook(OUTPUT_XLSX, {
         "Merged Notification Data": df_out,
-        "Name Conflict Review": df_review,
         "Placeholder Name Review": df_placeholder,
     })
     print(f"Done -> {OUTPUT_XLSX}")
