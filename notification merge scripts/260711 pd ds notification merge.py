@@ -60,6 +60,27 @@ from collections import defaultdict
 import pandas as pd
 
 # ------------------------------------------------------------
+# Progress bar - one line, updated in place, no per-item explanation.
+# ------------------------------------------------------------
+_last_pct = {}
+
+
+def progress(label: str, current: int, total: int, extra: str = "") -> None:
+    """Prints '[label]  42% |########------------|  420,000/1,000,000  extra'
+    on a single line, overwriting itself. Only redraws when the whole percent
+    value changes, so it's cheap to call on every loop iteration."""
+    pct = 100 if total <= 0 else min(100, current * 100 // total)
+    if _last_pct.get(label) == pct and current != total:
+        return
+    _last_pct[label] = pct
+    bar = "#" * (pct // 5) + "-" * (20 - pct // 5)
+    tail = f"  {extra}" if extra else ""
+    end = "\n" if current >= total else ""
+    print(f"\r  [{label}] {pct:3d}% |{bar}| {current:,}/{total:,}{tail}   ",
+          end=end, flush=True)
+
+
+# ------------------------------------------------------------
 # 1) CONFIG - edit these to match your workbook
 # ------------------------------------------------------------
 INPUT_XLSX  = "Data_01.xlsx"
@@ -354,20 +375,22 @@ def bucket_candidate_pairs(recs):
             buckets[("namedob", r.first, r.last, r.dob)].append(r.idx)
 
     pairs = set()
-    skipped = 0
-    for key, idxs in buckets.items():
+    skipped_buckets = 0
+    skipped_rows = 0
+    total = len(buckets)
+    for n, (key, idxs) in enumerate(buckets.items(), 1):
+        progress("Bucketing", n, total, extra=f"skipped={skipped_buckets}")
         if len(idxs) < 2:
             continue
         if len(idxs) > MAX_BUCKET_SIZE:
-            skipped += 1
-            print(f"  WARNING: bucket {key[:2]}... has {len(idxs):,} rows "
-                  f"(> {MAX_BUCKET_SIZE}) - skipping exhaustive compare, "
-                  f"likely a junk/shared value. Review manually.")
+            skipped_buckets += 1
+            skipped_rows += len(idxs)
             continue
         for a, b in itertools.combinations(sorted(idxs), 2):
             pairs.add((a, b))
-    if skipped:
-        print(f"  {skipped} oversized bucket(s) skipped - see warnings above.")
+    if skipped_buckets:
+        print(f"  Skipped {skipped_buckets:,} oversized bucket(s) "
+              f"({skipped_rows:,} rows, likely a shared junk value) - review manually.")
     return pairs
 
 
@@ -503,14 +526,12 @@ def main() -> None:
     print(f"  {len(pairs):,} candidate pairs to test.")
 
     uf = UnionFind(len(recs))
-    tested = 0
-    for a_idx, b_idx in pairs:
+    total_pairs = len(pairs)
+    for tested, (a_idx, b_idx) in enumerate(pairs, 1):
         r1, r2 = recs[a_idx], recs[b_idx]
         if is_match(r1, r2):
             uf.union(a_idx, b_idx)
-        tested += 1
-        if tested % 1_000_000 == 0:
-            print(f"  ... {tested:,} / {len(pairs):,} pairs tested")
+        progress("Clustering", tested, total_pairs)
 
     raw_groups = defaultdict(list)
     for r in recs:
@@ -541,8 +562,10 @@ def main() -> None:
 
     print("Building merged output ...")
     SEMICOLON_COLS = [COL_DOCID] + OTHER_MERGE_COLS
+    total_groups = len(groups)
     out_rows = []
-    for group_idxs in groups:
+    for n, group_idxs in enumerate(groups, 1):
+        progress("Building output", n, total_groups)
         sub = df.iloc[group_idxs]           # O(group size), not O(n)
         sub_recs = [recs[i] for i in group_idxs]
 
