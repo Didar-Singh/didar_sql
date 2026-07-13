@@ -87,9 +87,13 @@ OUTPUT : a new Excel workbook with four sheets:
              "; " boundaries (see split_docid_chunks()).
            - Address fields (Residential Address, City, State, Province,
              Zip, Country) are kept TOGETHER as one unit: the most common
-             address stays in those columns as-is, and every OTHER distinct
-             address goes into a new "Other Address" column as one combined
-             string per address, semicolon-joined.
+             address (by total row count) stays in those columns - with any
+             field left blank on one row filled in from another row's fuller
+             copy of that SAME address, so e.g. a blank Zip on one row never
+             by itself creates a spurious extra address - and every OTHER,
+             genuinely different address goes into a new "Other Address"
+             column as one combined string per address, semicolon-joined
+             (see address_key_conflict()).
          - "Junk SSN Review": every row where a non-blank SSN value was
            ignored as unusable (a known fake/placeholder SSN like
            123-45-6789, all-same-digit, or a masked SSN with too few known
@@ -1066,6 +1070,28 @@ def address_key(values) -> tuple:
     return tuple(_key(col, v) for col, v in zip(ADDRESS_COLS, values))
 
 
+def address_key_conflict(k1: tuple, k2: tuple) -> bool:
+    """True if two normalized address keys (see address_key(), each a
+    Street/City/State/Province/Zip/Country tuple) genuinely disagree - blank
+    on either side is never a conflict, but a real, differing value is.
+    Street is compared via street_compat() (a unit/apt suffix present on
+    only one side isn't a conflict, matching how Rule 8 treats it); Zip is
+    already the zip5-prefix-or-raw key from address_key(), so a plain
+    compare is enough; City/State/Province/Country are a plain blank-
+    tolerant equality check. Used by split_addresses() so a row that's
+    missing just one field (e.g. blank Zip) of an otherwise-identical
+    address is folded into that SAME address instead of being listed as a
+    separate 'Other Address' - mirrors how address_conflict() already treats
+    blanks when deciding whether two rows are the same person in the first
+    place, so the output doesn't contradict the matching decision."""
+    addr1, city1, state1, prov1, zip1, country1 = k1
+    addr2, city2, state2, prov2, zip2, country2 = k2
+    if not street_compat(addr1, addr2):
+        return True
+    pairs = ((city1, city2), (state1, state2), (prov1, prov2), (zip1, zip2), (country1, country2))
+    return any(a and b and a != b for a, b in pairs)
+
+
 def format_full_address(values) -> str:
     """One address, all its parts combined into a single readable string,
     e.g. '123 ABC Ln, Springfield, IL, 62701, USA'. Blank parts are skipped."""
@@ -1079,36 +1105,84 @@ def format_full_address(values) -> str:
 
 def split_addresses(df, group_idxs):
     """Returns (majority_values, other_address_string) for one merged group.
-    majority_values: the ADDRESS_COLS values (as originally entered) for the
-    address that appears most often among this group's rows - these go into
-    the normal Residential Address/City/State/Zip/Country columns unchanged.
-    other_address_string: every OTHER distinct address in this group,
+
+    Rows are first bucketed by their exact normalized address_key() (blank-
+    insensitive per field, abbreviation-canonicalized), then those DISTINCT
+    keys are clustered together whenever they don't genuinely conflict (see
+    address_key_conflict()) - e.g. the same street/city with Zip blank on
+    one row and present on another are one cluster, one address, not two.
+    majority_values: the fullest non-blank value per field (see
+    fullest_value()) across the winning cluster - the one with the most
+    rows in it - so a row missing a field borrows it from another row's
+    fuller copy of the same address, instead of leaving it blank or
+    spinning off a spurious 'Other Address' entry. These go into the normal
+    Residential Address/City/State/Zip/Country columns.
+    other_address_string: every OTHER, genuinely different address cluster,
     combined into one string per address and semicolon-joined, for the
     'Other Address' column. A row with no address at all doesn't count as
     a "real" address unless it's the only kind of address in the group."""
-    counts = defaultdict(int)
-    first_values = {}
-    first_seen_order = []
+    key_order = []       # distinct keys, first-seen order
+    key_count = {}       # key -> row count
+    key_raw = {}         # key -> first-seen raw ADDRESS_COLS values
     for idx in group_idxs:
-        values = tuple(df.at[idx, c] for c in ADDRESS_COLS)
-        key = address_key(values)
-        counts[key] += 1
-        if key not in first_values:
-            first_values[key] = values
-            first_seen_order.append(key)
+        raw = tuple(df.at[idx, c] for c in ADDRESS_COLS)
+        key = address_key(raw)
+        if key not in key_count:
+            key_count[key] = 0
+            key_raw[key] = raw
+            key_order.append(key)
+        key_count[key] += 1
 
-    non_blank_keys = [k for k in counts if any(k)]
-    candidates = non_blank_keys or list(counts.keys())
-    order_rank = {k: i for i, k in enumerate(first_seen_order)}
-    majority_key = max(candidates, key=lambda k: (counts[k], -order_rank[k]))
+    # Cluster the DISTINCT keys (typically a handful per person, even in a
+    # large merged group) that don't conflict with each other - plain
+    # pairwise since there are far fewer distinct addresses than rows.
+    parent = list(range(len(key_order)))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    for i, j in itertools.combinations(range(len(key_order)), 2):
+        if not address_key_conflict(key_order[i], key_order[j]):
+            union(i, j)
+
+    clusters = defaultdict(list)
+    for i in range(len(key_order)):
+        clusters[find(i)].append(i)
+
+    def cluster_weight(positions):
+        return sum(key_count[key_order[i]] for i in positions)
+
+    def cluster_values(positions):
+        """Fullest non-blank raw value per field across every distinct key
+        in this cluster - fills a gap like a blank Zip from another row's
+        fuller address rather than leaving it blank."""
+        out = []
+        for col_i in range(len(ADDRESS_COLS)):
+            raws = [key_raw[key_order[i]][col_i] for i in positions]
+            norms = [key_order[i][col_i] for i in positions]
+            out.append(fullest_value(raws, norms))
+        return tuple(out)
+
+    non_blank_clusters = [c for c in clusters.values()
+                          if any(any(key_order[i]) for i in c)]
+    candidates = non_blank_clusters or list(clusters.values())
+    majority_cluster = max(candidates, key=lambda c: (cluster_weight(c), -min(c)))
 
     other_strings = []
-    for key in first_seen_order:
-        if key == majority_key or not any(key):
+    for c in clusters.values():
+        if c is majority_cluster or not any(any(key_order[i]) for i in c):
             continue
-        other_strings.append(format_full_address(first_values[key]))
+        other_strings.append(format_full_address(cluster_values(c)))
 
-    return first_values[majority_key], MERGE_SEP.join(other_strings)
+    return cluster_values(majority_cluster), MERGE_SEP.join(other_strings)
 
 
 # ------------------------------------------------------------

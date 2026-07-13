@@ -27,6 +27,12 @@ field must be non-conflicting:
       side, or the two token sets share at least one value, is fine; two
       non-empty, completely disjoint sets is a conflict.
 
+    Name alone is not enough to merge, even with nothing else conflicting:
+    at least ONE of SSN, DOB, Address, Driver's License, Phone, or Email
+    must ACTUALLY agree (both rows non-blank and matching/overlapping,
+    not merely blank-vs-present). Two rows sharing only the name, with
+    every other field blank on both sides, are left unmerged.
+
 INPUT  : the OUTPUT workbook from the main merge script - specifically its
          "Merged Notification Data" sheet.
 OUTPUT : a new workbook with:
@@ -297,13 +303,25 @@ def full_name_match(r1: Rec, r2: Rec) -> bool:
         return False
     if address_conflict(r1, r2):
         return False
-    return (
+    if not (
         set_compatible(r1.empids, r2.empids)
         and set_compatible(r1.dl_ids, r2.dl_ids)
         and set_compatible(r1.passport_ids, r2.passport_ids)
         and set_compatible(r1.phones, r2.phones)
         and set_compatible(r1.emails, r2.emails)
-    )
+    ):
+        return False
+
+    # Nothing conflicts, but that's not enough on its own - the name match
+    # still needs at least one piece of PII to ACTUALLY agree (both sides
+    # non-blank and matching/overlapping), not just be blank on one side.
+    ssn_match = bool(r1.ssn) and bool(r2.ssn) and r1.ssn == r2.ssn
+    dob_match = bool(r1.dob) and bool(r2.dob) and not r1.dob.isdisjoint(r2.dob)
+    addr_match = bool(r1.addr) and bool(r2.addr) and street_compat(r1.addr, r2.addr)
+    dl_match = bool(r1.dl_ids) and bool(r2.dl_ids) and not r1.dl_ids.isdisjoint(r2.dl_ids)
+    phone_match = bool(r1.phones) and bool(r2.phones) and not r1.phones.isdisjoint(r2.phones)
+    email_match = bool(r1.emails) and bool(r2.emails) and not r1.emails.isdisjoint(r2.emails)
+    return ssn_match or dob_match or addr_match or dl_match or phone_match or email_match
 
 
 # ------------------------------------------------------------
