@@ -21,11 +21,14 @@ step:
 
 Either rule matching is enough to merge, and the match is transitive (if
 A matches B and B matches C, all three end up in one merged row, even if
-A and C don't directly match each other) - EXCEPT that a group that ends up
-containing 2+ DIFFERENT known SSNs (usually via a blank-SSN "bridge" row
-that matches two otherwise-unrelated people by Name+DOB) is a genuine
-conflict: instead of a partial/best-effort merge, EVERY row in that group is
-kept as its own separate, unmerged row (see main()).
+A and C don't directly match each other) - EXCEPT that a merge is refused
+whenever it would combine 2+ DIFFERENT known SSNs into one group (this can
+happen via a blank-SSN "bridge" row that matches two otherwise-unrelated
+people). Rather than un-merging the whole cluster, only the specific union
+that would cross real SSNs is refused - so e.g. 5 rows sharing one SSN and
+3 rows sharing a different SSN, bridged by a blank-SSN row, still end up as
+2 clean groups instead of 8 separate rows (see group_ssn/try_union() in
+main()).
 
 INPUT  : an Excel workbook with the columns listed in EXPECTED_COLS below.
 OUTPUT : a new Excel workbook with one sheet, "Merged Notification Data":
@@ -448,13 +451,37 @@ MAX_BUCKET_SIZE = 300   # safety valve: skip pairwise test inside a bucket
 
 def bucket_candidate_pairs(recs):
     buckets = defaultdict(list)
+    # Rule 3's bucket needs special handling: bucketing by Last Name ALONE
+    # (as a naive approach would) makes the bucket as big as every row that
+    # happens to share a common surname - easily 300+ in a large file, which
+    # then gets skipped outright by the MAX_BUCKET_SIZE safety valve, so even
+    # obvious exact duplicates (same First+Last, e.g. 80 copies of "Harish
+    # Kuntz") never get compared at all. Instead: bucket named rows by the
+    # FULL (Last, First) pair - keeps buckets small, scoped to one specific
+    # name, however common the surname is. Rows with a BLANK First Name
+    # (compatible with any First Name under Rule 3) get their own smaller
+    # "blank" bucket per Last Name, which also picks up one representative
+    # row from each distinct (Last, First) group under that surname - enough
+    # to bridge a blank-First row to a whole named group via Union-Find,
+    # without needing a full comparison against every member of it.
+    lastfirst_reps = {}
     for r in recs:
         if r.ssn:                                    # Rule 1: SSN Exists
             buckets[("ssn", r.ssn)].append(r.idx)
         if r.first and r.last and r.dob:              # Rule 2: Exact Name, DOB
             buckets[("namedob", r.first, r.last, r.dob)].append(r.idx)
         if r.last:                                    # Rule 3: Name-Only, No Identifiers
-            buckets[("lastname", r.last)].append(r.idx)
+            if r.first:
+                key = ("lastfirst", r.last, r.first)
+                lastfirst_reps.setdefault(key, r.idx)
+                buckets[key].append(r.idx)
+            else:
+                buckets[("lastblank", r.last)].append(r.idx)
+
+    for (kind, last, first), rep_idx in lastfirst_reps.items():
+        blank_key = ("lastblank", last)
+        if blank_key in buckets:
+            buckets[blank_key].append(rep_idx)
 
     pairs = set()
     skipped_buckets = 0
@@ -608,6 +635,58 @@ def main() -> None:
     print(f"  {len(pairs):,} candidate pairs to test.")
 
     uf = UnionFind(len(recs))
+    # group_ssn[root] = every DISTINCT known SSN currently inside that root's
+    # merged group (not just the two rows being compared). Guards against
+    # transitive contamination: a Step 2/3 match can bridge through a row
+    # with a BLANK SSN (blank never conflicts pairwise), which would
+    # otherwise let two groups with different real SSNs merge into one via
+    # that bridge row even though neither pairwise SSN conflicts directly.
+    # Refusing the union as soon as it would combine 2 different known SSNs
+    # - rather than merging everything first and un-merging afterward -
+    # means the SAFE parts of a would-be conflicting cluster still merge
+    # normally: e.g. 5 rows sharing SSN=111 and 3 rows sharing SSN=999,
+    # bridged by one blank-SSN row, end up as 2 clean groups (not 8 separate
+    # rows) - the bridge row itself lands in whichever group it's processed
+    # against first (order can vary; which side "wins" isn't predictable,
+    # but two different real SSNs never end up in the same group either way).
+    group_ssn = [({r.ssn} if r.ssn else set()) for r in recs]
+    # group_first[root] = every DISTINCT known First Name currently inside
+    # that root's group - the same kind of guard, but for Step 3 (Name-Only,
+    # No Identifiers). A blank-First "bridge" row is compatible with ANY
+    # First Name under a shared Last Name, so without this guard it could
+    # transitively glue together many genuinely different real people who
+    # just happen to share a common surname (e.g. 250 distinct "Kuntz"es,
+    # each with a different first name, all bridged into one group by a
+    # single blank-First "Kuntz" row) - and since none of them may have an
+    # SSN at all, group_ssn alone wouldn't catch it. Only enforced when the
+    # match ISN'T also justified by Step 1/2 (ssn_exists_match /
+    # exact_name_dob_match), since those are strong enough evidence to
+    # override a name difference on their own (e.g. same SSN, different
+    # spelled name, is supposed to merge).
+    group_first = [({r.first} if r.first else set()) for r in recs]
+    refused_ssn = 0
+    refused_name = 0
+
+    def try_union(a_idx, b_idx):
+        nonlocal refused_ssn, refused_name
+        ra, rb = uf.find(a_idx), uf.find(b_idx)
+        if ra == rb:
+            return
+        sa, sb = group_ssn[ra], group_ssn[rb]
+        if sa and sb and sa.isdisjoint(sb):
+            refused_ssn += 1
+            return   # would combine two different real SSNs - refused
+        r1, r2 = recs[a_idx], recs[b_idx]
+        if not (ssn_exists_match(r1, r2) or exact_name_dob_match(r1, r2)):
+            fa, fb = group_first[ra], group_first[rb]
+            if fa and fb and fa.isdisjoint(fb):
+                refused_name += 1
+                return   # weak Rule 3 evidence only - would combine two different real First Names
+        uf.union(a_idx, b_idx)
+        merged_root = min(ra, rb)
+        group_ssn[merged_root] = sa | sb
+        group_first[merged_root] = group_first[ra] | group_first[rb]
+
     pairs_list = list(pairs)
     total_pairs = len(pairs_list)
 
@@ -616,49 +695,38 @@ def main() -> None:
         # in-process.
         for tested, (a_idx, b_idx) in enumerate(pairs_list, 1):
             if is_match(recs[a_idx], recs[b_idx]):
-                uf.union(a_idx, b_idx)
+                try_union(a_idx, b_idx)
             progress("Clustering", tested, total_pairs)
     else:
         # Large run - spread the pairwise is_match() tests across
         # PARALLEL_WORKERS separate processes (real parallelism; a thread
         # pool would not help here, see PARALLEL_WORKERS comment above).
-        # The actual uf.union() calls stay single-process afterward, since
-        # Union-Find is shared, mutable state that can't be split safely.
+        # The actual union calls stay single-process afterward, since
+        # Union-Find (and group_ssn) is shared, mutable state that can't be
+        # split safely.
         chunks = _chunk_pairs(pairs_list)
         done = 0
         with Pool(processes=PARALLEL_WORKERS, initializer=_init_worker, initargs=(recs,)) as pool:
             for matched in pool.imap_unordered(_match_chunk, chunks):
                 for a_idx, b_idx in matched:
-                    uf.union(a_idx, b_idx)
+                    try_union(a_idx, b_idx)
                 done += 1
                 progress("Clustering", done, len(chunks))
 
-    raw_groups = defaultdict(list)
+    groups = defaultdict(list)
     for r in recs:
-        raw_groups[uf.find(r.idx)].append(r.idx)
-
-    # A group that ends up with 2+ DIFFERENT known SSNs is a genuine conflict
-    # - it can only happen via a blank-SSN "bridge" row (a direct pairwise
-    # SSN conflict already can't produce a match, see ssn_conflict()). Rather
-    # than silently keeping a partial/best-effort merge through that bridge
-    # row, EVERY row in a conflicting group is backed out to its own separate,
-    # unmerged row.
-    groups = []
-    conflict_rows = 0
-    for group_idxs in raw_groups.values():
-        known_ssns = {recs[i].ssn for i in group_idxs if recs[i].ssn}
-        if len(known_ssns) > 1:
-            conflict_rows += len(group_idxs)
-            groups.extend([i] for i in group_idxs)
-        else:
-            groups.append(group_idxs)
+        groups[uf.find(r.idx)].append(r.idx)
+    groups = list(groups.values())
 
     print(f"  {len(df):,} rows -> {len(groups):,} merged people "
           f"({len(df) - len(groups):,} rows collapsed by a match).")
-    if conflict_rows:
-        print(f"  WARNING: {conflict_rows:,} row(s) were part of a group with "
-              f"2+ conflicting SSNs - none of those rows were merged (kept "
-              f"as separate rows). Review manually.")
+    if refused_ssn:
+        print(f"  {refused_ssn:,} candidate merge(s) were refused - would have "
+              f"combined 2+ different real SSNs into one group.")
+    if refused_name:
+        print(f"  {refused_name:,} candidate merge(s) were refused - would have "
+              f"combined 2+ different real First Names into one group via the "
+              f"Name-Only fallback rule.")
 
     print("Building merged output ...")
     SEMICOLON_COLS = [COL_DOCID] + OTHER_MERGE_COLS
