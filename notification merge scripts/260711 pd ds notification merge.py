@@ -75,13 +75,21 @@ only an Address, etc.), with nothing shared to anchor Rules 1-9 on directly
 Either rule matching is enough to merge, and the match is transitive (if
 A matches B and B matches C, all three end up in one merged row, even if
 A and C don't directly match each other) - EXCEPT that a merge is refused
-whenever it would combine 2+ DIFFERENT known SSNs into one group (this can
-happen via a blank-SSN "bridge" row that matches two otherwise-unrelated
-people). Rather than un-merging the whole cluster, only the specific union
-that would cross real SSNs is refused - so e.g. 5 rows sharing one SSN and
-3 rows sharing a different SSN, bridged by a blank-SSN row, still end up as
-2 clean groups instead of 8 separate rows (see group_ssn/try_union() in
-main()).
+whenever it would combine 2+ DIFFERENT known SSNs, or 2+ DIFFERENT known
+DOBs, into one group (this can happen via a blank-SSN/blank-DOB "bridge"
+row that matches two otherwise-unrelated people). Rather than un-merging
+the whole cluster, only the specific union that would cross real SSNs/DOBs
+is refused - so e.g. 5 rows sharing one SSN and 3 rows sharing a different
+SSN, bridged by a blank-SSN row, still end up as 2 clean groups instead of
+8 separate rows (see group_ssn/group_dob/try_union() in main()).
+
+A conflicting real ADDRESS gets the same transitive-bridge protection, but
+only for the WEAK-evidence rules (Rule 3 Name-Only, and Rule 8 itself) - a
+STRONG match (Rule 1 SSN, Rule 2 Name+DOB, or Rules 4-7/9 ID+Name) is
+trusted enough to override a conflicting address on its own, since the same
+person legitimately having two different addresses on file (e.g. they
+moved) is far more likely than two different people sharing an SSN/DOB/ID
+(see group_addr/try_union() in main()).
 
 INPUT  : an Excel workbook with the columns listed in EXPECTED_COLS below.
 OUTPUT : a new Excel workbook with four sheets:
@@ -1390,10 +1398,12 @@ def main() -> None:
     # Zip, Province), each holding every DISTINCT known value currently in
     # that root's group. Same bridging risk again: Rule 8 itself can't
     # bridge through a blank address (it requires a genuine value match on
-    # both sides), but a DIFFERENT rule (e.g. Rule 1 via SSN, or Rule 3 via
-    # name) can still connect a blank-address row to two OTHER rows that
-    # have genuinely conflicting addresses with each other - and since
-    # those rules don't check address at all, nothing else would catch it.
+    # both sides), but Rule 3 (Name-Only) can still connect a blank-address
+    # row to two OTHER rows that have genuinely conflicting addresses with
+    # each other. Checked in try_union() ONLY for weak-evidence matches
+    # (Rule 3, Rule 8) - a STRONG match (SSN, Name+DOB, or any ID+Name rule)
+    # is trusted enough to override a conflicting address on its own, so it
+    # skips this check (see the strong_match guard in try_union()).
     group_addr = [
         (({split_street_unit(r.addr)[0]} if r.addr else set()),   # base street, so a unit/apt suffix doesn't falsely conflict
          ({r.city} if r.city else set()),
@@ -1420,22 +1430,32 @@ def main() -> None:
         if da and db and da.isdisjoint(db):
             refused_dob += 1
             return   # would combine two different real DOBs - refused
-        aa, ab = group_addr[ra], group_addr[rb]
-        if any(fa and fb and fa.isdisjoint(fb) for fa, fb in zip(aa, ab)):
-            refused_addr += 1
-            return   # would combine two conflicting real addresses - refused
         r1, r2 = recs[a_idx], recs[b_idx]
+        # A STRONG match (SSN, Name+DOB, or any ID+Name rule) is trusted
+        # enough to override a conflicting address on its own - e.g. the
+        # same SSN turning up with two different addresses on file is far
+        # more likely to mean "this person moved" than "two different
+        # people happen to share this SSN". Only the WEAK-evidence rules
+        # (Rule 3 Name-Only, and Rule 8 itself - which IS the address rule,
+        # so it can't be used to override its own conflict check) still get
+        # blocked by a conflicting address.
+        strong_match = (
+            ssn_exists_match(r1, r2) or exact_name_dob_match(r1, r2)
+            or empid_name_match(r1, r2) or dl_name_match(r1, r2)
+            or passport_name_match(r1, r2) or phone_name_match(r1, r2)
+            or email_name_match(r1, r2)
+        )
+        aa, ab = group_addr[ra], group_addr[rb]
+        if not strong_match:
+            if any(fa and fb and fa.isdisjoint(fb) for fa, fb in zip(aa, ab)):
+                refused_addr += 1
+                return   # would combine two conflicting real addresses - refused
         # Rules 2, 4-9 all require an EXACT First+Last match between r1/r2
         # directly, so they can never themselves introduce a first-name
         # conflict. Only Rule 3 (blank-First fallback) can actually
         # introduce one, hence the guard below only matters when none of
-        # the stronger rules also apply.
-        if not (
-            ssn_exists_match(r1, r2) or exact_name_dob_match(r1, r2)
-            or empid_name_match(r1, r2) or dl_name_match(r1, r2)
-            or passport_name_match(r1, r2) or phone_name_match(r1, r2)
-            or address_name_match(r1, r2) or email_name_match(r1, r2)
-        ):
+        # the stronger rules (including Rule 8) also apply.
+        if not (strong_match or address_name_match(r1, r2)):
             fa, fb = group_first[ra], group_first[rb]
             if fa and fb and fa.isdisjoint(fb):
                 refused_name += 1
