@@ -82,11 +82,16 @@ OUTPUT : a new Excel workbook with four sheets:
              values like "[Unknown]" are never picked).
            - Suffix: the single fullest non-blank value.
            - DOB: every distinct REAL DATE seen among the merged rows,
-             joined with "; " - compared by the NORMALIZED date (see
-             norm_dob()), not raw text, so the same date typed in different
-             formats across rows (e.g. "01/01/1990" vs "1990-01-01") is one
-             entry, not two (see dob_merge()). A genuinely different DOB
-             already can't end up in the same group in the first place - the
+             joined with "; ", each always displayed as a clean "MM/DD/YYYY"
+             string - compared AND displayed by the NORMALIZED date (see
+             norm_dob()), never raw cell text, so the same date typed in
+             different formats across rows (e.g. "01/01/1990" vs
+             "1990-01-01") is one entry, not two, and a raw Excel SERIAL
+             date number (e.g. "20037" - which the pyxlsb engine for .xlsb
+             files hands back as-is for a date-formatted cell, unlike
+             openpyxl for .xlsx) never leaks into the output (see
+             dob_merge()). A genuinely different DOB already can't end up in
+             the same group in the first place - the
              group-level safety net in main() refuses any merge that would
              combine 2+ different real DOBs (see group_dob/try_union()).
            - Employee ID, Driver's License, and Passport Number: every
@@ -1063,13 +1068,17 @@ def semicolon_merge(values) -> str:
 
 def dob_merge(values) -> str:
     """Like semicolon_merge(), but dedupes by the NORMALIZED date
-    (norm_dob()) instead of raw text - so the same date typed in different
+    (norm_dob()) instead of raw text, and always DISPLAYS that normalized
+    date as a clean 'MM/DD/YYYY' string - never the row's original raw text.
+    This matters for two reasons: (1) the same date typed in different
     formats across rows (e.g. '01/01/1990', '1990-01-01', '1/1/90') collapses
-    into ONE entry instead of showing as multiple different-looking DOBs.
-    Only a genuinely different real date produces a second entry - and the
-    group-level safety net in main() (group_dob/try_union()) already refuses
-    to merge two rows with different real DOBs in the first place, so this
-    is purely a display fix, not a new matching rule."""
+    into ONE consistently-formatted entry instead of showing as multiple
+    different-looking DOBs, and (2) a raw Excel SERIAL date number (e.g.
+    '20037' - see norm_dob()) never leaks into the output as-is. Only a
+    genuinely different real date produces a second entry - and the group-
+    level safety net in main() (group_dob/try_union()) already refuses to
+    merge two rows with different real DOBs in the first place, so this is
+    purely a display fix, not a new matching rule."""
     seen = set()
     out = []
     for v in values:
@@ -1081,7 +1090,7 @@ def dob_merge(values) -> str:
             if not key or key in seen:
                 continue
             seen.add(key)
-            out.append(raw)
+            out.append(f"{key[4:6]}/{key[6:8]}/{key[0:4]}")
     return MERGE_SEP.join(out)
 
 
