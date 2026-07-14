@@ -127,9 +127,15 @@ OUTPUT : a new Excel workbook with four sheets:
            - so a real DOB that got silently treated as blank, and could
            otherwise bridge two different people together during merging,
            doesn't go unnoticed (see classify_dob_issue()).
-         - "Large Group Review": every merged group with more than 50 rows -
-           usually a sign of a shared junk value (e.g. a fake SSN), worth a
-           manual check before trusting the output.
+         - "Large Group Review": any candidate group of more than
+           LARGE_GROUP_THRESHOLD (50) rows is NOT merged at all - usually a
+           sign of a shared junk value (e.g. a fake/reused SSN, or a
+           company-wide address/phone) rather than real evidence they're
+           the same person. Every original row from such a group is listed
+           here as-is (unmerged), tagged with a "Candidate Group ID" (rows
+           sharing one ID were clustered together) and "Candidate Group
+           Size", for manual review before merging any of them by hand.
+           These rows do NOT appear in "Merged Notification Data" at all.
 
 This script does not touch the input file. Save the output only to the
 secured/authorized folder for this data (never a desktop) - it contains
@@ -264,6 +270,14 @@ EXPECTED_COLS = (
 
 MERGE_SEP = "; "
 EXCEL_MAX_ROWS = 1_048_576
+
+# A merged group bigger than this is usually a shared junk value (e.g. a
+# reused/fake SSN, or a company-wide address/phone), not real evidence that
+# every one of those rows is the same person. Rather than collapse it into
+# one (likely wrong) merged row, such a group is held back entirely - none
+# of its rows are merged, and every original row goes into the "Large Group
+# Review" sheet as-is for a human to check before anything is merged.
+LARGE_GROUP_THRESHOLD = 50
 
 # Placeholder name values treated as blank (never match/conflict on their
 # own; a real name always supersedes these). Checked after stripping
@@ -1416,13 +1430,21 @@ def main() -> None:
         print(f"  {refused_addr:,} candidate merge(s) were refused - would have "
               f"combined 2+ conflicting real addresses into one group.")
 
+    # Groups bigger than LARGE_GROUP_THRESHOLD are usually a shared junk
+    # value (e.g. a reused SSN, or a company-wide address/phone), not real
+    # evidence every row is the same person - held back entirely rather
+    # than merged into one (likely wrong) row. See build_records()/main()
+    # docstring for "Large Group Review".
+    normal_groups = [g for g in groups if len(g) <= LARGE_GROUP_THRESHOLD]
+    held_groups = [g for g in groups if len(g) > LARGE_GROUP_THRESHOLD]
+
     print("Building merged output ...")
     SEMICOLON_COLS = [COL_DOCID] + OTHER_MERGE_COLS
-    total_groups = len(groups)
+    total_groups = len(normal_groups)
     out_rows = []
     docid_overflow_groups = 0
     max_docid_cols = 1
-    for n, group_idxs in enumerate(groups, 1):
+    for n, group_idxs in enumerate(normal_groups, 1):
         progress("Building output", n, total_groups)
         sub = df.iloc[group_idxs]           # O(group size), not O(n)
         sub_recs = [recs[i] for i in group_idxs]
@@ -1486,13 +1508,28 @@ def main() -> None:
 
     n_multi = (df_out["Rows Merged"] > 1).sum()
     print(f"  {n_multi:,} merged groups combine 2+ original rows.")
-    biggest = df_out["Rows Merged"].max()
-    print(f"  Largest merged group: {biggest:,} rows.")
-    df_large_groups = df_out[df_out["Rows Merged"] > 50].sort_values("Rows Merged", ascending=False)
+    if len(df_out):
+        biggest = df_out["Rows Merged"].max()
+        print(f"  Largest merged group: {biggest:,} rows.")
+
+    # Large/suspicious groups were held back above (not merged at all) -
+    # list every original row from them as-is, tagged with which candidate
+    # group they'd have landed in, for manual review.
+    large_group_rows = []
+    for gid, group_idxs in enumerate(held_groups, 1):
+        for idx in group_idxs:
+            row = df.iloc[idx].to_dict()
+            row["Candidate Group ID"] = gid
+            row["Candidate Group Size"] = len(group_idxs)
+            large_group_rows.append(row)
+    df_large_groups = pd.DataFrame(large_group_rows)
     if len(df_large_groups):
-        print(f"  WARNING: {len(df_large_groups):,} group(s) merged >50 rows - "
-              f"usually a shared junk value (e.g. a fake SSN). See the "
-              f"'Large Group Review' sheet before trusting the output.")
+        df_large_groups = df_large_groups.sort_values(
+            ["Candidate Group Size", "Candidate Group ID"], ascending=[False, True]
+        ).reset_index(drop=True)
+        print(f"  WARNING: {len(held_groups):,} candidate group(s) ({len(df_large_groups):,} rows) "
+              f"exceeded {LARGE_GROUP_THRESHOLD} rows and were held back from merging entirely "
+              f"- see the 'Large Group Review' sheet for manual review.")
 
     df_ssn_review = pd.DataFrame(ssn_review)
     df_dob_review = pd.DataFrame(dob_review)
