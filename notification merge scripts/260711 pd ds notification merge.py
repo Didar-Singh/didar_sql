@@ -21,10 +21,15 @@ step:
                             (e.g. "Jr" vs "Sr").
                         In any of these cases the two rows are kept separate
                         rather than merged.
-  Rule 2 (Exact Name, DOB): rows with the same First Name + Last Name
-                        (exact text match) AND the same DOB are merged,
-                        as long as their SSNs don't conflict (blank on
-                        either/both sides is fine).
+  Rule 2 (Exact Name, DOB): rows with a real (non-blank) First Name + Last
+                        Name on both sides that are COMPATIBLE - not
+                        required to be byte-exact, an incomplete/truncated
+                        entry (e.g. an initial like "J" for "Jeffrey", or
+                        "Did" for "Didar") counts as compatible, not a
+                        mismatch (see name_prefix_compat()) - AND the same
+                        DOB are merged, as long as their SSNs don't conflict
+                        (blank on either/both sides is fine) and Middle
+                        Name/Suffix don't actively disagree.
   Rule 3 (Name-Only, No Identifiers): if EITHER row has no usable SSN and
                         no DOB at all (nothing to corroborate identity),
                         fall back to matching on Last Name (exact) +
@@ -34,10 +39,13 @@ step:
                         alone.
   Rule 4 (Employee ID, Name): rows sharing at least one common Employee ID
                         (a cell can already contain multiple semicolon-
-                        joined IDs) AND the same exact First+Last Name are
-                        merged, as long as SSN and DOB are each either
-                        matching or blank on both sides (a real, differing
-                        value on both sides blocks it).
+                        joined IDs) AND a compatible First+Last Name (see
+                        name_compat_match() - an incomplete/truncated entry,
+                        e.g. an initial like "J" for "Jeffrey", counts as
+                        compatible, not a mismatch) are merged, as long as
+                        SSN and DOB are each either matching or blank on
+                        both sides (a real, differing value on both sides
+                        blocks it).
   Rule 5 (Driver's License, Name): same as Rule 4, but matched on Driver's
                         License Number instead of Employee ID.
   Rule 6 (Passport Number, Name): same as Rule 4, but matched on Passport
@@ -51,8 +59,9 @@ step:
                         must genuinely match on both sides. Unlike SSN,
                         address is NEVER enough to override a name
                         difference on its own - this also always requires
-                        an EXACT Name match and SSN/DOB to be
-                        matching-or-blank, same as Rules 4-7.
+                        a compatible Name match (name_compat_match()) and
+                        SSN/DOB to be matching-or-blank, same as Rules 4-7,
+                        9.
   Rule 9 (Email, Name): same as Rule 4, but matched on Email Address -
                         Personal instead of Employee ID.
 
@@ -645,6 +654,21 @@ def name_conflict(r1: Rec, r2: Rec) -> bool:
     return bool(r1.suffix) and bool(r2.suffix) and r1.suffix != r2.suffix
 
 
+def name_compat_match(r1: Rec, r2: Rec) -> bool:
+    """True if First and Last Name are each real (non-blank) on both sides
+    and COMPATIBLE - not required to be byte-exact (see
+    name_prefix_compat(): an incomplete/truncated entry, e.g. an initial
+    like 'J' for 'Jeffrey', or 'Did' for 'Didar', counts as compatible, not
+    a mismatch) - and Middle Name/Suffix don't actively disagree (see
+    name_conflict()). This is the shared POSITIVE name-match requirement for
+    Rules 2, 4-9 (Rule 1 instead uses name_conflict() alone, as a blocking
+    guard on top of an already-strong SSN match, not a positive
+    requirement; Rule 3 has its own, even weaker, blank-tolerant check)."""
+    if name_conflict(r1, r2):
+        return False
+    return bool(r1.first) and bool(r2.first) and bool(r1.last) and bool(r2.last)
+
+
 def ssn_exists_match(r1: Rec, r2: Rec) -> bool:
     """Step 1 - 'SSN Exists': both rows have a usable (non-blank) SSN and
     it's the same value, AS LONG AS a genuinely differing DOB
@@ -671,18 +695,20 @@ def ssn_conflict(r1: Rec, r2: Rec) -> bool:
 
 
 def exact_name_dob_match(r1: Rec, r2: Rec) -> bool:
-    """Step 2 - 'Exact Name, DOB': both rows have the same First Name AND
-    the same Last Name (exact text match, no typo/prefix tolerance) AND the
-    same DOB, AND their SSNs don't conflict (blank on either/both sides is
-    fine, but two different known SSNs block the merge). Middle Name/Suffix
-    are NOT part of the match - they just get semicolon-merged like every
-    other column when this rule fires."""
+    """Step 2 - 'Exact Name, DOB': First and Last Name are each real
+    (non-blank) on both sides and COMPATIBLE - not required to be byte-exact
+    (see name_prefix_compat(): an incomplete/truncated entry, e.g. an
+    initial like "J" for "Jeffrey", or "Did" for "Didar", counts as
+    compatible, not a mismatch) - AND the same DOB, AND their SSNs don't
+    conflict (blank on either/both sides is fine, but two different known
+    SSNs block the merge). Middle Name and Suffix are only checked for an
+    ACTIVE conflict (see name_conflict()) - they don't need to be present or
+    match, just not actively disagree."""
     if ssn_conflict(r1, r2):
         return False
-    return (
-        bool(r1.first) and bool(r1.last) and bool(r1.dob)
-        and r1.first == r2.first and r1.last == r2.last and r1.dob == r2.dob
-    )
+    if not name_compat_match(r1, r2):
+        return False
+    return bool(r1.dob) and r1.dob == r2.dob
 
 
 def has_no_identifiers(r: Rec) -> bool:
@@ -792,14 +818,17 @@ def compatible(a: str, b: str) -> bool:
 
 
 def _id_name_match(ids1: frozenset, ids2: frozenset, r1: Rec, r2: Rec) -> bool:
-    """Shared logic for Rules 4-6: rows share at least one common ID token
-    (from whichever ID field is being checked - see parse_id_tokens(), a
-    cell can already contain multiple semicolon-joined IDs) AND have the
-    same exact First+Last Name, AND SSN and DOB are each either matching or
-    blank on both sides (a real, differing value on either blocks it)."""
+    """Shared logic for Rules 4-7, 9: rows share at least one common ID
+    token (from whichever ID field is being checked - see
+    parse_id_tokens(), a cell can already contain multiple semicolon-joined
+    IDs) AND have a compatible First+Last Name (see name_compat_match() -
+    an incomplete/truncated entry, e.g. an initial like "J" for "Jeffrey",
+    counts as compatible, not a mismatch), AND SSN and DOB are each either
+    matching or blank on both sides (a real, differing value on either
+    blocks it)."""
     if not (ids1 and ids2 and not ids1.isdisjoint(ids2)):
         return False
-    if not (r1.first and r1.last and r1.first == r2.first and r1.last == r2.last):
+    if not name_compat_match(r1, r2):
         return False
     return compatible(r1.ssn, r2.ssn) and compatible(r1.dob, r2.dob)
 
@@ -838,9 +867,11 @@ def address_name_match(r1: Rec, r2: Rec) -> bool:
     one side never 'match' just because nothing conflicts).
 
     Unlike SSN (Rule 1), address is NEVER enough on its own to override a
-    name difference - an EXACT Name match is always required here too,
+    name difference - a compatible Name match (see name_compat_match() - an
+    incomplete/truncated entry, e.g. an initial like "J" for "Jeffrey",
+    counts as compatible, not a mismatch) is always required here too,
     plus SSN/DOB each being matching-or-blank (compatible()), same as
-    Rules 4-7. Zip is compared by its 5-digit prefix (zip5()), so a plain
+    Rules 4-7, 9. Zip is compared by its 5-digit prefix (zip5()), so a plain
     5-digit ZIP and its ZIP+4 form count as the same value, not a conflict
     and not a missed overlap. Street is compared via street_compat(), so
     '123 Abc Lane' vs '123 Abc Lane Apt 1' (unit detail on only one side)
@@ -857,7 +888,7 @@ def address_name_match(r1: Rec, r2: Rec) -> bool:
     other_overlap = any(a and b and a == b for a, b in zip(other_fields1, other_fields2))
     if not (street_overlap or other_overlap):
         return False   # nothing real actually overlaps - not a match
-    if not (r1.first and r1.last and r1.first == r2.first and r1.last == r2.last):
+    if not name_compat_match(r1, r2):
         return False
     return compatible(r1.ssn, r2.ssn) and compatible(r1.dob, r2.dob)
 
