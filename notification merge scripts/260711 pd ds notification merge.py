@@ -88,7 +88,10 @@ OUTPUT : a new Excel workbook with two sheets:
          - "Merged Notification Data": ONE ROW PER CONFIRMED PERSON.
            - First Name, Middle Name, Last Name, and SSN: the single
              fullest/most complete value among the merged rows (placeholder
-             values like "[Unknown]" are never picked).
+             values like "[Unknown]" already in the input are never picked
+             as that value). If EVERY merged row's First/Last Name is blank
+             or a placeholder, First Name and Last Name are each set to the
+             literal "[Unknown]" instead of being left blank.
            - Suffix: the single fullest non-blank value.
            - DOB: the one real date shared by every row in the group,
              always displayed as a clean "MM/DD/YYYY" string - compared by
@@ -1381,8 +1384,8 @@ def main() -> None:
             docid_overflow_groups += 1
             max_docid_cols = max(max_docid_cols, len(docid_chunks))
 
-        row[COL_FIRST] = fullest_value(sub[COL_FIRST], [r.first for r in sub_recs])
-        row[COL_LAST] = fullest_value(sub[COL_LAST], [r.last for r in sub_recs])
+        row[COL_FIRST] = fullest_value(sub[COL_FIRST], [r.first for r in sub_recs]) or "[Unknown]"
+        row[COL_LAST] = fullest_value(sub[COL_LAST], [r.last for r in sub_recs]) or "[Unknown]"
         row[COL_MIDDLE] = fullest_value(sub[COL_MIDDLE], [r.mid for r in sub_recs])
         row[COL_SUFFIX] = fullest_value(sub[COL_SUFFIX], [norm_text(v) for v in sub[COL_SUFFIX]])
         row[COL_SSN] = fullest_value(sub[COL_SSN], [r.ssn for r in sub_recs])
