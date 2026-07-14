@@ -30,13 +30,9 @@ step:
                         DOB are merged, as long as their SSNs don't conflict
                         (blank on either/both sides is fine) and Middle
                         Name/Suffix don't actively disagree.
-  Rule 3 (Name-Only, No Identifiers): if EITHER row has no usable SSN and
-                        no DOB at all (nothing to corroborate identity),
-                        fall back to matching on Last Name (exact) +
-                        compatible First Name (exact match, or blank on
-                        either side). This lets a bare-bones record with
-                        no SSN/DOB still attach to a fuller record by name
-                        alone.
+  (Rule 3 - a Name-Only, no-SSN/no-DOB fallback - previously existed here
+  and has been removed. Numbering below is left as-is, with a gap at 3,
+  rather than renumbering Rules 4-9.)
   Rule 4 (Employee ID, Name): rows sharing at least one common Employee ID
                         (a cell can already contain multiple semicolon-
                         joined IDs) AND a compatible First+Last Name (see
@@ -77,7 +73,7 @@ SSN, bridged by a blank-SSN row, still end up as 2 clean groups instead of
 8 separate rows (see group_ssn/group_dob/try_union() in main()).
 
 A conflicting real ADDRESS gets the same transitive-bridge protection, but
-only for the WEAK-evidence rules (Rule 3 Name-Only, and Rule 8 itself) - a
+only for the WEAK-evidence Rule 8 (Full Address, Name) itself - a
 STRONG match (Rule 1 SSN, Rule 2 Name+DOB, or Rules 4-7/9 ID+Name) is
 trusted enough to override a conflicting address on its own, since the same
 person legitimately having two different addresses on file (e.g. they
@@ -268,8 +264,8 @@ EXPECTED_COLS = (
 MERGE_SEP = "; "
 EXCEL_MAX_ROWS = 1_048_576
 
-# Placeholder name values treated as blank (never match/conflict on their own;
-# a real name always supersedes these - Rule 3). Checked after stripping
+# Placeholder name values treated as blank (never match/conflict on their
+# own; a real name always supersedes these). Checked after stripping
 # brackets/parens/periods, so "[Unknown]", "(unknown)", "N/A" all match.
 NAME_PLACEHOLDERS = {
     "UNKNOWN", "UNK", "UNKN", "NA", "NONE", "NULL", "NIL",
@@ -416,7 +412,7 @@ def norm_street(v) -> str:
 
 def norm_name(v) -> str:
     """Upper/trim; placeholder values ('[Unknown]', 'N/A', ...) become ''
-    so they never out-compete or conflict with a real name (Rule 3)."""
+    so they never out-compete or conflict with a real name."""
     s = norm_text(v)
     core = re.sub(r"[^A-Z0-9]", "", s)
     if not core or core in NAME_PLACEHOLDERS:
@@ -540,7 +536,7 @@ def parse_id_tokens(v) -> frozenset:
 #    (this loop runs millions of times, so dict-key lookups add up)
 # ------------------------------------------------------------
 class Rec:
-    __slots__ = ("idx", "first", "last", "mid", "suffix", "dob", "ssn", "ssn_present",
+    __slots__ = ("idx", "first", "last", "mid", "suffix", "dob", "ssn",
                  "empids", "dl_ids", "passport_ids", "phones", "emails",
                  "addr", "city", "state", "zip", "province")
 
@@ -578,15 +574,6 @@ def build_records(df: pd.DataFrame):
         r.suffix = norm_name(row[sf])
         r.dob = norm_dob(row[do])
         r.ssn = norm_ssn(row[ss])
-        # Distinct from r.ssn: TRUE if the raw cell had any real text at
-        # all, even if norm_ssn() rejected it (a masked SSN with too few
-        # known digits). That kind of SSN is not trusted for MATCHING
-        # (r.ssn stays '' so it can't falsely confirm two rows are the same
-        # person) - but it's still evidence the row ISN'T a bare, nothing-
-        # to-corroborate-with record, so it must not be treated as "no
-        # identifiers" by has_no_identifiers() (which would wrongly let
-        # Rule 3 pull it into an unrelated group).
-        r.ssn_present = bool(classify_ssn_issue(row[ss])) or bool(r.ssn)
         r.empids = parse_id_tokens(row[ei])
         r.dl_ids = parse_id_tokens(row[dl])
         r.passport_ids = parse_id_tokens(row[pp])
@@ -664,7 +651,7 @@ def name_compat_match(r1: Rec, r2: Rec) -> bool:
     name_conflict()). This is the shared POSITIVE name-match requirement for
     Rules 2, 4-9 (Rule 1 instead uses name_conflict() alone, as a blocking
     guard on top of an already-strong SSN match, not a positive
-    requirement; Rule 3 has its own, even weaker, blank-tolerant check)."""
+    requirement)."""
     if name_conflict(r1, r2):
         return False
     return bool(r1.first) and bool(r2.first) and bool(r1.last) and bool(r2.last)
@@ -710,17 +697,6 @@ def exact_name_dob_match(r1: Rec, r2: Rec) -> bool:
     if not name_compat_match(r1, r2):
         return False
     return bool(r1.dob) and r1.dob == r2.dob
-
-
-def has_no_identifiers(r: Rec) -> bool:
-    """True when a row has NEITHER a usable SSN NOR a DOB - nothing at all
-    to corroborate identity with. Checks ssn_present (not r.ssn) so a row
-    whose SSN got blanked for being junk/placeholder still counts as
-    HAVING an SSN here - it's just not trusted for matching. Without this
-    distinction, a junk SSN would make the row look like a bare record with
-    nothing to go on, wrongly letting Rule 3 (Name-Only) pull it into an
-    unrelated group that happens to share the same name."""
-    return not r.ssn_present and not r.dob
 
 
 def zip5(v: str) -> str:
@@ -776,39 +752,14 @@ def address_conflict(r1: Rec, r2: Rec) -> bool:
     street with an added apartment/unit suffix are never treated as
     conflicting either - only a genuinely different base street, or two
     real but DIFFERENT unit numbers, count as a conflict. Used to block
-    Step 3 from merging two same-named people whose addresses actively
-    disagree, with no SSN/DOB to corroborate either way - matching name
-    alone isn't enough when the address itself contradicts it."""
+    Rule 8 from merging two same-named people whose addresses actively
+    disagree - matching name alone isn't enough when the address itself
+    contradicts it."""
     if not street_compat(r1.addr, r2.addr):
         return True
     fields1 = (r1.city, r1.state, zip5(r1.zip), r1.province)
     fields2 = (r2.city, r2.state, zip5(r2.zip), r2.province)
     return any(a and b and a != b for a, b in zip(fields1, fields2))
-
-
-def no_identifier_name_match(r1: Rec, r2: Rec) -> bool:
-    """Step 3 - 'Name-Only, No Identifiers': only applies when at least one
-    side has no SSN and no DOB at all (see has_no_identifiers()) - otherwise
-    Rule 2 already covers rows that both have a DOB. Matches on Last Name
-    (exact) plus a compatible First Name (exact match, or blank on either
-    side - a blank First Name is never treated as a conflict), AS LONG AS
-    the address doesn't actively conflict (see address_conflict()) - two
-    same-named people with genuinely different addresses and nothing else
-    to go on should stay separate, not merge on name alone. This is
-    intentionally weaker evidence than Rules 1/2 (name alone, no SSN/DOB
-    backing it up), so it's a last-resort fallback for bare-bones records.
-    The group-level SSN-consistency check in main() still applies - if this
-    rule ever bridges two records that turn out to have different real
-    SSNs, the whole group is un-merged again."""
-    if not (has_no_identifiers(r1) or has_no_identifiers(r2)):
-        return False
-    if not r1.last or not r2.last or r1.last != r2.last:
-        return False
-    if r1.first and r2.first and r1.first != r2.first:
-        return False
-    if address_conflict(r1, r2):
-        return False
-    return True
 
 
 def compatible(a: str, b: str) -> bool:
@@ -898,7 +849,6 @@ def is_match(r1: Rec, r2: Rec) -> bool:
     return (
         ssn_exists_match(r1, r2)
         or exact_name_dob_match(r1, r2)
-        or no_identifier_name_match(r1, r2)
         or empid_name_match(r1, r2)
         or dl_name_match(r1, r2)
         or passport_name_match(r1, r2)
@@ -969,32 +919,11 @@ MAX_BUCKET_SIZE = 300   # safety valve: skip pairwise test inside a bucket
 
 def bucket_candidate_pairs(recs):
     buckets = defaultdict(list)
-    # Rule 3's bucket needs special handling: bucketing by Last Name ALONE
-    # (as a naive approach would) makes the bucket as big as every row that
-    # happens to share a common surname - easily 300+ in a large file, which
-    # then gets skipped outright by the MAX_BUCKET_SIZE safety valve, so even
-    # obvious exact duplicates (same First+Last, e.g. 80 copies of "Harish
-    # Kuntz") never get compared at all. Instead: bucket named rows by the
-    # FULL (Last, First) pair - keeps buckets small, scoped to one specific
-    # name, however common the surname is. Rows with a BLANK First Name
-    # (compatible with any First Name under Rule 3) get their own smaller
-    # "blank" bucket per Last Name, which also picks up one representative
-    # row from each distinct (Last, First) group under that surname - enough
-    # to bridge a blank-First row to a whole named group via Union-Find,
-    # without needing a full comparison against every member of it.
-    lastfirst_reps = {}
     for r in recs:
         if r.ssn:                                    # Rule 1: SSN Exists
             buckets[("ssn", r.ssn)].append(r.idx)
         if r.first and r.last and r.dob:              # Rule 2: Exact Name, DOB
             buckets[("namedob", r.first, r.last, r.dob)].append(r.idx)
-        if r.last:                                    # Rule 3: Name-Only, No Identifiers
-            if r.first:
-                key = ("lastfirst", r.last, r.first)
-                lastfirst_reps.setdefault(key, r.idx)
-                buckets[key].append(r.idx)
-            else:
-                buckets[("lastblank", r.last)].append(r.idx)
         if r.empids and r.first and r.last:           # Rule 4: Employee ID, Name
             for tok in r.empids:
                 buckets[("empidname", tok, r.first, r.last)].append(r.idx)
@@ -1028,11 +957,6 @@ def bucket_candidate_pairs(recs):
             buckets[("addrfield", "city", r.city)].append(r.idx)
         if r.zip:
             buckets[("addrfield", "zip", r.zip)].append(r.idx)
-
-    for (kind, last, first), rep_idx in lastfirst_reps.items():
-        blank_key = ("lastblank", last)
-        if blank_key in buckets:
-            buckets[blank_key].append(rep_idx)
 
     pairs = set()
     skipped_buckets = 0
@@ -1366,20 +1290,6 @@ def main() -> None:
     # against first (order can vary; which side "wins" isn't predictable,
     # but two different real SSNs never end up in the same group either way).
     group_ssn = [({r.ssn} if r.ssn else set()) for r in recs]
-    # group_first[root] = every DISTINCT known First Name currently inside
-    # that root's group - the same kind of guard, but for Step 3 (Name-Only,
-    # No Identifiers). A blank-First "bridge" row is compatible with ANY
-    # First Name under a shared Last Name, so without this guard it could
-    # transitively glue together many genuinely different real people who
-    # just happen to share a common surname (e.g. 250 distinct "Kuntz"es,
-    # each with a different first name, all bridged into one group by a
-    # single blank-First "Kuntz" row) - and since none of them may have an
-    # SSN at all, group_ssn alone wouldn't catch it. Only enforced when the
-    # match ISN'T also justified by Step 1/2 (ssn_exists_match /
-    # exact_name_dob_match), since those are strong enough evidence to
-    # override a name difference on their own (e.g. same SSN, different
-    # spelled name, is supposed to merge).
-    group_first = [({r.first} if r.first else set()) for r in recs]
     # group_dob[root] = every DISTINCT known DOB currently inside that
     # root's group. Same bridging risk as group_ssn: a blank-DOB row can
     # pairwise-match two OTHER rows (via Rules 1/4-8, which all treat a
@@ -1389,14 +1299,15 @@ def main() -> None:
     group_dob = [({r.dob} if r.dob else set()) for r in recs]
     # group_addr[root] = 5 sets (one per address field: Street, City, State,
     # Zip, Province), each holding every DISTINCT known value currently in
-    # that root's group. Same bridging risk again: Rule 8 itself can't
-    # bridge through a blank address (it requires a genuine value match on
-    # both sides), but Rule 3 (Name-Only) can still connect a blank-address
-    # row to two OTHER rows that have genuinely conflicting addresses with
-    # each other. Checked in try_union() ONLY for weak-evidence matches
-    # (Rule 3, Rule 8) - a STRONG match (SSN, Name+DOB, or any ID+Name rule)
-    # is trusted enough to override a conflicting address on its own, so it
-    # skips this check (see the strong_match guard in try_union()).
+    # that root's group. Same bridging risk again: Rule 8 needs a genuine
+    # value match on at least one field, but a row can overlap with two
+    # OTHERS via a DIFFERENT field (e.g. matching City, blank Street) even
+    # though those other two rows have a genuinely conflicting Street with
+    # each other - transitively combining them. Checked in try_union() ONLY
+    # for weak-evidence Rule 8 matches - a STRONG match (SSN, Name+DOB, or
+    # any ID+Name rule) is trusted enough to override a conflicting address
+    # on its own, so it skips this check (see the strong_match guard in
+    # try_union()).
     group_addr = [
         (({split_street_unit(r.addr)[0]} if r.addr else set()),   # base street, so a unit/apt suffix doesn't falsely conflict
          ({r.city} if r.city else set()),
@@ -1406,12 +1317,11 @@ def main() -> None:
         for r in recs
     ]
     refused_ssn = 0
-    refused_name = 0
     refused_dob = 0
     refused_addr = 0
 
     def try_union(a_idx, b_idx):
-        nonlocal refused_ssn, refused_name, refused_dob, refused_addr
+        nonlocal refused_ssn, refused_dob, refused_addr
         ra, rb = uf.find(a_idx), uf.find(b_idx)
         if ra == rb:
             return
@@ -1428,10 +1338,10 @@ def main() -> None:
         # enough to override a conflicting address on its own - e.g. the
         # same SSN turning up with two different addresses on file is far
         # more likely to mean "this person moved" than "two different
-        # people happen to share this SSN". Only the WEAK-evidence rules
-        # (Rule 3 Name-Only, and Rule 8 itself - which IS the address rule,
-        # so it can't be used to override its own conflict check) still get
-        # blocked by a conflicting address.
+        # people happen to share this SSN". Only the WEAK-evidence Rule 8
+        # itself (which IS the address rule, so it can't be used to
+        # override its own conflict check) still gets blocked by a
+        # conflicting address.
         strong_match = (
             ssn_exists_match(r1, r2) or exact_name_dob_match(r1, r2)
             or empid_name_match(r1, r2) or dl_name_match(r1, r2)
@@ -1443,22 +1353,11 @@ def main() -> None:
             if any(fa and fb and fa.isdisjoint(fb) for fa, fb in zip(aa, ab)):
                 refused_addr += 1
                 return   # would combine two conflicting real addresses - refused
-        # Rules 2, 4-9 all require an EXACT First+Last match between r1/r2
-        # directly, so they can never themselves introduce a first-name
-        # conflict. Only Rule 3 (blank-First fallback) can actually
-        # introduce one, hence the guard below only matters when none of
-        # the stronger rules (including Rule 8) also apply.
-        if not (strong_match or address_name_match(r1, r2)):
-            fa, fb = group_first[ra], group_first[rb]
-            if fa and fb and fa.isdisjoint(fb):
-                refused_name += 1
-                return   # weak Rule 3 evidence only - would combine two different real First Names
         uf.union(a_idx, b_idx)
         merged_root = min(ra, rb)
         group_ssn[merged_root] = sa | sb
         group_dob[merged_root] = da | db
         group_addr[merged_root] = tuple(fa | fb for fa, fb in zip(aa, ab))
-        group_first[merged_root] = group_first[ra] | group_first[rb]
 
     pairs_list = list(pairs)
     total_pairs = len(pairs_list)
@@ -1496,10 +1395,6 @@ def main() -> None:
     if refused_ssn:
         print(f"  {refused_ssn:,} candidate merge(s) were refused - would have "
               f"combined 2+ different real SSNs into one group.")
-    if refused_name:
-        print(f"  {refused_name:,} candidate merge(s) were refused - would have "
-              f"combined 2+ different real First Names into one group via the "
-              f"Name-Only fallback rule.")
     if refused_dob:
         print(f"  {refused_dob:,} candidate merge(s) were refused - would have "
               f"combined 2+ different real DOBs into one group.")
