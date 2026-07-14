@@ -84,7 +84,7 @@ moved) is far more likely than two different people sharing an SSN/DOB/ID
 (see group_addr/try_union() in main()).
 
 INPUT  : an Excel workbook with the columns listed in EXPECTED_COLS below.
-OUTPUT : a new Excel workbook with four sheets:
+OUTPUT : a new Excel workbook with two sheets:
          - "Merged Notification Data": ONE ROW PER CONFIRMED PERSON.
            - First Name, Middle Name, Last Name, and SSN: the single
              fullest/most complete value among the merged rows (placeholder
@@ -121,15 +121,6 @@ OUTPUT : a new Excel workbook with four sheets:
              genuinely different address goes into a new "Other Address"
              column as one combined string per address, semicolon-joined
              (see address_key_conflict()).
-         - "Junk SSN Review": every row where a non-blank SSN value was
-           ignored as unusable (a masked SSN with too few known digits) - so
-           a real-looking SSN that got silently treated as blank doesn't go
-           unnoticed (see classify_ssn_issue()).
-         - "Junk DOB Review": every row where a non-blank DOB value failed
-           to parse (an unrecognized format, e.g. a partially masked date)
-           - so a real DOB that got silently treated as blank, and could
-           otherwise bridge two different people together during merging,
-           doesn't go unnoticed (see classify_dob_issue()).
          - "DOB Conflict Review": any candidate group where 2+ rows have
            genuinely different real DOBs is NOT merged at all - every
            original row from such a group is listed here as-is (unmerged),
@@ -457,44 +448,6 @@ def norm_ssn(v) -> str:
     return kept if known >= SSN_MIN_KNOWN_OVERLAP else ""
 
 
-def classify_ssn_issue(v) -> str:
-    """Returns a short human-readable reason if a NON-BLANK SSN value was
-    rejected by norm_ssn() (wrong length, or a masked SSN with too few known
-    digits) - '' if the value was already blank/empty, or was accepted as
-    usable. Used to build the 'Junk SSN Review' sheet so a real-looking SSN
-    that got silently treated as blank doesn't go unnoticed."""
-    if v is None:
-        return ""
-    raw = str(v).strip()
-    if not raw or raw.lower() in ("nan", "none", "null"):
-        return ""
-    s = _numeric_cell_to_str(v).upper().replace("*", "X").replace("#", "X").replace("?", "X")
-    kept = re.sub(r"[^0-9X]", "", s)
-    if len(kept) != 9:
-        return ""   # not 9 digits at all - not SSN-shaped, not flagged
-    if "X" not in kept:
-        return ""   # fully valid, always accepted
-    known = sum(c != "X" for c in kept)
-    if known < SSN_MIN_KNOWN_OVERLAP:
-        return (f"Masked SSN with only {known} known digit(s) "
-                f"(< {SSN_MIN_KNOWN_OVERLAP} required) - too little to trust")
-    return ""   # masked but enough known digits - fine
-
-
-def ssn_cmp(a: str, b: str) -> str:
-    """Compare two 9-char SSN patterns, 'X' = wildcard. Returns:
-        'diff'    - a known digit disagrees (definitely different SSNs)
-        'same'    - known digits agree on >= SSN_MIN_KNOWN_OVERLAP positions
-        'unknown' - compatible but not enough overlap to be sure"""
-    overlap = 0
-    for ca, cb in zip(a, b):
-        if ca != "X" and cb != "X":
-            if ca != cb:
-                return "diff"
-            overlap += 1
-    return "same" if overlap >= SSN_MIN_KNOWN_OVERLAP else "unknown"
-
-
 # Excel's date epoch: day 1 = 1900-01-01, but Excel treats 1900 as a leap
 # year (it wasn't) - using 1899-12-30 as day 0 reproduces that quirk, so a
 # serial number converts to the SAME date Excel itself displays.
@@ -534,23 +487,6 @@ def norm_dob(v) -> str:
     return "" if pd.isna(ts) else ts.strftime("%Y%m%d")
 
 
-def classify_dob_issue(v) -> str:
-    """Returns a short human-readable reason if a NON-BLANK DOB value failed
-    to parse via norm_dob() - '' if the value was already blank/empty, or
-    was parsed successfully. Used to build the 'Junk DOB Review' sheet: a
-    DOB that silently becomes blank (e.g. a partially masked value like
-    'XX/XX/1980', or any other format norm_dob() doesn't recognize) is
-    treated as compatible with everything during matching (blank never
-    conflicts), so it can silently bridge two different people together -
-    this surfaces that instead of letting it happen unnoticed."""
-    if v is None:
-        return ""
-    raw = str(v).strip()
-    if not raw or raw.lower() in ("nan", "none", "null"):
-        return ""
-    return "" if norm_dob(v) else "Unparseable DOB value - treated as blank"
-
-
 def parse_id_tokens(v) -> frozenset:
     """Splits an Employee ID / Driver's License / Passport / Phone cell into
     individual ID tokens. Cells may already contain multiple semicolon-
@@ -583,17 +519,8 @@ def build_records(df: pd.DataFrame):
     """df MUST already have a 0..n-1 RangeIndex (see main()) - idx doubles
     as the record's position, so no separate index->position map is needed.
     Uses positional numpy-array access (df.values) rather than itertuples(),
-    since itertuples() mangles column names with spaces/punctuation.
-
-    Also returns ssn_review: every (DOCID, Original SSN, Reason) where a
-    non-blank SSN value was rejected by norm_ssn() (a masked SSN with too
-    few known digits) - so a real-looking SSN that got silently treated as
-    blank doesn't go unnoticed. Likewise returns dob_review: every (DOCID,
-    Original DOB, Reason) where a non-blank DOB value failed to parse via
-    norm_dob() (see classify_dob_issue())."""
+    since itertuples() mangles column names with spaces/punctuation."""
     recs = []
-    ssn_review = []
-    dob_review = []
     col_pos = {c: p for p, c in enumerate(df.columns)}
     values = df.values  # numpy object array, fast positional access
     fi, la, mi, sf, do, ss, ei, dl, pp, ph, em, gv, ad, ci, st, zp, pv = (
@@ -603,7 +530,6 @@ def build_records(df: pd.DataFrame):
         col_pos[COL_ADDR], col_pos[COL_CITY], col_pos[COL_STATE], col_pos[COL_ZIP],
         col_pos[COL_PROVINCE],
     )
-    docid_pos = col_pos[COL_DOCID]
     for i in range(len(df)):
         row = values[i]
         r = Rec(i)
@@ -625,25 +551,7 @@ def build_records(df: pd.DataFrame):
         r.zip = norm_text(row[zp])
         r.province = norm_text(row[pv])
         recs.append(r)
-
-        reason = classify_ssn_issue(row[ss])
-        if reason:
-            ssn_review.append({
-                "DOCID": row[docid_pos],
-                "First Name": row[fi], "Last Name": row[la],
-                "Original SSN": row[ss],
-                "Remarks": reason,
-            })
-
-        dob_reason = classify_dob_issue(row[do])
-        if dob_reason:
-            dob_review.append({
-                "DOCID": row[docid_pos],
-                "First Name": row[fi], "Last Name": row[la],
-                "Original DOB": row[do],
-                "Remarks": dob_reason,
-            })
-    return recs, ssn_review, dob_review
+    return recs
 
 
 # ------------------------------------------------------------
@@ -1297,13 +1205,7 @@ def main() -> None:
         )
     print(f"  {len(df):,} rows read.")
 
-    recs, ssn_review, dob_review = build_records(df)   # recs[i].idx == i == df row position
-    if ssn_review:
-        print(f"  {len(ssn_review):,} SSN value(s) were ignored as junk/unusable "
-              f"- see the 'Junk SSN Review' sheet.")
-    if dob_review:
-        print(f"  {len(dob_review):,} DOB value(s) failed to parse and were "
-              f"treated as blank - see the 'Junk DOB Review' sheet.")
+    recs = build_records(df)   # recs[i].idx == i == df row position
 
     print("Clustering (blocked comparison) ...")
     pairs = bucket_candidate_pairs(recs)
@@ -1536,14 +1438,9 @@ def main() -> None:
               f"had 2+ genuinely different DOBs and were held back from merging entirely "
               f"- see the 'DOB Conflict Review' sheet for manual review.")
 
-    df_ssn_review = pd.DataFrame(ssn_review)
-    df_dob_review = pd.DataFrame(dob_review)
-
     print(f"Writing {OUTPUT_XLSX} ...")
     _write_workbook(OUTPUT_XLSX, {
         "Merged Notification Data": df_out,
-        "Junk SSN Review": df_ssn_review,
-        "Junk DOB Review": df_dob_review,
         "DOB Conflict Review": df_dob_conflict,
     })
     print(f"Done -> {OUTPUT_XLSX}")
