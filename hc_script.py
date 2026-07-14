@@ -171,6 +171,7 @@ Run:
 
 import sys
 import re
+import time
 import itertools
 import unicodedata
 from collections import defaultdict
@@ -193,20 +194,46 @@ PARALLEL_THRESHOLD = 20_000
 # Progress bar - one line, updated in place, no per-item explanation.
 # ------------------------------------------------------------
 _last_pct = {}
+_label_start = {}   # label -> monotonic start time, for this run's ETA estimate
+
+
+def _format_duration(seconds: float) -> str:
+    """'45s', '3m12s', or '1h05m' - whichever is most readable for the size."""
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, secs = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m{secs:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
 
 
 def progress(label: str, current: int, total: int, extra: str = "") -> None:
-    """Prints '[label]  42% |########------------|  420,000/1,000,000  extra'
+    """Prints '[label]  42% |########------------|  420,000/1,000,000  ETA 3m12s  extra'
     on a single line, overwriting itself. Only redraws when the whole percent
-    value changes, so it's cheap to call on every loop iteration."""
+    value changes, so it's cheap to call on every loop iteration. ETA is a
+    linear extrapolation from THIS label's own elapsed time and progress so
+    far (first call for a label starts its clock) - it's an estimate, not a
+    guarantee, since a phase's per-item cost isn't always uniform."""
+    now = time.monotonic()
+    start = _label_start.setdefault(label, now)
     pct = 100 if total <= 0 else min(100, current * 100 // total)
     if _last_pct.get(label) == pct and current != total:
         return
     _last_pct[label] = pct
     bar = "#" * (pct // 5) + "-" * (20 - pct // 5)
+    elapsed = now - start
+    if current >= total:
+        timing = f"  (took {_format_duration(elapsed)})"
+    elif current > 0:
+        remaining = elapsed * (total - current) / current
+        timing = f"  ETA {_format_duration(remaining)}"
+    else:
+        timing = ""
     tail = f"  {extra}" if extra else ""
     end = "\n" if current >= total else ""
-    print(f"\r  [{label}] {pct:3d}% |{bar}| {current:,}/{total:,}{tail}   ",
+    print(f"\r  [{label}] {pct:3d}% |{bar}| {current:,}/{total:,}{timing}{tail}   ",
           end=end, flush=True)
 
 
@@ -1013,12 +1040,37 @@ class UnionFind:
 #    never do a full N x N comparison. Candidate pairs come from one bucket
 #    per active rule; is_match() then applies the real rules within each.
 # ------------------------------------------------------------
+def describe_bucket_key(key) -> str:
+    """PII-safe label for a bucket's grouping field - e.g. 'City', 'SSN' -
+    NEVER the actual value. Bucket keys are built directly from SSN, Name,
+    DOB, Address, Phone, and Email values (see bucket_candidate_pairs()), so
+    printing a key verbatim for diagnostics would put PII/PHI straight into
+    console output/logs. Only the field name and a row count are safe to
+    surface."""
+    level = key[0]
+    if level == LEVEL_ADDRESS:
+        return {"addr": "Street Address", "city": "City", "zip": "Zip"}.get(key[1], key[1])
+    if level == LEVEL_SSN:
+        return "SSN"
+    if level == LEVEL_NAMEDOB:
+        return "First+Last Name + DOB"
+    return f"{LEVEL_NAMES[level]} + Name"
+
+
 
 
 def bucket_candidate_pairs(recs):
-    """Returns {level: set_of_candidate_pairs}, one set per LEVEL_ORDER entry.
-    Each level's pairs are bucketed - and later tested - independently, so
-    levels can be processed strictly in priority order (see main())."""
+    """Returns (level_pairs, biggest_buckets):
+      - level_pairs: {level: set_of_candidate_pairs}, one set per LEVEL_ORDER
+        entry. Each level's pairs are bucketed - and later tested -
+        independently, so levels can be processed strictly in priority order
+        (see main()).
+      - biggest_buckets: the 5 largest buckets overall (key, row count) -
+        diagnostic only, so a single low-cardinality value (e.g. a common
+        City) that's silently blowing up one level's candidate-pair count
+        (quadratic in bucket size) can be spotted instead of guessing (see
+        the State/Province exclusion note below for why this is a real
+        risk)."""
     buckets = defaultdict(list)
     for r in recs:
         if r.ssn:                                    # Level 1: SSN Exists
@@ -1060,14 +1112,20 @@ def bucket_candidate_pairs(recs):
 
     level_pairs = {lvl: set() for lvl in LEVEL_ORDER}
     total = len(buckets)
+    biggest_buckets = []   # min-heap-free top-5 via simple insert (total buckets can be huge, keep this O(total*5))
     for n, (key, idxs) in enumerate(buckets.items(), 1):
         progress("Bucketing", n, total)
         if len(idxs) < 2:
             continue
+        biggest_buckets.append((len(idxs), key))
+        if len(biggest_buckets) > 5:
+            biggest_buckets.sort(key=lambda t: -t[0])
+            del biggest_buckets[5:]
         level = key[0]
         for a, b in itertools.combinations(sorted(idxs), 2):
             level_pairs[level].add((a, b))
-    return level_pairs
+    biggest_buckets.sort(key=lambda t: -t[0])
+    return level_pairs, biggest_buckets[:5]
 
 
 # ------------------------------------------------------------
@@ -1330,10 +1388,12 @@ def split_addresses(df, group_idxs):
 # 8) Main
 # ------------------------------------------------------------
 def main() -> None:
+    run_start = time.monotonic()
     print(f"Reading {INPUT_XLSX} ...")
     # .xlsb (Excel Binary Workbook) needs the pyxlsb engine explicitly -
     # pandas can't infer it the way it does for .xlsx/.xls.
     engine = "pyxlsb" if INPUT_XLSX.lower().endswith(".xlsb") else None
+    t0 = time.monotonic()
     df = pd.read_excel(INPUT_XLSX, sheet_name=INPUT_SHEET, dtype=str, engine=engine)
     df.columns = [str(c).strip() for c in df.columns]
     df = df.reset_index(drop=True)   # guarantees row position == record idx
@@ -1345,9 +1405,11 @@ def main() -> None:
             f"  {missing}\nColumns present:\n  {list(df.columns)}\n"
             "Fix the COL_*/OTHER_MERGE_COLS names in the CONFIG block."
         )
-    print(f"  {len(df):,} rows read.")
+    print(f"  {len(df):,} rows read. ({time.monotonic() - t0:.1f}s)")
 
+    t0 = time.monotonic()
     recs, ssn_review, dob_review = build_records(df)   # recs[i].idx == i == df row position
+    print(f"  Records built. ({time.monotonic() - t0:.1f}s)")
     if ssn_review:
         print(f"  {len(ssn_review):,} SSN value(s) were ignored as junk/unusable "
               f"- see the 'Junk SSN Review' sheet.")
@@ -1356,10 +1418,19 @@ def main() -> None:
               f"treated as blank - see the 'Junk DOB Review' sheet.")
 
     print("Clustering (blocked comparison, strict priority levels) ...")
-    level_pairs = bucket_candidate_pairs(recs)
+    t0 = time.monotonic()
+    level_pairs, biggest_buckets = bucket_candidate_pairs(recs)
     total_candidates = sum(len(p) for p in level_pairs.values())
     print(f"  {total_candidates:,} candidate pairs to test across "
-          f"{len(LEVEL_ORDER)} priority levels.")
+          f"{len(LEVEL_ORDER)} priority levels. (bucketing took "
+          f"{time.monotonic() - t0:.1f}s)")
+    if biggest_buckets:
+        print("  Largest buckets (candidate-pair hotspots - values withheld, "
+              "PII/PHI):")
+        for size, key in biggest_buckets:
+            pair_count = size * (size - 1) // 2
+            print(f"    {describe_bucket_key(key):<20} {size:>8,} rows "
+                  f"-> {pair_count:>12,} pairs")
 
     uf = UnionFind(len(recs))
     # locked[root] = True once a group (2+ rows) has been finalized by an
@@ -1448,32 +1519,45 @@ def main() -> None:
             fa | fb for fa, fb in zip(group_addr[ra], group_addr[rb]))
         locked[merged_root] = locked[ra] or locked[rb]
 
-    for level in LEVEL_ORDER:
-        pairs_list = list(level_pairs[level])
-        total_pairs = len(pairs_list)
-        label = f"Clustering L{level} ({LEVEL_NAMES[level]})"
-        if total_pairs:
-            match_func = LEVEL_MATCH_FUNCS[level]
-            print(f"  Level {level} ({LEVEL_NAMES[level]}): "
-                  f"{total_pairs:,} candidate pairs.")
-            if total_pairs < PARALLEL_THRESHOLD:
-                # Small run - not worth the process-startup overhead, just
-                # test in-process.
-                for tested, (a_idx, b_idx) in enumerate(pairs_list, 1):
-                    if match_func(recs[a_idx], recs[b_idx]):
-                        try_union(a_idx, b_idx, level)
-                    progress(label, tested, total_pairs)
-            else:
-                # Large run - spread the pairwise match tests across
-                # PARALLEL_WORKERS separate processes (real parallelism; a
-                # thread pool would not help here, see PARALLEL_WORKERS
-                # comment above). The actual union calls stay single-process
-                # afterward, since Union-Find (and group_ssn/locked) is
-                # shared, mutable state that can't be split safely.
-                chunks = _chunk_pairs(pairs_list)
-                done = 0
-                with Pool(processes=PARALLEL_WORKERS, initializer=_init_worker,
-                          initargs=(recs,)) as pool:
+    # The worker pool is created ONCE, lazily, on the first level that needs
+    # it, and reused for every later level that does too - recreating it per
+    # level (as before) re-pickles and re-sends the ENTIRE `recs` list (every
+    # row) to fresh worker processes each time, which for a large file is
+    # real, repeated, wasted work. Safe to share across levels unchanged:
+    # `_worker_recs` is just each row's already-computed fields (name/SSN/
+    # DOB/...), which never change during clustering - only the Union-Find/
+    # locked bookkeeping changes, and that stays single-process (see
+    # try_union()), never sent to the workers.
+    pool = None
+    try:
+        for level in LEVEL_ORDER:
+            level_t0 = time.monotonic()
+            pairs_list = list(level_pairs[level])
+            total_pairs = len(pairs_list)
+            label = f"Clustering L{level} ({LEVEL_NAMES[level]})"
+            if total_pairs:
+                match_func = LEVEL_MATCH_FUNCS[level]
+                print(f"  Level {level} ({LEVEL_NAMES[level]}): "
+                      f"{total_pairs:,} candidate pairs.")
+                if total_pairs < PARALLEL_THRESHOLD:
+                    # Small run - not worth the process-startup overhead, just
+                    # test in-process.
+                    for tested, (a_idx, b_idx) in enumerate(pairs_list, 1):
+                        if match_func(recs[a_idx], recs[b_idx]):
+                            try_union(a_idx, b_idx, level)
+                        progress(label, tested, total_pairs)
+                else:
+                    # Large run - spread the pairwise match tests across
+                    # PARALLEL_WORKERS separate processes (real parallelism; a
+                    # thread pool would not help here, see PARALLEL_WORKERS
+                    # comment above). The actual union calls stay single-process
+                    # afterward, since Union-Find (and group_ssn/locked) is
+                    # shared, mutable state that can't be split safely.
+                    if pool is None:
+                        pool = Pool(processes=PARALLEL_WORKERS,
+                                    initializer=_init_worker, initargs=(recs,))
+                    chunks = _chunk_pairs(pairs_list)
+                    done = 0
                     for matched in pool.imap_unordered(
                             _match_chunk, [(level, c) for c in chunks]):
                         for a_idx, b_idx in matched:
@@ -1481,17 +1565,24 @@ def main() -> None:
                         done += 1
                         progress(label, done, len(chunks))
 
-        # This level is done - LOCK every group it leaves with 2+ rows
-        # (whether formed entirely at this level, or grown by adding rows
-        # onto a group locked at an earlier level) before moving on to the
-        # next, lower-priority level. From here on, try_union() will refuse
-        # to merge this group with any OTHER already-locked group.
-        root_members = defaultdict(list)
-        for r in recs:
-            root_members[uf.find(r.idx)].append(r.idx)
-        for root, members in root_members.items():
-            if len(members) > 1:
-                locked[root] = True
+            # This level is done - LOCK every group it leaves with 2+ rows
+            # (whether formed entirely at this level, or grown by adding rows
+            # onto a group locked at an earlier level) before moving on to the
+            # next, lower-priority level. From here on, try_union() will refuse
+            # to merge this group with any OTHER already-locked group.
+            root_members = defaultdict(list)
+            for r in recs:
+                root_members[uf.find(r.idx)].append(r.idx)
+            for root, members in root_members.items():
+                if len(members) > 1:
+                    locked[root] = True
+
+            if total_pairs:
+                print(f"    Level {level} done. ({time.monotonic() - level_t0:.1f}s)")
+    finally:
+        if pool is not None:
+            pool.close()
+            pool.join()
 
     if refused_lock:
         print(f"  {refused_lock:,} candidate merge(s) were refused - would have "
@@ -1515,6 +1606,7 @@ def main() -> None:
               f"combined 2+ conflicting real addresses into one group.")
 
     print("Building merged output ...")
+    t0 = time.monotonic()
     SEMICOLON_COLS = [COL_DOCID] + OTHER_MERGE_COLS
     total_groups = len(groups)
     out_rows = []
@@ -1576,6 +1668,7 @@ def main() -> None:
     df_out = df_out[new_order]
 
     df_out = df_out.sort_values(["Rows Merged"], ascending=False).reset_index(drop=True)
+    print(f"  Output built. ({time.monotonic() - t0:.1f}s)")
 
     if docid_overflow_groups:
         print(f"  {docid_overflow_groups:,} group(s) had a DOCID list too long for one "
@@ -1596,13 +1689,15 @@ def main() -> None:
     df_dob_review = pd.DataFrame(dob_review)
 
     print(f"Writing {OUTPUT_XLSX} ...")
+    t0 = time.monotonic()
     _write_workbook(OUTPUT_XLSX, {
         "Merged Notification Data": df_out,
         "Junk SSN Review": df_ssn_review,
         "Junk DOB Review": df_dob_review,
         "Large Group Review": df_large_groups,
     })
-    print(f"Done -> {OUTPUT_XLSX}")
+    print(f"  Written. ({time.monotonic() - t0:.1f}s)")
+    print(f"Done -> {OUTPUT_XLSX}  (total runtime {_format_duration(time.monotonic() - run_start)})")
     print("Reminder: save the output only to the secured/authorized folder for "
           "this data - never a desktop or personal drive. It contains SSN, "
           "DOB, and other PII/PHI.")
