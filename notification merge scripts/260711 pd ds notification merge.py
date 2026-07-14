@@ -1,4 +1,4 @@
-﻿"""
+"""
 260711 pd ds notification merge.py
 
 Merge PII/PHI person records from an Excel export into one row per
@@ -81,7 +81,7 @@ moved) is far more likely than two different people sharing an SSN/DOB/ID
 (see group_addr/try_union() in main()).
 
 INPUT  : an Excel workbook with the columns listed in EXPECTED_COLS below.
-OUTPUT : a new Excel workbook with four sheets:
+OUTPUT : a new Excel workbook with three sheets:
          - "Merged Notification Data": ONE ROW PER CONFIRMED PERSON.
            - First Name, Middle Name, Last Name, and SSN: the single
              fullest/most complete value among the merged rows (placeholder
@@ -125,10 +125,6 @@ OUTPUT : a new Excel workbook with four sheets:
          - "Large Group Review": every merged group with more than 50 rows -
            usually a sign of a shared junk value (e.g. a fake SSN), worth a
            manual check before trusting the output.
-         - "Skipped Bucket Review": a breakdown, BY FIELD TYPE (not raw
-           value - bucket keys can contain real PII), of every oversized
-           bucket (>MAX_BUCKET_SIZE rows sharing one value) that got
-           skipped during blocking instead of being exhaustively compared.
 
 This script does not touch the input file. Save the output only to the
 secured/authorized folder for this data (never a desktop) - it contains
@@ -488,7 +484,7 @@ def ssn_cmp(a: str, b: str) -> str:
 # year (it wasn't) - using 1899-12-30 as day 0 reproduces that quirk, so a
 # serial number converts to the SAME date Excel itself displays.
 _EXCEL_SERIAL_EPOCH = pd.Timestamp("1899-12-30")
-_EXCEL_SERIAL_RE = re.compile(r"\d{1,6}(\.0+)?")   # bare serial, e.g. '20037' or '20037.0'
+_EXCEL_SERIAL_RE = re.compile(r"\d{1,6}(\.\d+)?")   # bare serial, e.g. '20037', '20037.0', or '20037.5' (date + time-of-day)
 
 
 def norm_dob(v) -> str:
@@ -501,7 +497,14 @@ def norm_dob(v) -> str:
     serial number as-is, which pandas then stringifies verbatim. A bare
     integer (<=6 digits, so an 8-digit literal 'YYYYMMDD' date is never
     mistaken for one) is treated as such a serial and converted via Excel's
-    date epoch; anything else falls through to normal date-text parsing."""
+    date epoch; anything else falls through to normal date-text parsing.
+
+    A serial can carry a fractional time-of-day component (e.g. '20037.5')
+    even for a nominally date-only field - int() truncates that fraction,
+    keeping just the date. Requiring an exact '.0' here previously fell
+    through to pd.to_datetime(), which can't parse a bare serial number as
+    text and silently returned '' - treating a real, known DOB as blank and
+    letting it bridge two otherwise-unrelated people during merging."""
     if v is None:
         return ""
     s = str(v).strip()
@@ -914,7 +917,6 @@ class UnionFind:
 #    never do a full N x N comparison. Candidate pairs come from one bucket
 #    per active rule; is_match() then applies the real rules within each.
 # ------------------------------------------------------------
-MAX_BUCKET_SIZE = 300   # safety valve: skip pairwise test inside a bucket
 
 
 def bucket_candidate_pairs(recs):
@@ -946,11 +948,10 @@ def bucket_candidate_pairs(recs):
         # State/Province deliberately excluded here (though still checked
         # for conflicts by address_name_match() itself) - they're too
         # low-cardinality for large files (e.g. "CA" alone can be shared by
-        # tens of thousands of unrelated rows), which blows a bucket way
-        # past MAX_BUCKET_SIZE and gets it skipped entirely - silently
-        # losing candidate pairs for Street/City/Zip too, not just State.
-        # A real matching address almost always also shares City or Zip,
-        # so this loses very little real coverage.
+        # tens of thousands of unrelated rows), which would make that one
+        # bucket's pairwise comparison extremely slow. A real matching
+        # address almost always also shares City or Zip, so this loses
+        # very little real coverage.
         if r.addr:
             buckets[("addrfield", "addr", r.addr)].append(r.idx)
         if r.city:
@@ -959,38 +960,14 @@ def bucket_candidate_pairs(recs):
             buckets[("addrfield", "zip", r.zip)].append(r.idx)
 
     pairs = set()
-    skipped_buckets = 0
-    skipped_rows = 0
-    # Breakdown by bucket TYPE (not raw value - bucket keys can contain real
-    # PII like SSN/Name/State, which shouldn't get printed to the console).
-    # This still tells you exactly which rule/field is driving the skips.
-    skipped_by_type = defaultdict(lambda: [0, 0])   # kind -> [bucket_count, row_count]
     total = len(buckets)
     for n, (key, idxs) in enumerate(buckets.items(), 1):
-        progress("Bucketing", n, total, extra=f"skipped={skipped_buckets}")
+        progress("Bucketing", n, total)
         if len(idxs) < 2:
-            continue
-        if len(idxs) > MAX_BUCKET_SIZE:
-            skipped_buckets += 1
-            skipped_rows += len(idxs)
-            kind = f"{key[0]}/{key[1]}" if key[0] == "addrfield" else key[0]
-            entry = skipped_by_type[kind]
-            entry[0] += 1
-            entry[1] += len(idxs)
             continue
         for a, b in itertools.combinations(sorted(idxs), 2):
             pairs.add((a, b))
-    skipped_summary = []
-    if skipped_buckets:
-        print(f"  Skipped {skipped_buckets:,} oversized bucket(s) "
-              f"({skipped_rows:,} rows, likely a shared junk value) - review manually.")
-        print("  Breakdown by field (bucket type -> buckets skipped, rows involved):")
-        for kind, (cnt, rows) in sorted(skipped_by_type.items(), key=lambda kv: -kv[1][1]):
-            print(f"    {kind:<14} {cnt:>5,} bucket(s)  {rows:>10,} rows")
-            skipped_summary.append({
-                "Bucket Type": kind, "Buckets Skipped": cnt, "Rows Involved": rows,
-            })
-    return pairs, skipped_summary
+    return pairs
 
 
 # ------------------------------------------------------------
@@ -1271,7 +1248,7 @@ def main() -> None:
               f"- see the 'Junk SSN Review' sheet.")
 
     print("Clustering (blocked comparison) ...")
-    pairs, skipped_bucket_summary = bucket_candidate_pairs(recs)
+    pairs = bucket_candidate_pairs(recs)
     print(f"  {len(pairs):,} candidate pairs to test.")
 
     uf = UnionFind(len(recs))
@@ -1481,14 +1458,12 @@ def main() -> None:
               f"'Large Group Review' sheet before trusting the output.")
 
     df_ssn_review = pd.DataFrame(ssn_review)
-    df_skipped_buckets = pd.DataFrame(skipped_bucket_summary)
 
     print(f"Writing {OUTPUT_XLSX} ...")
     _write_workbook(OUTPUT_XLSX, {
         "Merged Notification Data": df_out,
         "Junk SSN Review": df_ssn_review,
         "Large Group Review": df_large_groups,
-        "Skipped Bucket Review": df_skipped_buckets,
     })
     print(f"Done -> {OUTPUT_XLSX}")
     print("Reminder: save the output only to the secured/authorized folder for "
