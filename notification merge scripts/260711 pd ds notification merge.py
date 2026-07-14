@@ -146,8 +146,13 @@ an Employee ID + Name - instead of comparing every row to every other row).
 Install once:
     pip install pandas openpyxl pyxlsb
 
-Run:
+Run (uses INPUT_XLSX/OUTPUT_XLSX from the CONFIG block below as-is):
     python "260711 pd ds notification merge.py"
+
+Or override the input/output file on the command line instead of editing
+the CONFIG block:
+    python "260711 pd ds notification merge.py" input.xlsb
+    python "260711 pd ds notification merge.py" input.xlsb output.xlsx
 """
 
 import sys
@@ -1466,6 +1471,19 @@ def _write_workbook(path, sheets: dict):
 
 
 if __name__ == "__main__":
+    # Optional command-line overrides, so the input/output file doesn't
+    # require editing the CONFIG block every run:
+    #   python "260711 pd ds notification merge.py"                     (uses INPUT_XLSX/OUTPUT_XLSX above as-is)
+    #   python "260711 pd ds notification merge.py" input.xlsb          (overrides INPUT_XLSX only)
+    #   python "260711 pd ds notification merge.py" input.xlsb out.xlsx (overrides both)
+    if len(sys.argv) > 3:
+        print(f"Usage: python {sys.argv[0]!r} [input_file] [output_file]", file=sys.stderr)
+        sys.exit(1)
+    if len(sys.argv) > 1:
+        INPUT_XLSX = sys.argv[1]
+    if len(sys.argv) > 2:
+        OUTPUT_XLSX = sys.argv[2]
+
     try:
         main()
     except Exception as exc:
