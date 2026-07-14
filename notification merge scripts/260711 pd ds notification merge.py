@@ -5,12 +5,13 @@ Merge PII/PHI person records from an Excel export into one row per
 confirmed person, for the notification report. Ten rules, built step by
 step:
 
-  Rule 1 (SSN Exists): rows with the same (non-blank) SSN are merged,
+  Rule 1 (SSN Exists): rows with the same (non-blank) SSN are merged, AS
+                        LONG AS both rows ALSO have a real (non-blank) DOB
+                        and it's the SAME value - a shared SSN is NOT
+                        trusted enough on its own; a blank DOB on either
+                        side no longer counts as "no conflict" (unlike
+                        Rules 4-8/9-10 below) - DOB must genuinely agree.
                         UNLESS:
-                          - both rows also have a real DOB and it genuinely
-                            disagrees (dob_conflict()) - two different real
-                            DOBs mean the shared SSN is more likely wrong/
-                            reused than proof of the same identity; or
                           - First, Middle, or Last Name genuinely disagrees
                             between the two rows (name_conflict()) - blank
                             on either side is fine, and an incomplete/
@@ -567,18 +568,6 @@ def build_records(df: pd.DataFrame):
 #    Add each newly confirmed rule here as its own small function, then
 #    call it from is_match() below.
 # ------------------------------------------------------------
-def dob_conflict(r1: Rec, r2: Rec) -> bool:
-    """True when BOTH rows have a usable DOB and it genuinely disagrees.
-    Blocks Step 1 (SSN Exists) - a matching SSN is NOT trusted enough to
-    override two different real DOBs, regardless of whether the names
-    match, are spelling variants, or are unrelated. Two rows with the same
-    SSN but different DOBs are kept as separate entities rather than
-    merged into one row with multiple DOB values. Blank DOB on either side
-    is not a conflict - Rule 1 still merges purely on a shared SSN then, as
-    usual."""
-    return bool(r1.dob) and bool(r2.dob) and r1.dob != r2.dob
-
-
 def name_prefix_compat(a: str, b: str) -> bool:
     """True if two (already normalized) name values are compatible: blank on
     either side, exactly equal, or one is a PREFIX of the other - an
@@ -624,14 +613,15 @@ def name_compat_match(r1: Rec, r2: Rec) -> bool:
 
 def ssn_exists_match(r1: Rec, r2: Rec) -> bool:
     """Step 1 - 'SSN Exists': both rows have a usable (non-blank) SSN and
-    it's the same value, AS LONG AS a genuinely differing DOB
-    (dob_conflict()) or a genuinely differing Name/Suffix (name_conflict())
-    doesn't block it - a shared SSN alone isn't trusted enough to override
-    either of those. An incomplete/truncated name (e.g. 'Did' vs 'Didar') is
-    NOT treated as a differing name here - see name_prefix_compat()."""
-    if dob_conflict(r1, r2):
-        return False
+    it's the same value, AND both rows have a real (non-blank) DOB that's
+    the SAME value - unlike Rules 4-8/9-10, a blank DOB on either side does
+    NOT count as compatible here; DOB must genuinely agree for the SSN
+    alone to be trusted. Also blocked by a genuinely differing Name/Suffix
+    (name_conflict()). An incomplete/truncated name (e.g. 'Did' vs 'Didar')
+    is NOT treated as a differing name here - see name_prefix_compat()."""
     if name_conflict(r1, r2):
+        return False
+    if not (r1.dob and r2.dob and r1.dob == r2.dob):
         return False
     return bool(r1.ssn) and bool(r2.ssn) and r1.ssn == r2.ssn
 
@@ -1237,10 +1227,10 @@ def main() -> None:
     group_ssn = [({r.ssn} if r.ssn else set()) for r in recs]
     # group_dob[root] = every DISTINCT known DOB currently inside that
     # root's group. Same bridging risk as group_ssn: a blank-DOB row can
-    # pairwise-match two OTHER rows (via Rules 1/4-8, which all treat a
-    # blank DOB as non-conflicting) that have different real DOBs from each
-    # other, transitively merging two genuinely different DOBs into one
-    # group even though those two rows would directly fail dob_conflict().
+    # pairwise-match two OTHER rows (via Rules 4-8/9-10, which still treat a
+    # blank DOB as compatible - unlike Rule 1, which now requires DOB to
+    # genuinely agree) that have different real DOBs from each other,
+    # transitively merging two genuinely different DOBs into one group.
     group_dob = [({r.dob} if r.dob else set()) for r in recs]
     # group_addr[root] = 5 sets (one per address field: Street, City, State,
     # Zip, Province), each holding every DISTINCT known value currently in
