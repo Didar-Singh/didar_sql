@@ -81,10 +81,14 @@ OUTPUT : a new Excel workbook with four sheets:
              fullest/most complete value among the merged rows (placeholder
              values like "[Unknown]" are never picked).
            - Suffix: the single fullest non-blank value.
-           - DOB: every distinct value seen among the merged rows, joined
-             with "; " (Rule 1 doesn't require DOB to match, so a merged
-             group can legitimately contain more than one DOB value - all
-             of them are kept, not collapsed to a single "winner").
+           - DOB: every distinct REAL DATE seen among the merged rows,
+             joined with "; " - compared by the NORMALIZED date (see
+             norm_dob()), not raw text, so the same date typed in different
+             formats across rows (e.g. "01/01/1990" vs "1990-01-01") is one
+             entry, not two (see dob_merge()). A genuinely different DOB
+             already can't end up in the same group in the first place - the
+             group-level safety net in main() refuses any merge that would
+             combine 2+ different real DOBs (see group_dob/try_union()).
            - Employee ID, Driver's License, and Passport Number: every
              distinct ID TOKEN seen (cells can already contain multiple
              semicolon-joined IDs - see parse_id_tokens()), deduplicated
@@ -469,12 +473,34 @@ def ssn_cmp(a: str, b: str) -> str:
     return "same" if overlap >= SSN_MIN_KNOWN_OVERLAP else "unknown"
 
 
+# Excel's date epoch: day 1 = 1900-01-01, but Excel treats 1900 as a leap
+# year (it wasn't) - using 1899-12-30 as day 0 reproduces that quirk, so a
+# serial number converts to the SAME date Excel itself displays.
+_EXCEL_SERIAL_EPOCH = pd.Timestamp("1899-12-30")
+_EXCEL_SERIAL_RE = re.compile(r"\d{1,6}(\.0+)?")   # bare serial, e.g. '20037' or '20037.0'
+
+
 def norm_dob(v) -> str:
+    """Parses a DOB cell into 'YYYYMMDD', or '' if unparseable/blank.
+
+    Also handles a raw Excel SERIAL date number (e.g. '20037') showing up
+    as the cell's text instead of an actual date: unlike openpyxl (used for
+    .xlsx), the pyxlsb engine (used for .xlsb) doesn't auto-convert a date-
+    formatted numeric cell into a real date - it hands back the underlying
+    serial number as-is, which pandas then stringifies verbatim. A bare
+    integer (<=6 digits, so an 8-digit literal 'YYYYMMDD' date is never
+    mistaken for one) is treated as such a serial and converted via Excel's
+    date epoch; anything else falls through to normal date-text parsing."""
     if v is None:
         return ""
     s = str(v).strip()
     if not s or s.lower() in ("nan", "none", "null"):
         return ""
+    if _EXCEL_SERIAL_RE.fullmatch(s):
+        serial = int(float(s))
+        if 1 <= serial <= 60000:   # sane range: years ~1900-2064
+            ts = _EXCEL_SERIAL_EPOCH + pd.Timedelta(days=serial)
+            return ts.strftime("%Y%m%d")
     ts = pd.to_datetime(s, errors="coerce")
     return "" if pd.isna(ts) else ts.strftime("%Y%m%d")
 
@@ -1035,6 +1061,30 @@ def semicolon_merge(values) -> str:
     return MERGE_SEP.join(out)
 
 
+def dob_merge(values) -> str:
+    """Like semicolon_merge(), but dedupes by the NORMALIZED date
+    (norm_dob()) instead of raw text - so the same date typed in different
+    formats across rows (e.g. '01/01/1990', '1990-01-01', '1/1/90') collapses
+    into ONE entry instead of showing as multiple different-looking DOBs.
+    Only a genuinely different real date produces a second entry - and the
+    group-level safety net in main() (group_dob/try_union()) already refuses
+    to merge two rows with different real DOBs in the first place, so this
+    is purely a display fix, not a new matching rule."""
+    seen = set()
+    out = []
+    for v in values:
+        if v is None:
+            continue
+        for tok in str(v).split(";"):
+            raw = tok.strip()
+            key = norm_dob(raw)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(raw)
+    return MERGE_SEP.join(out)
+
+
 DOCID_CHUNK_SIZE = 20_000   # keep well under Excel's 32,767-char cell limit
 
 
@@ -1405,7 +1455,7 @@ def main() -> None:
               f"combined 2+ conflicting real addresses into one group.")
 
     print("Building merged output ...")
-    SEMICOLON_COLS = [COL_DOCID, COL_DOB] + OTHER_MERGE_COLS
+    SEMICOLON_COLS = [COL_DOCID] + OTHER_MERGE_COLS
     total_groups = len(groups)
     out_rows = []
     docid_overflow_groups = 0
@@ -1416,6 +1466,7 @@ def main() -> None:
         sub_recs = [recs[i] for i in group_idxs]
 
         row = {c: semicolon_merge(sub[c]) for c in SEMICOLON_COLS}
+        row[COL_DOB] = dob_merge(sub[COL_DOB])
 
         # A group merging enough rows can produce a DOCID string longer than
         # Excel's 32,767-char cell limit (silently truncated otherwise) -
