@@ -81,25 +81,25 @@ moved) is far more likely than two different people sharing an SSN/DOB/ID
 (see group_addr/try_union() in main()).
 
 INPUT  : an Excel workbook with the columns listed in EXPECTED_COLS below.
-OUTPUT : a new Excel workbook with four sheets:
+OUTPUT : a new Excel workbook with five sheets:
          - "Merged Notification Data": ONE ROW PER CONFIRMED PERSON.
            - First Name, Middle Name, Last Name, and SSN: the single
              fullest/most complete value among the merged rows (placeholder
              values like "[Unknown]" are never picked).
            - Suffix: the single fullest non-blank value.
-           - DOB: every distinct REAL DATE seen among the merged rows,
-             joined with "; ", each always displayed as a clean "MM/DD/YYYY"
-             string - compared AND displayed by the NORMALIZED date (see
-             norm_dob()), never raw cell text, so the same date typed in
-             different formats across rows (e.g. "01/01/1990" vs
-             "1990-01-01") is one entry, not two, and a raw Excel SERIAL
-             date number (e.g. "20037" - which the pyxlsb engine for .xlsb
-             files hands back as-is for a date-formatted cell, unlike
-             openpyxl for .xlsx) never leaks into the output (see
-             dob_merge()). A genuinely different DOB already can't end up in
-             the same group in the first place - the
-             group-level safety net in main() refuses any merge that would
-             combine 2+ different real DOBs (see group_dob/try_union()).
+           - DOB: the one real date shared by every row in the group,
+             always displayed as a clean "MM/DD/YYYY" string - compared by
+             the NORMALIZED date (see norm_dob()), never raw cell text, so
+             the same date typed in different formats across rows (e.g.
+             "01/01/1990" vs "1990-01-01") is treated as one date, not two,
+             and a raw Excel SERIAL date number (e.g. "20037" - which the
+             pyxlsb engine for .xlsb files hands back as-is for a
+             date-formatted cell, unlike openpyxl for .xlsx) never leaks
+             into the output (see dob_merge()). A group where 2+ rows have
+             GENUINELY DIFFERENT real DOBs (possible via a blank-DOB bridge
+             row - see group_dob/try_union()) is not merged at all here -
+             every one of its original rows goes to "DOB Conflict Review"
+             instead (see below).
            - Employee ID, Driver's License, and Passport Number: every
              distinct ID TOKEN seen (cells can already contain multiple
              semicolon-joined IDs - see parse_id_tokens()), deduplicated
@@ -127,6 +127,12 @@ OUTPUT : a new Excel workbook with four sheets:
            - so a real DOB that got silently treated as blank, and could
            otherwise bridge two different people together during merging,
            doesn't go unnoticed (see classify_dob_issue()).
+         - "DOB Conflict Review": any candidate group where 2+ rows have
+           genuinely different real DOBs is NOT merged at all - every
+           original row from such a group is listed here as-is (unmerged),
+           tagged with a "Candidate Group ID" (rows sharing one ID were
+           clustered together) and "Candidate Group Size", for manual
+           review. These rows do NOT appear in "Merged Notification Data".
          - "Large Group Review": every merged group with more than 50 rows -
            usually a sign of a shared junk value (e.g. a fake SSN), worth a
            manual check before trusting the output.
@@ -1420,6 +1426,7 @@ def main() -> None:
     SEMICOLON_COLS = [COL_DOCID] + OTHER_MERGE_COLS
     total_groups = len(groups)
     out_rows = []
+    dob_conflict_rows = []
     docid_overflow_groups = 0
     max_docid_cols = 1
     for n, group_idxs in enumerate(groups, 1):
@@ -1427,8 +1434,23 @@ def main() -> None:
         sub = df.iloc[group_idxs]           # O(group size), not O(n)
         sub_recs = [recs[i] for i in group_idxs]
 
+        merged_dob = dob_merge(sub[COL_DOB])
+        if MERGE_SEP in merged_dob:
+            # 2+ genuinely different real DOBs ended up in one group (via a
+            # blank-DOB bridge row) - don't merge this group at all. Every
+            # original row goes into "DOB Conflict Review" as-is, tagged
+            # with which candidate group they'd have landed in, for manual
+            # review instead of silently combining conflicting birth dates
+            # into one person.
+            for idx in group_idxs:
+                conflict_row = df.iloc[idx].to_dict()
+                conflict_row["Candidate Group ID"] = n
+                conflict_row["Candidate Group Size"] = len(group_idxs)
+                dob_conflict_rows.append(conflict_row)
+            continue
+
         row = {c: semicolon_merge(sub[c]) for c in SEMICOLON_COLS}
-        row[COL_DOB] = dob_merge(sub[COL_DOB])
+        row[COL_DOB] = merged_dob
 
         # A group merging enough rows can produce a DOCID string longer than
         # Excel's 32,767-char cell limit (silently truncated otherwise) -
@@ -1494,6 +1516,16 @@ def main() -> None:
               f"usually a shared junk value (e.g. a fake SSN). See the "
               f"'Large Group Review' sheet before trusting the output.")
 
+    df_dob_conflict = pd.DataFrame(dob_conflict_rows)
+    if len(df_dob_conflict):
+        df_dob_conflict = df_dob_conflict.sort_values(
+            ["Candidate Group Size", "Candidate Group ID"], ascending=[False, True]
+        ).reset_index(drop=True)
+        n_conflict_groups = df_dob_conflict["Candidate Group ID"].nunique()
+        print(f"  WARNING: {n_conflict_groups:,} candidate group(s) ({len(df_dob_conflict):,} rows) "
+              f"had 2+ genuinely different DOBs and were held back from merging entirely "
+              f"- see the 'DOB Conflict Review' sheet for manual review.")
+
     df_ssn_review = pd.DataFrame(ssn_review)
     df_dob_review = pd.DataFrame(dob_review)
 
@@ -1502,6 +1534,7 @@ def main() -> None:
         "Merged Notification Data": df_out,
         "Junk SSN Review": df_ssn_review,
         "Junk DOB Review": df_dob_review,
+        "DOB Conflict Review": df_dob_conflict,
         "Large Group Review": df_large_groups,
     })
     print(f"Done -> {OUTPUT_XLSX}")
