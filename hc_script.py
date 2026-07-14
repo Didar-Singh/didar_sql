@@ -41,7 +41,14 @@ strict priority levels (see LEVEL_ORDER below), built step by step:
                         compatible, not a mismatch) are merged, as long as
                         SSN and DOB are each either matching or blank on
                         both sides (a real, differing value on both sides
-                        blocks it).
+                        blocks it), AND Address doesn't actively conflict
+                        (blank on either side is fine, but a real, differing
+                        Residential Address/City/State/Zip/Province blocks
+                        it - this match is only ever a compatible, not
+                        exact, name, so a conflicting address is treated as
+                        evidence these are two different people who happen
+                        to share that Employee ID, not one person who
+                        moved).
   Rule 5 (Driver's License, Name): same as Rule 4, but matched on Driver's
                         License Number instead of Employee ID.
   Rule 6 (Passport Number, Name): same as Rule 4, but matched on Passport
@@ -170,7 +177,6 @@ Run:
 """
 
 import sys
-import os
 import re
 import time
 import itertools
@@ -184,11 +190,15 @@ import pandas as pd
 # large files). Plain `threading` would NOT help here - the match functions
 # are pure CPU-bound Python, and the GIL serializes threads so they'd just
 # take turns instead of running in parallel. Separate processes actually
-# parallelize it. Scales to the machine's own core count (leaving one core
-# free for the main process, which is still doing sequential Union-Find
-# bookkeeping while workers churn) instead of a fixed 4 - a fixed count left
-# real cores idle on any machine with more than 5.
-PARALLEL_WORKERS = max(1, (os.cpu_count() or 4) - 1)
+# parallelize it. Measured (not guessed): raising this past 4 on an 8-logical-
+# core dev machine showed NO steady-state improvement (results were within
+# noise of each other, sometimes slightly worse) - each row's match check is
+# cheap enough that IPC/chunk overhead outweighs the extra parallelism, and
+# logical (hyperthreaded) cores don't add real throughput for CPU-bound pure
+# Python work the way physical cores do. If profiling on the actual
+# production machine (see the per-level timing this script now prints) shows
+# workers sitting idle, raise this - but don't assume more is faster.
+PARALLEL_WORKERS = 4
 # Below this many candidate pairs, run single-process instead - spinning up
 # worker processes has real overhead (~tens of ms each) that isn't worth it
 # for a small/quick run.
@@ -846,7 +856,11 @@ def address_conflict(r1: Rec, r2: Rec) -> bool:
     real but DIFFERENT unit numbers, count as a conflict. Used to block
     Rule 8 from merging two same-named people whose addresses actively
     disagree - matching name alone isn't enough when the address itself
-    contradicts it."""
+    contradicts it. Also used (see _id_name_match()) to block Rules 4-7, 9 -
+    a shared Employee ID/DL/Passport/Phone/Email plus a merely COMPATIBLE
+    (not exact) name is weak enough evidence that a real, conflicting address
+    is treated as a sign these are two different people who happen to share
+    that ID/contact value, not one person who moved."""
     if not street_compat(r1.addr, r2.addr):
         return True
     fields1 = (r1.city, r1.state, zip5(r1.zip), r1.province)
@@ -869,10 +883,17 @@ def _id_name_match(ids1: frozenset, ids2: frozenset, r1: Rec, r2: Rec) -> bool:
     an incomplete/truncated entry, e.g. an initial like "J" for "Jeffrey",
     counts as compatible, not a mismatch), AND SSN and DOB are each either
     matching or blank on both sides (a real, differing value on either
-    blocks it)."""
+    blocks it), AND Address doesn't actively conflict (address_conflict() -
+    blank on either side is fine, but a real, differing address is treated
+    as evidence these are two different people who happen to share that
+    Employee ID/DL/Passport/Phone/Email, not one person who moved - this
+    match is only ever a compatible-name, not an exact one, so it's weaker
+    evidence than SSN and a conflicting address is enough to block it)."""
     if not (ids1 and ids2 and not ids1.isdisjoint(ids2)):
         return False
     if not name_compat_match(r1, r2):
+        return False
+    if address_conflict(r1, r2):
         return False
     return compatible(r1.ssn, r2.ssn) and compatible(r1.dob, r2.dob)
 
