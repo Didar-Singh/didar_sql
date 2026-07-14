@@ -65,13 +65,6 @@ step:
   Rule 9 (Email, Name): same as Rule 4, but matched on Email Address -
                         Personal instead of Employee ID.
 
-NOTE: a "Rule 10 (Full Name Match)" second pass - for the same person
-scattered across rows that each carry a DIFFERENT single piece of
-corroborating info (one row has only a DOB, another only an SSN, another
-only an Address, etc.), with nothing shared to anchor Rules 1-9 on directly
-- lives in a SEPARATE script that runs on THIS script's output. See
-"260714 pd ds final merge script.py".
-
 Either rule matching is enough to merge, and the match is transitive (if
 A matches B and B matches C, all three end up in one merged row, even if
 A and C don't directly match each other) - EXCEPT that a merge is refused
