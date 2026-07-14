@@ -170,6 +170,7 @@ Run:
 """
 
 import sys
+import os
 import re
 import time
 import itertools
@@ -183,8 +184,11 @@ import pandas as pd
 # large files). Plain `threading` would NOT help here - the match functions
 # are pure CPU-bound Python, and the GIL serializes threads so they'd just
 # take turns instead of running in parallel. Separate processes actually
-# parallelize it.
-PARALLEL_WORKERS = 4
+# parallelize it. Scales to the machine's own core count (leaving one core
+# free for the main process, which is still doing sequential Union-Find
+# bookkeeping while workers churn) instead of a fixed 4 - a fixed count left
+# real cores idle on any machine with more than 5.
+PARALLEL_WORKERS = max(1, (os.cpu_count() or 4) - 1)
 # Below this many candidate pairs, run single-process instead - spinning up
 # worker processes has real overhead (~tens of ms each) that isn't worth it
 # for a small/quick run.
@@ -1488,6 +1492,17 @@ def main() -> None:
     refused_dob = 0
     refused_addr = 0
     refused_lock = 0
+    # root_size[root] = row count of that root's current group - maintained
+    # incrementally alongside Union-Find instead of recomputed by rescanning
+    # every record, so end-of-level locking (below) doesn't need an O(n) pass
+    # over all rows on every one of the 8 levels regardless of how few rows
+    # that level actually touched.
+    root_size = [1] * len(recs)
+    # touched_roots = every root actually produced by a successful union in
+    # THIS level's pass so far - end-of-level locking only needs to inspect
+    # these (via find(), for the final canonical root after any further
+    # same-level chaining), not every one of the 400k+ records.
+    touched_roots = set()
 
     def try_union(a_idx, b_idx, level):
         nonlocal refused_ssn, refused_dob, refused_addr, refused_lock
@@ -1518,6 +1533,8 @@ def main() -> None:
         group_addr[merged_root] = tuple(
             fa | fb for fa, fb in zip(group_addr[ra], group_addr[rb]))
         locked[merged_root] = locked[ra] or locked[rb]
+        root_size[merged_root] = root_size[ra] + root_size[rb]
+        touched_roots.add(merged_root)
 
     # The worker pool is created ONCE, lazily, on the first level that needs
     # it, and reused for every later level that does too - recreating it per
@@ -1569,13 +1586,17 @@ def main() -> None:
             # (whether formed entirely at this level, or grown by adding rows
             # onto a group locked at an earlier level) before moving on to the
             # next, lower-priority level. From here on, try_union() will refuse
-            # to merge this group with any OTHER already-locked group.
-            root_members = defaultdict(list)
-            for r in recs:
-                root_members[uf.find(r.idx)].append(r.idx)
-            for root, members in root_members.items():
-                if len(members) > 1:
-                    locked[root] = True
+            # to merge this group with any OTHER already-locked group. Only
+            # touched_roots (roots a union actually landed on THIS level) can
+            # have newly crossed the 2-row threshold, so re-deriving each
+            # one's final canonical root (further same-level chaining can
+            # still move it) and checking root_size there is enough - no need
+            # to rescan all of `recs` on every level.
+            for root in touched_roots:
+                true_root = uf.find(root)
+                if root_size[true_root] > 1:
+                    locked[true_root] = True
+            touched_roots.clear()
 
             if total_pairs:
                 print(f"    Level {level} done. ({time.monotonic() - level_t0:.1f}s)")
