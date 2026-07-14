@@ -5,13 +5,22 @@ Merge PII/PHI person records from an Excel export into one row per
 confirmed person, for the notification report. Nine rules, built step by
 step:
 
-  Rule 1 (SSN Exists): rows with the same (non-blank, non-junk) SSN are
-                        merged (Name is not considered), UNLESS both rows
-                        also have a real DOB and it genuinely disagrees
-                        (dob_conflict()) - two different real DOBs mean the
-                        shared SSN is more likely wrong/reused than proof
-                        of the same identity, so those two rows are kept
-                        separate rather than merged.
+  Rule 1 (SSN Exists): rows with the same (non-blank) SSN are merged,
+                        UNLESS:
+                          - both rows also have a real DOB and it genuinely
+                            disagrees (dob_conflict()) - two different real
+                            DOBs mean the shared SSN is more likely wrong/
+                            reused than proof of the same identity; or
+                          - First, Middle, or Last Name genuinely disagrees
+                            between the two rows (name_conflict()) - blank
+                            on either side is fine, and an incomplete/
+                            truncated entry that's a prefix of the fuller
+                            one (e.g. "Did" vs "Didar") is NOT treated as a
+                            conflict, but a real difference is; or
+                          - Suffix is present on both sides and differs
+                            (e.g. "Jr" vs "Sr").
+                        In any of these cases the two rows are kept separate
+                        rather than merged.
   Rule 2 (Exact Name, DOB): rows with the same First Name + Last Name
                         (exact text match) AND the same DOB are merged,
                         as long as their SSNs don't conflict (blank on
@@ -95,10 +104,9 @@ OUTPUT : a new Excel workbook with four sheets:
              column as one combined string per address, semicolon-joined
              (see address_key_conflict()).
          - "Junk SSN Review": every row where a non-blank SSN value was
-           ignored as unusable (a known fake/placeholder SSN like
-           123-45-6789, all-same-digit, or a masked SSN with too few known
-           digits) - so a real-looking SSN that got silently treated as
-           blank doesn't go unnoticed (see classify_ssn_issue()).
+           ignored as unusable (a masked SSN with too few known digits) - so
+           a real-looking SSN that got silently treated as blank doesn't go
+           unnoticed (see classify_ssn_issue()).
          - "Large Group Review": every merged group with more than 50 rows -
            usually a sign of a shared junk value (e.g. a fake SSN), worth a
            manual check before trusting the output.
@@ -116,7 +124,7 @@ already share an exact SSN, an exact First+Last Name+DOB, a Last Name, or
 an Employee ID + Name - instead of comparing every row to every other row).
 
 Install once:
-    pip install pandas openpyxl
+    pip install pandas openpyxl pyxlsb
 
 Run:
     python "260711 pd ds notification merge.py"
@@ -165,7 +173,7 @@ def progress(label: str, current: int, total: int, extra: str = "") -> None:
 # ------------------------------------------------------------
 # 1) CONFIG - edit these to match your workbook
 # ------------------------------------------------------------
-INPUT_XLSX  = "Data_01.xlsx"
+INPUT_XLSX  = "Cng Notification_Final_updated.xlsb"
 INPUT_SHEET = 0
 OUTPUT_XLSX = "260711 re ds notification merge output.xlsx"
 
@@ -249,13 +257,6 @@ NAME_PLACEHOLDERS = {
     "XXX", "XX", "X", "NMN", "NONAME", "NOTGIVEN", "NOTPROVIDED",
 }
 
-# Fake / junk SSNs that must never be used to match people.
-SSN_PLACEHOLDERS = {
-    "123456789", "987654321", "111223333", "123121234", "456789123",
-    "078051120", "219099999", "457555462",
-}
-
-
 # ------------------------------------------------------------
 # 2) Normalization helpers
 # ------------------------------------------------------------
@@ -267,6 +268,21 @@ SSN_PLACEHOLDERS = {
 # this file), so the source itself never contains an actual invisible char.
 _INVISIBLE_CODEPOINTS = (0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF, 0x00A0, 0x00AD)
 _INVISIBLE_CHARS = re.compile("[" + "".join(chr(c) for c in _INVISIBLE_CODEPOINTS) + "]")
+
+
+def _numeric_cell_to_str(v) -> str:
+    """Coerces a raw cell value to text without letting pandas' float parsing
+    corrupt a whole-number ID (SSN, Employee ID, Driver's License, Passport,
+    Phone). A purely-numeric column (no dashes, no leading zero) gets read as
+    float64 by pandas whenever that column has even one blank cell elsewhere
+    - so a valid value like 123456789 silently becomes 123456789.0, and
+    str()'ing that adds a spurious extra digit ('123456789.0' -> 10 digits
+    after stripping the dot), making an otherwise-identical ID fail to match
+    another row's clean text/int version of the same number. A whole-number
+    float is converted via int() first to avoid this."""
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v)
 
 
 def norm_text(v) -> str:
@@ -392,37 +408,32 @@ def norm_name(v) -> str:
 SSN_MIN_KNOWN_OVERLAP = 4   # min matching KNOWN digits to trust a masked SSN
 
 
-def is_junk_ssn(d: str) -> bool:
-    """True for a 9-digit (fully known) SSN that can't belong to a real
-    person: all-same-digit, or a known fake/placeholder value."""
-    return len(set(d)) == 1 or d in SSN_PLACEHOLDERS
-
-
 def norm_ssn(v) -> str:
     """Return a 9-character pattern of digits and 'X' (X = redacted digit),
     or '' if unusable. Mask characters *, #, ? are treated as X, so
         123-45-6789 -> '123456789'
         123-45-XXXX -> '12345XXXX'
         123-45-6XXX -> '123456XXX'
-    Rejected (-> ''): not 9 characters, a fully-known junk SSN (all-same-
-    digit / known placeholder), or a masked SSN with fewer than
-    SSN_MIN_KNOWN_OVERLAP known digits (too little information to trust)."""
+    Rejected (-> ''): not 9 characters, or a masked SSN with fewer than
+    SSN_MIN_KNOWN_OVERLAP known digits (too little information to trust).
+    A fully-known 9-digit value is always accepted, even a placeholder-
+    looking one (e.g. all-same-digit) - this data has no junk SSNs, so no
+    such filtering is applied."""
     if v is None:
         return ""
-    s = str(v).upper().replace("*", "X").replace("#", "X").replace("?", "X")
+    s = _numeric_cell_to_str(v).upper().replace("*", "X").replace("#", "X").replace("?", "X")
     kept = re.sub(r"[^0-9X]", "", s)
     if len(kept) != 9:
         return ""
     if "X" not in kept:                                    # fully known
-        return "" if is_junk_ssn(kept) else kept
+        return kept
     known = sum(c != "X" for c in kept)                     # masked
     return kept if known >= SSN_MIN_KNOWN_OVERLAP else ""
 
 
 def classify_ssn_issue(v) -> str:
     """Returns a short human-readable reason if a NON-BLANK SSN value was
-    rejected by norm_ssn() (all-same-digit, a known fake/placeholder value
-    like 123-45-6789, wrong length, or a masked SSN with too few known
+    rejected by norm_ssn() (wrong length, or a masked SSN with too few known
     digits) - '' if the value was already blank/empty, or was accepted as
     usable. Used to build the 'Junk SSN Review' sheet so a real-looking SSN
     that got silently treated as blank doesn't go unnoticed."""
@@ -431,16 +442,12 @@ def classify_ssn_issue(v) -> str:
     raw = str(v).strip()
     if not raw or raw.lower() in ("nan", "none", "null"):
         return ""
-    s = raw.upper().replace("*", "X").replace("#", "X").replace("?", "X")
+    s = _numeric_cell_to_str(v).upper().replace("*", "X").replace("#", "X").replace("?", "X")
     kept = re.sub(r"[^0-9X]", "", s)
     if len(kept) != 9:
-        return ""   # not 9 digits at all - not SSN-shaped, not flagged as "junk"
+        return ""   # not 9 digits at all - not SSN-shaped, not flagged
     if "X" not in kept:
-        if len(set(kept)) == 1:
-            return "All-same-digit SSN - ignored as junk"
-        if kept in SSN_PLACEHOLDERS:
-            return "Known fake/placeholder SSN - ignored as junk"
-        return ""   # fully valid
+        return ""   # fully valid, always accepted
     known = sum(c != "X" for c in kept)
     if known < SSN_MIN_KNOWN_OVERLAP:
         return (f"Masked SSN with only {known} known digit(s) "
@@ -473,14 +480,18 @@ def norm_dob(v) -> str:
 
 
 def parse_id_tokens(v) -> frozenset:
-    """Splits an Employee ID / Driver's License / Passport cell into
+    """Splits an Employee ID / Driver's License / Passport / Phone cell into
     individual ID tokens. Cells may already contain multiple semicolon-
     joined IDs from an earlier merge (e.g. '12345; 12346' OR '12345;12346'
     - space after the ';' is optional/inconsistent in the source data), so
-    this splits on ';' regardless of spacing and normalizes each token."""
+    this splits on ';' regardless of spacing and normalizes each token.
+    Uses _numeric_cell_to_str() (not a plain str()) so a purely-numeric ID
+    that pandas read as a float (e.g. 12345.0) doesn't pick up a spurious
+    extra digit and silently fail to match another row's clean version of
+    the same ID."""
     if v is None:
         return frozenset()
-    return frozenset(norm_text(p) for p in str(v).split(";") if norm_text(p))
+    return frozenset(norm_text(p) for p in _numeric_cell_to_str(v).split(";") if norm_text(p))
 
 
 # ------------------------------------------------------------
@@ -488,7 +499,7 @@ def parse_id_tokens(v) -> frozenset:
 #    (this loop runs millions of times, so dict-key lookups add up)
 # ------------------------------------------------------------
 class Rec:
-    __slots__ = ("idx", "first", "last", "mid", "dob", "ssn", "ssn_present",
+    __slots__ = ("idx", "first", "last", "mid", "suffix", "dob", "ssn", "ssn_present",
                  "empids", "dl_ids", "passport_ids", "phones", "emails",
                  "addr", "city", "state", "zip", "province")
 
@@ -503,15 +514,15 @@ def build_records(df: pd.DataFrame):
     since itertuples() mangles column names with spaces/punctuation.
 
     Also returns ssn_review: every (DOCID, Original SSN, Reason) where a
-    non-blank SSN value was rejected by norm_ssn() (junk/placeholder,
-    all-same-digit, or a masked SSN with too few known digits) - so a real-
-    looking SSN that got silently treated as blank doesn't go unnoticed."""
+    non-blank SSN value was rejected by norm_ssn() (a masked SSN with too
+    few known digits) - so a real-looking SSN that got silently treated as
+    blank doesn't go unnoticed."""
     recs = []
     ssn_review = []
     col_pos = {c: p for p, c in enumerate(df.columns)}
     values = df.values  # numpy object array, fast positional access
-    fi, la, mi, do, ss, ei, dl, pp, ph, em, ad, ci, st, zp, pv = (
-        col_pos[COL_FIRST], col_pos[COL_LAST], col_pos[COL_MIDDLE],
+    fi, la, mi, sf, do, ss, ei, dl, pp, ph, em, ad, ci, st, zp, pv = (
+        col_pos[COL_FIRST], col_pos[COL_LAST], col_pos[COL_MIDDLE], col_pos[COL_SUFFIX],
         col_pos[COL_DOB], col_pos[COL_SSN], col_pos[COL_EMPID], col_pos[COL_DL],
         col_pos[COL_PASSPORT], col_pos[COL_PHONE], col_pos[COL_EMAIL], col_pos[COL_ADDR],
         col_pos[COL_CITY], col_pos[COL_STATE], col_pos[COL_ZIP], col_pos[COL_PROVINCE],
@@ -523,15 +534,17 @@ def build_records(df: pd.DataFrame):
         r.first = norm_name(row[fi])
         r.last = norm_name(row[la])
         r.mid = norm_name(row[mi])
+        r.suffix = norm_name(row[sf])
         r.dob = norm_dob(row[do])
         r.ssn = norm_ssn(row[ss])
         # Distinct from r.ssn: TRUE if the raw cell had any real text at
-        # all, even if norm_ssn() rejected it as junk/unusable. A junk SSN
-        # is not trusted for MATCHING (r.ssn stays '' so it can't falsely
-        # confirm two rows are the same person) - but it's still evidence
-        # the row ISN'T a bare, nothing-to-corroborate-with record, so it
-        # must not be treated as "no identifiers" by has_no_identifiers()
-        # (which would wrongly let Rule 3 pull it into an unrelated group).
+        # all, even if norm_ssn() rejected it (a masked SSN with too few
+        # known digits). That kind of SSN is not trusted for MATCHING
+        # (r.ssn stays '' so it can't falsely confirm two rows are the same
+        # person) - but it's still evidence the row ISN'T a bare, nothing-
+        # to-corroborate-with record, so it must not be treated as "no
+        # identifiers" by has_no_identifiers() (which would wrongly let
+        # Rule 3 pull it into an unrelated group).
         r.ssn_present = bool(classify_ssn_issue(row[ss])) or bool(r.ssn)
         r.empids = parse_id_tokens(row[ei])
         r.dl_ids = parse_id_tokens(row[dl])
@@ -573,13 +586,44 @@ def dob_conflict(r1: Rec, r2: Rec) -> bool:
     return bool(r1.dob) and bool(r2.dob) and r1.dob != r2.dob
 
 
+def name_prefix_compat(a: str, b: str) -> bool:
+    """True if two (already normalized) name values are compatible: blank on
+    either side, exactly equal, or one is a PREFIX of the other - an
+    incomplete/truncated entry (e.g. 'DID' vs 'DIDAR') is not treated as a
+    real difference. A genuine difference (neither a prefix of the other)
+    returns False."""
+    if not a or not b or a == b:
+        return True
+    return a.startswith(b) or b.startswith(a)
+
+
+def name_conflict(r1: Rec, r2: Rec) -> bool:
+    """True when First, Middle, or Last Name genuinely disagrees between two
+    rows (see name_prefix_compat() - blank on either side, or one being a
+    truncated/incomplete version of the other, is NOT a conflict), or when
+    Suffix is present on both sides and differs (e.g. 'Jr' vs 'Sr' - no
+    prefix tolerance for Suffix, since it isn't an abbreviation-of-the-same-
+    value situation). Blocks Step 1 (SSN Exists) - a matching SSN is not
+    trusted enough to override a genuine name difference."""
+    if not name_prefix_compat(r1.first, r2.first):
+        return True
+    if not name_prefix_compat(r1.mid, r2.mid):
+        return True
+    if not name_prefix_compat(r1.last, r2.last):
+        return True
+    return bool(r1.suffix) and bool(r2.suffix) and r1.suffix != r2.suffix
+
+
 def ssn_exists_match(r1: Rec, r2: Rec) -> bool:
-    """Step 1 - 'SSN Exists': both rows have a usable (non-blank, non-junk)
-    SSN and it's the same value. Name is NOT considered here at all, but a
-    genuinely differing DOB on both sides blocks the merge (dob_conflict())
-    - a shared SSN alone isn't trusted enough to override two different
-    real DOBs."""
+    """Step 1 - 'SSN Exists': both rows have a usable (non-blank) SSN and
+    it's the same value, AS LONG AS a genuinely differing DOB
+    (dob_conflict()) or a genuinely differing Name/Suffix (name_conflict())
+    doesn't block it - a shared SSN alone isn't trusted enough to override
+    either of those. An incomplete/truncated name (e.g. 'Did' vs 'Didar') is
+    NOT treated as a differing name here - see name_prefix_compat()."""
     if dob_conflict(r1, r2):
+        return False
+    if name_conflict(r1, r2):
         return False
     return bool(r1.ssn) and bool(r2.ssn) and r1.ssn == r2.ssn
 
@@ -1190,7 +1234,10 @@ def split_addresses(df, group_idxs):
 # ------------------------------------------------------------
 def main() -> None:
     print(f"Reading {INPUT_XLSX} ...")
-    df = pd.read_excel(INPUT_XLSX, sheet_name=INPUT_SHEET, dtype=str)
+    # .xlsb (Excel Binary Workbook) needs the pyxlsb engine explicitly -
+    # pandas can't infer it the way it does for .xlsx/.xls.
+    engine = "pyxlsb" if INPUT_XLSX.lower().endswith(".xlsb") else None
+    df = pd.read_excel(INPUT_XLSX, sheet_name=INPUT_SHEET, dtype=str, engine=engine)
     df.columns = [str(c).strip() for c in df.columns]
     df = df.reset_index(drop=True)   # guarantees row position == record idx
 
@@ -1399,13 +1446,22 @@ def main() -> None:
 
     df_out = pd.DataFrame(out_rows)
 
-    # Put any 'DOCIDs 2', 'DOCIDs 3', ... overflow columns right after
-    # 'DOCIDs' - dict-key insertion order would otherwise scatter them
-    # wherever the first overflowing group happened to appear.
+    # Column order: follow the INPUT file's own header sequence (not a
+    # fixed order), so the output layout matches the source workbook the
+    # user already knows - any 'DOCIDs 2', 'DOCIDs 3', ... overflow columns
+    # go right after 'DOCIDs', and columns with no input counterpart
+    # ('Other Address', 'Rows Merged', 'Names Differ') go at the end.
     docid_extra_cols = [f"{COL_DOCID} {i}" for i in range(2, max_docid_cols + 1)]
-    docid_pos = list(df_out.columns).index(COL_DOCID)
-    other_cols = [c for c in df_out.columns if c not in docid_extra_cols]
-    new_order = other_cols[:docid_pos + 1] + docid_extra_cols + other_cols[docid_pos + 1:]
+    input_order = list(df.columns)
+    extra_cols = [c for c in df_out.columns if c not in input_order and c not in docid_extra_cols]
+    new_order = []
+    for c in input_order:
+        if c not in df_out.columns:
+            continue
+        new_order.append(c)
+        if c == COL_DOCID:
+            new_order.extend(docid_extra_cols)
+    new_order.extend(extra_cols)
     df_out = df_out[new_order]
 
     df_out = df_out.sort_values(["Rows Merged"], ascending=False).reset_index(drop=True)
@@ -1460,3 +1516,4 @@ if __name__ == "__main__":
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
+
