@@ -2,7 +2,7 @@
 260711 pd ds notification merge.py
 
 Merge PII/PHI person records from an Excel export into one row per
-confirmed person, for the notification report. Nine rules, built step by
+confirmed person, for the notification report. Ten rules, built step by
 step:
 
   Rule 1 (SSN Exists): rows with the same (non-blank) SSN are merged,
@@ -57,9 +57,12 @@ step:
                         difference on its own - this also always requires
                         a compatible Name match (name_compat_match()) and
                         SSN/DOB to be matching-or-blank, same as Rules 4-7,
-                        9.
+                        9-10.
   Rule 9 (Email, Name): same as Rule 4, but matched on Email Address -
                         Personal instead of Employee ID.
+  Rule 10 (Government-Issued ID Number, Name): same as Rule 4, but matched
+                        on Government-Issued ID Number instead of Employee
+                        ID.
 
 Either rule matching is enough to merge, and the match is transitive (if
 A matches B and B matches C, all three end up in one merged row, even if
@@ -74,14 +77,14 @@ SSN, bridged by a blank-SSN row, still end up as 2 clean groups instead of
 
 A conflicting real ADDRESS gets the same transitive-bridge protection, but
 only for the WEAK-evidence Rule 8 (Full Address, Name) itself - a
-STRONG match (Rule 1 SSN, Rule 2 Name+DOB, or Rules 4-7/9 ID+Name) is
+STRONG match (Rule 1 SSN, Rule 2 Name+DOB, or Rules 4-7/9-10 ID+Name) is
 trusted enough to override a conflicting address on its own, since the same
 person legitimately having two different addresses on file (e.g. they
 moved) is far more likely than two different people sharing an SSN/DOB/ID
 (see group_addr/try_union() in main()).
 
 INPUT  : an Excel workbook with the columns listed in EXPECTED_COLS below.
-OUTPUT : a new Excel workbook with five sheets:
+OUTPUT : a new Excel workbook with four sheets:
          - "Merged Notification Data": ONE ROW PER CONFIRMED PERSON.
            - First Name, Middle Name, Last Name, and SSN: the single
              fullest/most complete value among the merged rows (placeholder
@@ -133,9 +136,10 @@ OUTPUT : a new Excel workbook with five sheets:
            tagged with a "Candidate Group ID" (rows sharing one ID were
            clustered together) and "Candidate Group Size", for manual
            review. These rows do NOT appear in "Merged Notification Data".
-         - "Large Group Review": every merged group with more than 50 rows -
-           usually a sign of a shared junk value (e.g. a fake SSN), worth a
-           manual check before trusting the output.
+
+Every group is merged regardless of size - a group of 50+ rows sharing one
+value (e.g. a reused/junk SSN) is merged the same as a group of 2, with no
+separate size-based review step.
 
 This script does not touch the input file. Save the output only to the
 secured/authorized folder for this data (never a desktop) - it contains
@@ -207,9 +211,9 @@ COL_SUFFIX = "Suffix"
 COL_DOB    = "Full Date of Birth (MM/DD/YYYY)"
 COL_SSN    = "Social Security Number"
 
-# COL_EMPID/COL_DL/COL_PASSPORT/COL_PHONE/COL_EMAIL are used for matching
-# (Rules 4-7, 9). COL_GOVID isn't used for matching - kept as a plain
-# semicolon-merged column in OTHER_MERGE_COLS below.
+# COL_EMPID/COL_DL/COL_PASSPORT/COL_PHONE/COL_EMAIL/COL_GOVID are used for
+# matching (Rules 4-7, 9-10) AND kept as plain semicolon-merged columns in
+# OTHER_MERGE_COLS below (matching doesn't remove a column from display).
 COL_DL       = "Driver's License Number"
 COL_PASSPORT = "Passport Number"
 COL_GOVID    = "Government-Issued ID Number"
@@ -569,7 +573,7 @@ def parse_id_tokens(v) -> frozenset:
 class Rec:
     __slots__ = ("idx", "first", "last", "mid", "suffix", "dob", "ssn",
                  "empids", "dl_ids", "passport_ids", "phones", "emails",
-                 "addr", "city", "state", "zip", "province")
+                 "govids", "addr", "city", "state", "zip", "province")
 
     def __init__(self, idx):
         self.idx = idx
@@ -592,11 +596,12 @@ def build_records(df: pd.DataFrame):
     dob_review = []
     col_pos = {c: p for p, c in enumerate(df.columns)}
     values = df.values  # numpy object array, fast positional access
-    fi, la, mi, sf, do, ss, ei, dl, pp, ph, em, ad, ci, st, zp, pv = (
+    fi, la, mi, sf, do, ss, ei, dl, pp, ph, em, gv, ad, ci, st, zp, pv = (
         col_pos[COL_FIRST], col_pos[COL_LAST], col_pos[COL_MIDDLE], col_pos[COL_SUFFIX],
         col_pos[COL_DOB], col_pos[COL_SSN], col_pos[COL_EMPID], col_pos[COL_DL],
-        col_pos[COL_PASSPORT], col_pos[COL_PHONE], col_pos[COL_EMAIL], col_pos[COL_ADDR],
-        col_pos[COL_CITY], col_pos[COL_STATE], col_pos[COL_ZIP], col_pos[COL_PROVINCE],
+        col_pos[COL_PASSPORT], col_pos[COL_PHONE], col_pos[COL_EMAIL], col_pos[COL_GOVID],
+        col_pos[COL_ADDR], col_pos[COL_CITY], col_pos[COL_STATE], col_pos[COL_ZIP],
+        col_pos[COL_PROVINCE],
     )
     docid_pos = col_pos[COL_DOCID]
     for i in range(len(df)):
@@ -613,6 +618,7 @@ def build_records(df: pd.DataFrame):
         r.passport_ids = parse_id_tokens(row[pp])
         r.phones = parse_id_tokens(row[ph])
         r.emails = parse_id_tokens(row[em])
+        r.govids = parse_id_tokens(row[gv])
         r.addr = norm_street(row[ad])
         r.city = norm_text(row[ci])
         r.state = norm_text(row[st])
@@ -813,7 +819,7 @@ def compatible(a: str, b: str) -> bool:
 
 
 def _id_name_match(ids1: frozenset, ids2: frozenset, r1: Rec, r2: Rec) -> bool:
-    """Shared logic for Rules 4-7, 9: rows share at least one common ID
+    """Shared logic for Rules 4-7, 9-10: rows share at least one common ID
     token (from whichever ID field is being checked - see
     parse_id_tokens(), a cell can already contain multiple semicolon-joined
     IDs) AND have a compatible First+Last Name (see name_compat_match() -
@@ -853,6 +859,11 @@ def email_name_match(r1: Rec, r2: Rec) -> bool:
     return _id_name_match(r1.emails, r2.emails, r1, r2)
 
 
+def govid_name_match(r1: Rec, r2: Rec) -> bool:
+    """Step 10 - 'Government-Issued ID Number, Name' (see _id_name_match())."""
+    return _id_name_match(r1.govids, r2.govids, r1, r2)
+
+
 def address_name_match(r1: Rec, r2: Rec) -> bool:
     """Step 8 - 'Full Address, Name': Residential Address, City, State,
     Zip, and Province are each checked individually - blank on either side
@@ -866,7 +877,7 @@ def address_name_match(r1: Rec, r2: Rec) -> bool:
     incomplete/truncated entry, e.g. an initial like "J" for "Jeffrey",
     counts as compatible, not a mismatch) is always required here too,
     plus SSN/DOB each being matching-or-blank (compatible()), same as
-    Rules 4-7, 9. Zip is compared by its 5-digit prefix (zip5()), so a plain
+    Rules 4-7, 9-10. Zip is compared by its 5-digit prefix (zip5()), so a plain
     5-digit ZIP and its ZIP+4 form count as the same value, not a conflict
     and not a missed overlap. Street is compared via street_compat(), so
     '123 Abc Lane' vs '123 Abc Lane Apt 1' (unit detail on only one side)
@@ -898,6 +909,7 @@ def is_match(r1: Rec, r2: Rec) -> bool:
         or phone_name_match(r1, r2)
         or address_name_match(r1, r2)
         or email_name_match(r1, r2)
+        or govid_name_match(r1, r2)
     )
 
 
@@ -981,6 +993,9 @@ def bucket_candidate_pairs(recs):
         if r.emails and r.first and r.last:             # Rule 9: Email, Name
             for tok in r.emails:
                 buckets[("emailname", tok, r.first, r.last)].append(r.idx)
+        if r.govids and r.first and r.last:             # Rule 10: Government ID, Name
+            for tok in r.govids:
+                buckets[("govidname", tok, r.first, r.last)].append(r.idx)
         # Rule 8: Full Address, Name - bucket by each address FIELD
         # individually (not the whole address as one key), since
         # address_name_match() only needs ONE field to genuinely overlap.
@@ -1366,7 +1381,7 @@ def main() -> None:
             ssn_exists_match(r1, r2) or exact_name_dob_match(r1, r2)
             or empid_name_match(r1, r2) or dl_name_match(r1, r2)
             or passport_name_match(r1, r2) or phone_name_match(r1, r2)
-            or email_name_match(r1, r2)
+            or email_name_match(r1, r2) or govid_name_match(r1, r2)
         )
         aa, ab = group_addr[ra], group_addr[rb]
         if not strong_match:
@@ -1510,11 +1525,6 @@ def main() -> None:
     print(f"  {n_multi:,} merged groups combine 2+ original rows.")
     biggest = df_out["Rows Merged"].max()
     print(f"  Largest merged group: {biggest:,} rows.")
-    df_large_groups = df_out[df_out["Rows Merged"] > 50].sort_values("Rows Merged", ascending=False)
-    if len(df_large_groups):
-        print(f"  WARNING: {len(df_large_groups):,} group(s) merged >50 rows - "
-              f"usually a shared junk value (e.g. a fake SSN). See the "
-              f"'Large Group Review' sheet before trusting the output.")
 
     df_dob_conflict = pd.DataFrame(dob_conflict_rows)
     if len(df_dob_conflict):
@@ -1535,7 +1545,6 @@ def main() -> None:
         "Junk SSN Review": df_ssn_review,
         "Junk DOB Review": df_dob_review,
         "DOB Conflict Review": df_dob_conflict,
-        "Large Group Review": df_large_groups,
     })
     print(f"Done -> {OUTPUT_XLSX}")
     print("Reminder: save the output only to the secured/authorized folder for "
