@@ -81,7 +81,7 @@ moved) is far more likely than two different people sharing an SSN/DOB/ID
 (see group_addr/try_union() in main()).
 
 INPUT  : an Excel workbook with the columns listed in EXPECTED_COLS below.
-OUTPUT : a new Excel workbook with three sheets:
+OUTPUT : a new Excel workbook with four sheets:
          - "Merged Notification Data": ONE ROW PER CONFIRMED PERSON.
            - First Name, Middle Name, Last Name, and SSN: the single
              fullest/most complete value among the merged rows (placeholder
@@ -122,6 +122,11 @@ OUTPUT : a new Excel workbook with three sheets:
            ignored as unusable (a masked SSN with too few known digits) - so
            a real-looking SSN that got silently treated as blank doesn't go
            unnoticed (see classify_ssn_issue()).
+         - "Junk DOB Review": every row where a non-blank DOB value failed
+           to parse (an unrecognized format, e.g. a partially masked date)
+           - so a real DOB that got silently treated as blank, and could
+           otherwise bridge two different people together during merging,
+           doesn't go unnoticed (see classify_dob_issue()).
          - "Large Group Review": every merged group with more than 50 rows -
            usually a sign of a shared junk value (e.g. a fake SSN), worth a
            manual check before trusting the output.
@@ -519,6 +524,23 @@ def norm_dob(v) -> str:
     return "" if pd.isna(ts) else ts.strftime("%Y%m%d")
 
 
+def classify_dob_issue(v) -> str:
+    """Returns a short human-readable reason if a NON-BLANK DOB value failed
+    to parse via norm_dob() - '' if the value was already blank/empty, or
+    was parsed successfully. Used to build the 'Junk DOB Review' sheet: a
+    DOB that silently becomes blank (e.g. a partially masked value like
+    'XX/XX/1980', or any other format norm_dob() doesn't recognize) is
+    treated as compatible with everything during matching (blank never
+    conflicts), so it can silently bridge two different people together -
+    this surfaces that instead of letting it happen unnoticed."""
+    if v is None:
+        return ""
+    raw = str(v).strip()
+    if not raw or raw.lower() in ("nan", "none", "null"):
+        return ""
+    return "" if norm_dob(v) else "Unparseable DOB value - treated as blank"
+
+
 def parse_id_tokens(v) -> frozenset:
     """Splits an Employee ID / Driver's License / Passport / Phone cell into
     individual ID tokens. Cells may already contain multiple semicolon-
@@ -556,9 +578,12 @@ def build_records(df: pd.DataFrame):
     Also returns ssn_review: every (DOCID, Original SSN, Reason) where a
     non-blank SSN value was rejected by norm_ssn() (a masked SSN with too
     few known digits) - so a real-looking SSN that got silently treated as
-    blank doesn't go unnoticed."""
+    blank doesn't go unnoticed. Likewise returns dob_review: every (DOCID,
+    Original DOB, Reason) where a non-blank DOB value failed to parse via
+    norm_dob() (see classify_dob_issue())."""
     recs = []
     ssn_review = []
+    dob_review = []
     col_pos = {c: p for p, c in enumerate(df.columns)}
     values = df.values  # numpy object array, fast positional access
     fi, la, mi, sf, do, ss, ei, dl, pp, ph, em, ad, ci, st, zp, pv = (
@@ -597,7 +622,16 @@ def build_records(df: pd.DataFrame):
                 "Original SSN": row[ss],
                 "Remarks": reason,
             })
-    return recs, ssn_review
+
+        dob_reason = classify_dob_issue(row[do])
+        if dob_reason:
+            dob_review.append({
+                "DOCID": row[docid_pos],
+                "First Name": row[fi], "Last Name": row[la],
+                "Original DOB": row[do],
+                "Remarks": dob_reason,
+            })
+    return recs, ssn_review, dob_review
 
 
 # ------------------------------------------------------------
@@ -1242,10 +1276,13 @@ def main() -> None:
         )
     print(f"  {len(df):,} rows read.")
 
-    recs, ssn_review = build_records(df)   # recs[i].idx == i == df row position
+    recs, ssn_review, dob_review = build_records(df)   # recs[i].idx == i == df row position
     if ssn_review:
         print(f"  {len(ssn_review):,} SSN value(s) were ignored as junk/unusable "
               f"- see the 'Junk SSN Review' sheet.")
+    if dob_review:
+        print(f"  {len(dob_review):,} DOB value(s) failed to parse and were "
+              f"treated as blank - see the 'Junk DOB Review' sheet.")
 
     print("Clustering (blocked comparison) ...")
     pairs = bucket_candidate_pairs(recs)
@@ -1458,11 +1495,13 @@ def main() -> None:
               f"'Large Group Review' sheet before trusting the output.")
 
     df_ssn_review = pd.DataFrame(ssn_review)
+    df_dob_review = pd.DataFrame(dob_review)
 
     print(f"Writing {OUTPUT_XLSX} ...")
     _write_workbook(OUTPUT_XLSX, {
         "Merged Notification Data": df_out,
         "Junk SSN Review": df_ssn_review,
+        "Junk DOB Review": df_dob_review,
         "Large Group Review": df_large_groups,
     })
     print(f"Done -> {OUTPUT_XLSX}")
