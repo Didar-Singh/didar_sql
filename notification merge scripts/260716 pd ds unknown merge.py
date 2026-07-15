@@ -444,6 +444,20 @@ def norm_name(v) -> str:
     return s
 
 
+def is_unknown_name(v) -> bool:
+    """True ONLY for the literal '[Unknown]' placeholder (bracket/paren/
+    period/case-insensitive - '[Unknown]', '(unknown)', 'Unknown.' all
+    count), NOT a truly blank/empty cell and NOT any other placeholder like
+    'UNK', 'N/A', 'NONE' (see NAME_PLACEHOLDERS - norm_name() treats all of
+    those as equally blank, but the ID-merge bridge rules need to tell an
+    explicit '[Unknown]' entry apart from a cell with nothing typed in it
+    at all)."""
+    if v is None:
+        return False
+    core = re.sub(r"[^A-Z0-9]", "", norm_text(v))
+    return core == "UNKNOWN"
+
+
 SSN_MIN_KNOWN_OVERLAP = 4   # min matching KNOWN digits to trust a masked SSN
 
 
@@ -531,7 +545,8 @@ def parse_id_tokens(v) -> frozenset:
 class Rec:
     __slots__ = ("idx", "first", "last", "mid", "suffix", "dob", "ssn",
                  "empids", "dl_ids", "passport_ids", "phones", "emails",
-                 "govids", "addr", "city", "state", "zip", "province")
+                 "govids", "addr", "city", "state", "zip", "province",
+                 "name_bridge_ok")
 
     def __init__(self, idx):
         self.idx = idx
@@ -557,6 +572,13 @@ def build_records(df: pd.DataFrame):
         r = Rec(i)
         r.first = norm_name(row[fi])
         r.last = norm_name(row[la])
+        # Eligible to act as the "no real name" side of an ID-merge bridge
+        # (see _id_name_match_strong()) only if it has a real name, OR both
+        # First and Last are the literal "[Unknown]" placeholder - NOT if
+        # the cell is truly blank/empty (nothing typed at all).
+        r.name_bridge_ok = (
+            bool(r.first) and bool(r.last)
+        ) or (is_unknown_name(row[fi]) and is_unknown_name(row[la]))
         r.mid = norm_name(row[mi])
         r.suffix = norm_name(row[sf])
         r.dob = norm_dob(row[do])
@@ -767,15 +789,22 @@ def _id_name_match_strong(ids1: frozenset, ids2: frozenset, r1: Rec, r2: Rec) ->
 
     Unlike _id_name_match() (Phone/Email), a REAL name is not required on
     BOTH sides here - a shared Employee ID/DL/Passport/Gov ID is trusted
-    enough on its own to merge a row with a placeholder name (e.g.
-    "Unknown"/"UNK") into the same person as another row sharing that ID.
-    This is intentionally ONE-SIDED: it lets an Unknown/blank-name row
-    bridge to a real name, or to another Unknown/blank row, but two rows
-    that EACH have a real, genuinely differing name are NEVER merged here,
-    no matter what else matches (SSN/DOB agreeing is not trusted enough to
-    override an actual Name difference for this rule - only a blank/
-    placeholder name on at least one side is)."""
+    enough on its own to merge a row explicitly labeled "[Unknown]" into
+    the same person as another row sharing that ID. This is intentionally
+    ONE-SIDED: it lets an "[Unknown]" row bridge to a real name, or to
+    another "[Unknown]" row, but two rows that EACH have a real, genuinely
+    differing name are NEVER merged here, no matter what else matches
+    (SSN/DOB agreeing is not trusted enough to override an actual Name
+    difference for this rule - only an explicit "[Unknown]" on at least one
+    side is).
+
+    Critically, a row with NOTHING typed in First/Last at all (truly blank,
+    not the "[Unknown]" placeholder) does NOT get this bridging treatment -
+    see Rec.name_bridge_ok in build_records() / is_unknown_name() - it
+    never merges with anyone via this rule, even if it shares the ID."""
     if not (ids1 and ids2 and not ids1.isdisjoint(ids2)):
+        return False
+    if not (r1.name_bridge_ok and r2.name_bridge_ok):
         return False
     if name_conflict(r1, r2):
         return False
