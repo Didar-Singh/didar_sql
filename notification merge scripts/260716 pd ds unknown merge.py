@@ -766,23 +766,19 @@ def _id_name_match_strong(ids1: frozenset, ids2: frozenset, r1: Rec, r2: Rec) ->
     and DOB are each either matching or blank on both sides.
 
     Unlike _id_name_match() (Phone/Email), a REAL name is not required on
-    both sides here - a shared Employee ID/DL/Passport/Gov ID is trusted
+    BOTH sides here - a shared Employee ID/DL/Passport/Gov ID is trusted
     enough on its own to merge a row with a placeholder name (e.g.
-    "Unknown"/"UNK") into the same person as another row sharing that ID,
-    the same way Rule 1 already treats a blank/placeholder name as no
-    conflict for a shared SSN rather than a missing match.
-
-    A GENUINE Name conflict (a real, differing value on both sides) is
-    still normally refused - UNLESS a real DOB or SSN is known on BOTH
-    sides AND matches, which is trusted enough to confirm they're the same
-    person despite the Name difference (e.g. a legal name change on file)."""
+    "Unknown"/"UNK") into the same person as another row sharing that ID.
+    This is intentionally ONE-SIDED: it lets an Unknown/blank-name row
+    bridge to a real name, or to another Unknown/blank row, but two rows
+    that EACH have a real, genuinely differing name are NEVER merged here,
+    no matter what else matches (SSN/DOB agreeing is not trusted enough to
+    override an actual Name difference for this rule - only a blank/
+    placeholder name on at least one side is)."""
     if not (ids1 and ids2 and not ids1.isdisjoint(ids2)):
         return False
     if name_conflict(r1, r2):
-        dob_confirms = bool(r1.dob) and bool(r2.dob) and r1.dob == r2.dob
-        ssn_confirms = bool(r1.ssn) and bool(r2.ssn) and r1.ssn == r2.ssn
-        if not (dob_confirms or ssn_confirms):
-            return False
+        return False
     return compatible(r1.ssn, r2.ssn) and compatible(r1.dob, r2.dob)
 
 
@@ -1339,21 +1335,21 @@ def main() -> None:
             refused_dob += 1
             return   # would combine two different real DOBs - refused
         r1, r2 = recs[a_idx], recs[b_idx]
-        # A real, matching DOB or SSN between THIS pair is trusted enough to
-        # confirm they're the same person despite a Name difference (see
-        # _id_name_match_strong()) - so it also bypasses the group-level
-        # Name-bridging guard just below, the same way strong_match (further
-        # down) bypasses the address-bridging guard.
-        name_pair_confirmed = (
-            (bool(r1.dob) and bool(r2.dob) and r1.dob == r2.dob)
-            or (bool(r1.ssn) and bool(r2.ssn) and r1.ssn == r2.ssn)
-        )
+        # A mismatch on EITHER First OR Last (both known, and disjoint) is
+        # enough to refuse - a shared Last Name alone (e.g. two different
+        # "Holland"s) is NOT enough to treat two genuinely different First
+        # names as the same person. Only an Unknown/blank-name row is meant
+        # to bridge here (into a real name, or into another Unknown row) -
+        # two rows/groups that EACH have a real, differing name must never
+        # merge through such a bridge, no exceptions (not even a matching
+        # SSN/DOB - see _id_name_match_strong()).
         fa1, fa2 = group_first[ra], group_first[rb]
         la1, la2 = group_last[ra], group_last[rb]
-        if not name_pair_confirmed:
-            if fa1 and fa2 and la1 and la2 and fa1.isdisjoint(fa2) and la1.isdisjoint(la2):
-                refused_name += 1
-                return   # would combine two rows/groups with genuinely different real names - refused
+        first_conflict = bool(fa1) and bool(fa2) and fa1.isdisjoint(fa2)
+        last_conflict = bool(la1) and bool(la2) and la1.isdisjoint(la2)
+        if first_conflict or last_conflict:
+            refused_name += 1
+            return   # would combine two rows/groups with genuinely different real names - refused
         # A STRONG match (SSN, Name+DOB, or any ID+Name rule) is trusted
         # enough to override a conflicting address on its own - e.g. the
         # same SSN turning up with two different addresses on file is far
