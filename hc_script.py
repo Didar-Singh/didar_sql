@@ -41,14 +41,7 @@ strict priority levels (see LEVEL_ORDER below), built step by step:
                         compatible, not a mismatch) are merged, as long as
                         SSN and DOB are each either matching or blank on
                         both sides (a real, differing value on both sides
-                        blocks it), AND Address doesn't actively conflict
-                        (blank on either side is fine, but a real, differing
-                        Residential Address/City/State/Zip/Province blocks
-                        it - this match is only ever a compatible, not
-                        exact, name, so a conflicting address is treated as
-                        evidence these are two different people who happen
-                        to share that Employee ID, not one person who
-                        moved).
+                        blocks it).
   Rule 5 (Driver's License, Name): same as Rule 4, but matched on Driver's
                         License Number instead of Employee ID.
   Rule 6 (Passport Number, Name): same as Rule 4, but matched on Passport
@@ -170,13 +163,18 @@ already share an exact SSN, an exact First+Last Name+DOB, a Last Name, or
 an Employee ID + Name - instead of comparing every row to every other row).
 
 Install once:
-    pip install pandas openpyxl pyxlsb
+    pip install pandas openpyxl pyxlsb xlsxwriter
+    pip install python-calamine   # optional - much faster reader, used if present
+    pip install pywin32           # optional - only needed to also emit a .xlsb
+                                   # output (Excel COM automation; Windows + a
+                                   # local Excel install required)
 
 Run:
     python "260711 pd ds notification merge.py"
 """
 
 import sys
+import os
 import re
 import time
 import itertools
@@ -184,21 +182,18 @@ import unicodedata
 from collections import defaultdict
 from multiprocessing import Pool
 
+import numpy as np
 import pandas as pd
 
 # Worker processes for the pairwise clustering step (the slowest phase on
 # large files). Plain `threading` would NOT help here - the match functions
 # are pure CPU-bound Python, and the GIL serializes threads so they'd just
 # take turns instead of running in parallel. Separate processes actually
-# parallelize it. Measured (not guessed): raising this past 4 on an 8-logical-
-# core dev machine showed NO steady-state improvement (results were within
-# noise of each other, sometimes slightly worse) - each row's match check is
-# cheap enough that IPC/chunk overhead outweighs the extra parallelism, and
-# logical (hyperthreaded) cores don't add real throughput for CPU-bound pure
-# Python work the way physical cores do. If profiling on the actual
-# production machine (see the per-level timing this script now prints) shows
-# workers sitting idle, raise this - but don't assume more is faster.
-PARALLEL_WORKERS = 4
+# parallelize it. Scales to the machine's own core count (leaving one core
+# free for the main process, which is still doing sequential Union-Find
+# bookkeeping while workers churn) instead of a fixed 4 - a fixed count left
+# real cores idle on any machine with more than 5.
+PARALLEL_WORKERS = max(1, (os.cpu_count() or 4) - 1)
 # Below this many candidate pairs, run single-process instead - spinning up
 # worker processes has real overhead (~tens of ms each) that isn't worth it
 # for a small/quick run.
@@ -257,6 +252,12 @@ def progress(label: str, current: int, total: int, extra: str = "") -> None:
 INPUT_XLSX  = "Cng Notification_Final_updated.xlsb"
 INPUT_SHEET = 0
 OUTPUT_XLSX = "260711 re ds notification merge output.xlsx"
+# .xlsb version of the same output, produced via Excel COM automation after
+# the .xlsx is written (see _convert_to_xlsb()) - pandas/openpyxl/xlsxwriter
+# have no way to WRITE .xlsb directly, only pyxlsb can READ it. Requires
+# `pip install pywin32` and a local Excel install (Windows only); if either
+# is missing, the .xlsx above is still produced and kept as the real output.
+OUTPUT_XLSB = "260711 re ds notification merge output.xlsb"
 
 COL_DOCID  = "DOCIDs"
 COL_FIRST  = "First Name"
@@ -856,11 +857,7 @@ def address_conflict(r1: Rec, r2: Rec) -> bool:
     real but DIFFERENT unit numbers, count as a conflict. Used to block
     Rule 8 from merging two same-named people whose addresses actively
     disagree - matching name alone isn't enough when the address itself
-    contradicts it. Also used (see _id_name_match()) to block Rules 4-7, 9 -
-    a shared Employee ID/DL/Passport/Phone/Email plus a merely COMPATIBLE
-    (not exact) name is weak enough evidence that a real, conflicting address
-    is treated as a sign these are two different people who happen to share
-    that ID/contact value, not one person who moved."""
+    contradicts it."""
     if not street_compat(r1.addr, r2.addr):
         return True
     fields1 = (r1.city, r1.state, zip5(r1.zip), r1.province)
@@ -883,17 +880,10 @@ def _id_name_match(ids1: frozenset, ids2: frozenset, r1: Rec, r2: Rec) -> bool:
     an incomplete/truncated entry, e.g. an initial like "J" for "Jeffrey",
     counts as compatible, not a mismatch), AND SSN and DOB are each either
     matching or blank on both sides (a real, differing value on either
-    blocks it), AND Address doesn't actively conflict (address_conflict() -
-    blank on either side is fine, but a real, differing address is treated
-    as evidence these are two different people who happen to share that
-    Employee ID/DL/Passport/Phone/Email, not one person who moved - this
-    match is only ever a compatible-name, not an exact one, so it's weaker
-    evidence than SSN and a conflicting address is enough to block it)."""
+    blocks it)."""
     if not (ids1 and ids2 and not ids1.isdisjoint(ids2)):
         return False
     if not name_compat_match(r1, r2):
-        return False
-    if address_conflict(r1, r2):
         return False
     return compatible(r1.ssn, r2.ssn) and compatible(r1.dob, r2.dob)
 
@@ -1086,10 +1076,14 @@ def describe_bucket_key(key) -> str:
 
 def bucket_candidate_pairs(recs):
     """Returns (level_pairs, biggest_buckets):
-      - level_pairs: {level: set_of_candidate_pairs}, one set per LEVEL_ORDER
-        entry. Each level's pairs are bucketed - and later tested -
-        independently, so levels can be processed strictly in priority order
-        (see main()).
+      - level_pairs: {level: list_of_candidate_pairs}, one deduped list per
+        LEVEL_ORDER entry (a pair can be produced more than once within a
+        level - e.g. two rows sharing 2 different Employee ID tokens, or the
+        3 separate Address sub-buckets - so a dedup pass is still needed, just
+        done once in bulk via numpy at the end instead of per-insert via a
+        Python set, which is far cheaper at large candidate-pair counts).
+        Each level's pairs are bucketed - and later tested - independently,
+        so levels can be processed strictly in priority order (see main()).
       - biggest_buckets: the 5 largest buckets overall (key, row count) -
         diagnostic only, so a single low-cardinality value (e.g. a common
         City) that's silently blowing up one level's candidate-pair count
@@ -1128,14 +1122,34 @@ def bucket_candidate_pairs(recs):
         # would make that one bucket's pairwise comparison extremely slow. A
         # real matching address almost always also shares City or Zip, so
         # this loses very little real coverage.
-        if r.addr:
-            buckets[(LEVEL_ADDRESS, "addr", r.addr)].append(r.idx)
-        if r.city:
-            buckets[(LEVEL_ADDRESS, "city", r.city)].append(r.idx)
-        if r.zip:
-            buckets[(LEVEL_ADDRESS, "zip", r.zip)].append(r.idx)
+        #
+        # Two more refinements, both provably lossless (they can never drop
+        # a true match, only skip pairs that address_name_match() would have
+        # rejected anyway):
+        #   1) Only bucket a row here if First AND Last Name are both real -
+        #      address_name_match() requires name_compat_match(), which
+        #      itself requires both non-blank on both sides, so a row with
+        #      either blank can NEVER match at this level. Previously such
+        #      rows still inflated a shared City/Zip bucket for nothing.
+        #   2) Split each bucket further by the first character of Last
+        #      Name. Two names that name_prefix_compat() would call
+        #      compatible are either identical or one is a literal PREFIX of
+        #      the other - either way they always share the same first
+        #      character. So two rows that could possibly pass
+        #      name_compat_match() always land in the same first-character
+        #      sub-bucket; this only splits apart rows whose last names
+        #      start with different letters, which could never have matched
+        #      anyway. On a file where one City/Zip is shared by thousands
+        #      of unrelated people, this cuts the quadratic candidate-pair
+        #      count from that bucket by roughly 26x on average.
+        if r.addr and r.first and r.last:
+            buckets[(LEVEL_ADDRESS, "addr", r.addr, r.last[0])].append(r.idx)
+        if r.city and r.first and r.last:
+            buckets[(LEVEL_ADDRESS, "city", r.city, r.last[0])].append(r.idx)
+        if r.zip and r.first and r.last:
+            buckets[(LEVEL_ADDRESS, "zip", r.zip, r.last[0])].append(r.idx)
 
-    level_pairs = {lvl: set() for lvl in LEVEL_ORDER}
+    level_pair_lists = {lvl: [] for lvl in LEVEL_ORDER}
     total = len(buckets)
     biggest_buckets = []   # min-heap-free top-5 via simple insert (total buckets can be huge, keep this O(total*5))
     for n, (key, idxs) in enumerate(buckets.items(), 1):
@@ -1147,9 +1161,19 @@ def bucket_candidate_pairs(recs):
             biggest_buckets.sort(key=lambda t: -t[0])
             del biggest_buckets[5:]
         level = key[0]
-        for a, b in itertools.combinations(sorted(idxs), 2):
-            level_pairs[level].add((a, b))
+        level_pair_lists[level].extend(itertools.combinations(sorted(idxs), 2))
     biggest_buckets.sort(key=lambda t: -t[0])
+
+    # Dedup each level's pairs in one bulk numpy pass instead of hashing every
+    # tuple into a Python set as it's produced - same end result (each pair
+    # tested exactly once per level), much cheaper at large candidate counts.
+    level_pairs = {}
+    for lvl, pairs in level_pair_lists.items():
+        if not pairs:
+            level_pairs[lvl] = []
+            continue
+        arr = np.unique(np.array(pairs, dtype=np.int64), axis=0)
+        level_pairs[lvl] = list(map(tuple, arr.tolist()))
     return level_pairs, biggest_buckets[:5]
 
 
@@ -1271,6 +1295,18 @@ def zip_key(v) -> str:
     return z5 if z5 else norm_text(v)
 
 
+def _address_field_norm(col, v) -> str:
+    """Per-field normalization used by BOTH address_key() (multi-row grouping)
+    and the singleton fast path in main() - factored out to one place so the
+    two paths can never silently drift apart on what counts as a blank vs.
+    real value for a given address field."""
+    if col == COL_ZIP:
+        return zip_key(v)
+    if col == COL_ADDR:
+        return norm_street(v)
+    return norm_text(v)
+
+
 def address_key(values) -> tuple:
     """Normalized tuple used to tell whether two rows have the SAME address
     (all fields blank-insensitive) - used to find the majority address.
@@ -1280,13 +1316,7 @@ def address_key(values) -> tuple:
     vs its ZIP+4 form, and '123 West Lane' vs '123 W Ln', each count as the
     SAME address here - matching how they're already treated during merging
     (see zip5() / norm_street())."""
-    def _key(col, v):
-        if col == COL_ZIP:
-            return zip_key(v)
-        if col == COL_ADDR:
-            return norm_street(v)
-        return norm_text(v)
-    return tuple(_key(col, v) for col, v in zip(ADDRESS_COLS, values))
+    return tuple(_address_field_norm(col, v) for col, v in zip(ADDRESS_COLS, values))
 
 
 def address_key_conflict(k1: tuple, k2: tuple) -> bool:
@@ -1322,7 +1352,7 @@ def format_full_address(values) -> str:
     return ", ".join(parts)
 
 
-def split_addresses(df, group_idxs):
+def split_addresses(values_arr, addr_col_pos, group_idxs):
     """Returns (majority_values, other_address_string) for one merged group.
 
     Rows are first bucketed by their exact normalized address_key() (blank-
@@ -1344,7 +1374,12 @@ def split_addresses(df, group_idxs):
     key_count = {}       # key -> row count
     key_raw = {}         # key -> first-seen raw ADDRESS_COLS values
     for idx in group_idxs:
-        raw = tuple(df.at[idx, c] for c in ADDRESS_COLS)
+        row = values_arr[idx]
+        # Raw positional numpy access instead of df.at[idx, c] per field -
+        # df.at does a label lookup on every call, which adds up across
+        # every row x every address field of every multi-row group. This is
+        # byte-identical to the old df.at-based lookup, just faster.
+        raw = tuple(row[p] for p in addr_col_pos)
         key = address_key(raw)
         if key not in key_count:
             key_count[key] = 0
@@ -1409,15 +1444,27 @@ def split_addresses(df, group_idxs):
     return cluster_values(majority_cluster), MERGE_SEP.join(other_strings)
 
 
+def _pick_read_engine(path: str) -> str:
+    """python-calamine (Rust-backed) reads large .xlsb/.xlsx workbooks far
+    faster than pyxlsb/openpyxl - used automatically when the optional
+    `python-calamine` package is installed (`pip install python-calamine`),
+    falling back to the engine pandas would otherwise pick (pyxlsb is
+    required for .xlsb - pandas can't infer it the way it does for
+    .xlsx/.xls) if that package isn't present."""
+    try:
+        import python_calamine  # noqa: F401
+        return "calamine"
+    except ImportError:
+        return "pyxlsb" if path.lower().endswith(".xlsb") else None
+
+
 # ------------------------------------------------------------
 # 8) Main
 # ------------------------------------------------------------
 def main() -> None:
     run_start = time.monotonic()
     print(f"Reading {INPUT_XLSX} ...")
-    # .xlsb (Excel Binary Workbook) needs the pyxlsb engine explicitly -
-    # pandas can't infer it the way it does for .xlsx/.xls.
-    engine = "pyxlsb" if INPUT_XLSX.lower().endswith(".xlsb") else None
+    engine = _pick_read_engine(INPUT_XLSX)
     t0 = time.monotonic()
     df = pd.read_excel(INPUT_XLSX, sheet_name=INPUT_SHEET, dtype=str, engine=engine)
     df.columns = [str(c).strip() for c in df.columns]
@@ -1654,13 +1701,72 @@ def main() -> None:
     out_rows = []
     docid_overflow_groups = 0
     max_docid_cols = 1
+
+    # Raw positional access (numpy array + column-position map), reused below
+    # for the singleton fast path - avoids pandas' per-call indexing overhead
+    # (df.iloc[...]/df[col]) for the common case of a group that's just one
+    # untouched row, which on a large file is most of them (only rows that
+    # actually matched another row need the full sub-DataFrame machinery).
+    values_arr = df.values
+    col_pos = {c: p for p, c in enumerate(df.columns)}
+    semicol_col_pos = [col_pos[c] for c in SEMICOLON_COLS]
+    addr_col_pos = [col_pos[c] for c in ADDRESS_COLS]
+    dob_pos, first_pos, last_pos, mid_pos, suffix_pos, ssn_pos = (
+        col_pos[COL_DOB], col_pos[COL_FIRST], col_pos[COL_LAST],
+        col_pos[COL_MIDDLE], col_pos[COL_SUFFIX], col_pos[COL_SSN],
+    )
+
     for n, group_idxs in enumerate(groups, 1):
         progress("Building output", n, total_groups)
-        sub = df.iloc[group_idxs]           # O(group size), not O(n)
+
+        if len(group_idxs) == 1:
+            # Fast path: nothing to merge, so skip df.iloc/sub-frame
+            # construction and split_addresses()'s (otherwise-harmless but
+            # pointless for 1 row) address clustering - just run each
+            # existing merge helper on this single row's own values, which
+            # produces byte-identical output to the general path below.
+            i = group_idxs[0]
+            rv = values_arr[i]
+            rec = recs[i]
+            row = {c: semicolon_merge([rv[p]]) for c, p in zip(SEMICOLON_COLS, semicol_col_pos)}
+            row[COL_DOB] = dob_merge([rv[dob_pos]])
+
+            docid_chunks = split_docid_chunks(row[COL_DOCID])
+            row[COL_DOCID] = docid_chunks[0]
+            for extra_i, chunk in enumerate(docid_chunks[1:], start=2):
+                row[f"{COL_DOCID} {extra_i}"] = chunk
+            if len(docid_chunks) > 1:
+                docid_overflow_groups += 1
+                max_docid_cols = max(max_docid_cols, len(docid_chunks))
+
+            row[COL_FIRST] = fullest_value([rv[first_pos]], [rec.first])
+            row[COL_LAST] = fullest_value([rv[last_pos]], [rec.last])
+            row[COL_MIDDLE] = fullest_value([rv[mid_pos]], [rec.mid])
+            row[COL_SUFFIX] = fullest_value([rv[suffix_pos]], [norm_text(rv[suffix_pos])])
+            row[COL_SSN] = fullest_value([rv[ssn_pos]], [rec.ssn])
+
+            for c, p in zip(ADDRESS_COLS, addr_col_pos):
+                raw = rv[p]
+                norm = _address_field_norm(c, raw)
+                row[c] = "" if not norm else ("" if raw is None else str(raw).strip())
+            row["Other Address"] = ""
+
+            row["Rows Merged"] = 1
+            row["Names Differ"] = False
+            out_rows.append(row)
+            continue
+
+        # Raw positional numpy access (values_arr[i][pos]) instead of
+        # df.iloc[group_idxs] - building a pandas sub-DataFrame per group has
+        # real per-call overhead (index alignment, dtype bookkeeping) that
+        # adds up across tens of thousands of small groups. This produces
+        # byte-identical output to the old sub-DataFrame-based path.
+        sub_rows = [values_arr[i] for i in group_idxs]
         sub_recs = [recs[i] for i in group_idxs]
 
-        row = {c: semicolon_merge(sub[c]) for c in SEMICOLON_COLS}
-        row[COL_DOB] = dob_merge(sub[COL_DOB])
+        row = {c: semicolon_merge([r[p] for r in sub_rows])
+               for c, p in zip(SEMICOLON_COLS, semicol_col_pos)}
+        row[COL_DOB] = dob_merge([r[dob_pos] for r in sub_rows])
 
         # A group merging enough rows can produce a DOCID string longer than
         # Excel's 32,767-char cell limit (silently truncated otherwise) -
@@ -1674,19 +1780,22 @@ def main() -> None:
             docid_overflow_groups += 1
             max_docid_cols = max(max_docid_cols, len(docid_chunks))
 
-        row[COL_FIRST] = fullest_value(sub[COL_FIRST], [r.first for r in sub_recs])
-        row[COL_LAST] = fullest_value(sub[COL_LAST], [r.last for r in sub_recs])
-        row[COL_MIDDLE] = fullest_value(sub[COL_MIDDLE], [r.mid for r in sub_recs])
-        row[COL_SUFFIX] = fullest_value(sub[COL_SUFFIX], [norm_text(v) for v in sub[COL_SUFFIX]])
-        row[COL_SSN] = fullest_value(sub[COL_SSN], [r.ssn for r in sub_recs])
+        first_vals = [r[first_pos] for r in sub_rows]
+        last_vals = [r[last_pos] for r in sub_rows]
+        suffix_vals = [r[suffix_pos] for r in sub_rows]
+        row[COL_FIRST] = fullest_value(first_vals, [r.first for r in sub_recs])
+        row[COL_LAST] = fullest_value(last_vals, [r.last for r in sub_recs])
+        row[COL_MIDDLE] = fullest_value([r[mid_pos] for r in sub_rows], [r.mid for r in sub_recs])
+        row[COL_SUFFIX] = fullest_value(suffix_vals, [norm_text(v) for v in suffix_vals])
+        row[COL_SSN] = fullest_value([r[ssn_pos] for r in sub_rows], [r.ssn for r in sub_recs])
 
-        majority_addr_values, other_address = split_addresses(df, group_idxs)
+        majority_addr_values, other_address = split_addresses(values_arr, addr_col_pos, group_idxs)
         for c, v in zip(ADDRESS_COLS, majority_addr_values):
             row[c] = v
         row["Other Address"] = other_address
 
         row["Rows Merged"] = len(group_idxs)
-        row["Names Differ"] = has_variation(sub[COL_FIRST]) or has_variation(sub[COL_LAST])
+        row["Names Differ"] = has_variation(first_vals) or has_variation(last_vals)
         out_rows.append(row)
 
     df_out = pd.DataFrame(out_rows)
@@ -1709,8 +1818,22 @@ def main() -> None:
     new_order.extend(extra_cols)
     df_out = df_out[new_order]
 
+    # Final safety-net check ONLY - not part of the merge logic itself. The
+    # matching rules above never produce two output rows for the same
+    # person on purpose; this just catches the case where two DIFFERENT
+    # groups happened to collapse to an identical row across EVERY column
+    # (e.g. two distinct small groups whose merged values are all blank/
+    # identical) and drops the extra copy, keeping the first occurrence.
+    dup_mask = df_out.duplicated(keep="first")
+    n_dupes = int(dup_mask.sum())
+    if n_dupes:
+        df_out = df_out[~dup_mask].reset_index(drop=True)
+
     df_out = df_out.sort_values(["Rows Merged"], ascending=False).reset_index(drop=True)
     print(f"  Output built. ({time.monotonic() - t0:.1f}s)")
+    if n_dupes:
+        print(f"  {n_dupes:,} fully-duplicate output row(s) removed "
+              f"(final check only - every column was identical to another row).")
 
     if docid_overflow_groups:
         print(f"  {docid_overflow_groups:,} group(s) had a DOCID list too long for one "
@@ -1739,14 +1862,24 @@ def main() -> None:
         "Large Group Review": df_large_groups,
     })
     print(f"  Written. ({time.monotonic() - t0:.1f}s)")
-    print(f"Done -> {OUTPUT_XLSX}  (total runtime {_format_duration(time.monotonic() - run_start)})")
+
+    t0 = time.monotonic()
+    if _convert_to_xlsb(OUTPUT_XLSX, OUTPUT_XLSB):
+        print(f"  {OUTPUT_XLSB} written. ({time.monotonic() - t0:.1f}s)")
+        print(f"Done -> {OUTPUT_XLSX} and {OUTPUT_XLSB} "
+              f"(total runtime {_format_duration(time.monotonic() - run_start)})")
+    else:
+        print(f"Done -> {OUTPUT_XLSX}  (total runtime {_format_duration(time.monotonic() - run_start)})")
     print("Reminder: save the output only to the secured/authorized folder for "
           "this data - never a desktop or personal drive. It contains SSN, "
           "DOB, and other PII/PHI.")
 
 
 def _write_workbook(path, sheets: dict):
-    with pd.ExcelWriter(path, engine="openpyxl") as xl:
+    # xlsxwriter instead of openpyxl - notably faster writing a sheet of this
+    # size, with no feature this script needs (no cell formatting/formulas
+    # applied here) given up in the swap.
+    with pd.ExcelWriter(path, engine="xlsxwriter") as xl:
         for sheet, df in sheets.items():
             if len(df) > EXCEL_MAX_ROWS:
                 csv_name = path.replace(".xlsx", f" {sheet}.csv")
@@ -1756,6 +1889,41 @@ def _write_workbook(path, sheets: dict):
                              ).to_excel(xl, sheet_name=sheet, index=False)
             else:
                 df.to_excel(xl, sheet_name=sheet, index=False)
+
+
+def _convert_to_xlsb(xlsx_path: str, xlsb_path: str) -> bool:
+    """Saves a copy of the already-written .xlsx workbook as .xlsb via Excel
+    COM automation (FileFormat 50 = xlsb) - the only reliable way to WRITE
+    .xlsb, since no Python library (pandas/openpyxl/xlsxwriter/pyxlsb) can.
+    Requires `pywin32` and a local Excel install; returns False (and leaves
+    the .xlsx as the real output) if either isn't available, rather than
+    failing the whole run over an optional secondary format."""
+    try:
+        import win32com.client as win32
+    except ImportError:
+        print("  Skipping .xlsb output - pywin32 isn't installed "
+              "(`pip install pywin32`). Kept the .xlsx output.")
+        return False
+
+    abs_xlsx, abs_xlsb = os.path.abspath(xlsx_path), os.path.abspath(xlsb_path)
+    excel = None
+    try:
+        excel = win32.gencache.EnsureDispatch("Excel.Application")
+        excel.Visible = False
+        excel.DisplayAlerts = False
+        wb = excel.Workbooks.Open(abs_xlsx)
+        try:
+            wb.SaveAs(abs_xlsb, FileFormat=50)
+        finally:
+            wb.Close(SaveChanges=False)
+        return True
+    except Exception as exc:
+        print(f"  Skipping .xlsb output - Excel COM conversion failed: {exc}. "
+              f"Kept the .xlsx output.")
+        return False
+    finally:
+        if excel is not None:
+            excel.Quit()
 
 
 if __name__ == "__main__":
