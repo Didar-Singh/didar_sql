@@ -1,10 +1,16 @@
 """
 dat_to_sqlserver.py
-Load a Concordance/Relativity .dat load file directly into SQL Server.
+Load a Concordance/Relativity .dat load file (or a standard .csv file)
+directly into SQL Server. Format is auto-detected from the file extension.
 
-Field format:  þvalueþ\x14þvalueþ...
+.dat field format:  þvalueþ\x14þvalueþ...
     þ  (thorn, \xFE) = text qualifier wrapping each field
     \x14 (ASCII 20)  = column separator
+
+.csv field format: standard RFC4180 -- comma-separated, double-quote
+    qualifier, "" as an escaped quote. Parsed with Python's csv module,
+    so quoted commas and embedded newlines inside a field are handled
+    correctly (not just split line-by-line).
 
 Features:
     * Loads into an EXISTING table (does NOT drop it). It reads the table's
@@ -39,11 +45,13 @@ RUN COMMANDS
     #   schema.Table             -> goes to DEFAULT_DATABASE.schema.Table
     #   Database.schema.Table    -> goes to the database you name
     python dat_to_sqlserver.py "Objects_1000125_export Part 2.dat" MyDatabase.dbo.Objects_1000125
+    python dat_to_sqlserver.py "export.csv" MyDatabase.dbo.MyTable
 ------------------------------------------------------------------------------
 Set SERVER (and SQL login if not using Windows auth) below before running.
 The target DATABASE must already exist; the script creates the TABLE.
 Keep real credentials out of source control.
 """
+import csv
 import os
 import re
 import sys
@@ -242,18 +250,35 @@ def sql_type(max_len: int) -> str:
     return f"NVARCHAR({min(buffered, 4000)})"
 
 
+def is_csv_file(path: Path) -> bool:
+    return path.suffix.lower() == ".csv"
+
+
+def dedupe_cols(cols):
+    seen = {}
+    out = []
+    for c in cols:
+        if c in seen:
+            seen[c] += 1
+            out.append(f"{c}_{seen[c]}")
+        else:
+            seen[c] = 0
+            out.append(c)
+    return out
+
+
 def read_header(fin):
     header = fin.readline().strip()
     raw_headers = header.split(DELIMITER)
-    cols = [clean_col(c, i) for i, c in enumerate(raw_headers)]
-    seen = {}
-    for i, c in enumerate(cols):
-        if c in seen:
-            seen[c] += 1
-            cols[i] = f"{c}_{seen[c]}"
-        else:
-            seen[c] = 0
+    cols = dedupe_cols([clean_col(c, i) for i, c in enumerate(raw_headers)])
     return header, cols
+
+
+def read_header_csv(fin):
+    """Read the header row of a .csv file via the csv module (handles a
+    quoted header name that itself contains a comma)."""
+    raw_headers = next(csv.reader(fin))
+    return dedupe_cols([clean_col(c, i) for i, c in enumerate(raw_headers)])
 
 
 def get_row_count(cur, full_table) -> int:
@@ -377,35 +402,65 @@ def main():
     total_bytes = os.path.getsize(dat_path)
     start_time = time.time()
 
+    is_csv = is_csv_file(dat_path)
+    open_kwargs = dict(encoding="utf-8-sig", errors="ignore")
+    if is_csv:
+        open_kwargs["newline"] = ""  # required by the csv module
+    print(f"Detected format: {'CSV' if is_csv else 'DAT'} (from file extension)")
+
     # ---------------- PASS 1: analyse (measure max length per column) --------
     print("PASS 1/2  Analysing file to size columns (no data written yet)...")
-    with open(dat_path, "r", encoding="utf-8-sig", errors="ignore") as fin:
-        header, cols = read_header(fin)
+    header = None
+    with open(dat_path, "r", **open_kwargs) as fin:
+        if is_csv:
+            cols = read_header_csv(fin)
+            processed = fin.tell()
+        else:
+            header, cols = read_header(fin)
+            processed = len(header.encode("utf-8", "ignore"))
         ncols = len(cols)
         stats = [ColumnStats(c) for c in cols]
         print(f"{ncols} columns detected. Target: {full_table}")
 
-        processed = len(header.encode("utf-8", "ignore"))
         total_rows = blank_skipped = 0
         padded, trimmed = [], []
 
-        for line_no, line in enumerate(fin, start=2):
-            processed += len(line.encode("utf-8", "ignore"))
-            if not line.strip():
-                blank_skipped += 1
-                continue
-            values = [v.strip("þ \r\n") for v in line.split(DELIMITER)]
-            if len(values) < ncols:
-                padded.append(line_no)
-                values += [""] * (ncols - len(values))
-            elif len(values) > ncols:
-                trimmed.append(line_no)
-            values = values[:ncols]
-            for i in range(ncols):
-                stats[i].observe(values[i])
-            total_rows += 1
-            if total_rows % 1000 == 0:
-                render_progress(processed, total_bytes, start_time, total_rows)
+        if is_csv:
+            for line_no, raw_values in enumerate(csv.reader(fin), start=2):
+                processed = fin.tell()
+                values = [v.strip() for v in raw_values]
+                if not any(values):
+                    blank_skipped += 1
+                    continue
+                if len(values) < ncols:
+                    padded.append(line_no)
+                    values += [""] * (ncols - len(values))
+                elif len(values) > ncols:
+                    trimmed.append(line_no)
+                values = values[:ncols]
+                for i in range(ncols):
+                    stats[i].observe(values[i])
+                total_rows += 1
+                if total_rows % 1000 == 0:
+                    render_progress(processed, total_bytes, start_time, total_rows)
+        else:
+            for line_no, line in enumerate(fin, start=2):
+                processed += len(line.encode("utf-8", "ignore"))
+                if not line.strip():
+                    blank_skipped += 1
+                    continue
+                values = [v.strip("þ \r\n") for v in line.split(DELIMITER)]
+                if len(values) < ncols:
+                    padded.append(line_no)
+                    values += [""] * (ncols - len(values))
+                elif len(values) > ncols:
+                    trimmed.append(line_no)
+                values = values[:ncols]
+                for i in range(ncols):
+                    stats[i].observe(values[i])
+                total_rows += 1
+                if total_rows % 1000 == 0:
+                    render_progress(processed, total_bytes, start_time, total_rows)
     render_progress(total_bytes, total_bytes, start_time, total_rows)
     print(f"\nAnalysis done: {total_rows:,} rows. Creating right-sized table...")
 
@@ -457,28 +512,54 @@ def main():
     seen = 0            # data rows scanned so far (matches the checkpoint counter)
     rows_loaded = resume_from
     try:
-        with open(dat_path, "r", encoding="utf-8-sig", errors="ignore") as fin:
-            fin.readline()  # skip header
-            processed = len(header.encode("utf-8", "ignore"))
+        with open(dat_path, "r", **open_kwargs) as fin:
+            if is_csv:
+                reader = csv.reader(fin)
+                next(reader)  # skip header
+                processed = fin.tell()
+            else:
+                fin.readline()  # skip header
+                processed = len(header.encode("utf-8", "ignore"))
             batch = []
-            for line in fin:
-                processed += len(line.encode("utf-8", "ignore"))
-                if not line.strip():
-                    continue
-                seen += 1
-                if seen <= resume_from:
-                    continue                # already loaded on a previous run
-                values = [v.strip("þ \r\n") for v in line.split(DELIMITER)]
-                if len(values) < ncols:
-                    values += [""] * (ncols - len(values))
-                values = values[:ncols]
-                row = [values[i] for i in load_idx]
-                batch.append([v if v != "" else None for v in row])
-                if len(batch) >= BATCH_SIZE:
-                    commit_batch(cur, conn, insert_sql, batch)   # retries transient errors
-                    rows_loaded = seen                           # committed -> resumable
-                    batch.clear()
-                    render_progress(processed, total_bytes, load_start, rows_loaded)
+
+            if is_csv:
+                for raw_values in reader:
+                    processed = fin.tell()
+                    values = [v.strip() for v in raw_values]
+                    if not any(values):
+                        continue
+                    seen += 1
+                    if seen <= resume_from:
+                        continue            # already loaded on a previous run
+                    if len(values) < ncols:
+                        values += [""] * (ncols - len(values))
+                    values = values[:ncols]
+                    row = [values[i] for i in load_idx]
+                    batch.append([v if v != "" else None for v in row])
+                    if len(batch) >= BATCH_SIZE:
+                        commit_batch(cur, conn, insert_sql, batch)   # retries transient errors
+                        rows_loaded = seen                           # committed -> resumable
+                        batch.clear()
+                        render_progress(processed, total_bytes, load_start, rows_loaded)
+            else:
+                for line in fin:
+                    processed += len(line.encode("utf-8", "ignore"))
+                    if not line.strip():
+                        continue
+                    seen += 1
+                    if seen <= resume_from:
+                        continue            # already loaded on a previous run
+                    values = [v.strip("þ \r\n") for v in line.split(DELIMITER)]
+                    if len(values) < ncols:
+                        values += [""] * (ncols - len(values))
+                    values = values[:ncols]
+                    row = [values[i] for i in load_idx]
+                    batch.append([v if v != "" else None for v in row])
+                    if len(batch) >= BATCH_SIZE:
+                        commit_batch(cur, conn, insert_sql, batch)   # retries transient errors
+                        rows_loaded = seen                           # committed -> resumable
+                        batch.clear()
+                        render_progress(processed, total_bytes, load_start, rows_loaded)
             if batch:
                 commit_batch(cur, conn, insert_sql, batch)
                 rows_loaded = seen
