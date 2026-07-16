@@ -31,47 +31,67 @@ strict priority levels (see LEVEL_ORDER below), built step by step:
                         (blank on either/both sides is fine) and Middle
                         Name/Suffix don't actively disagree.
   (Rule 3 - a Name-Only, no-SSN/no-DOB fallback - previously existed here
-  and has been removed. Numbering below is left as-is, with a gap at 3,
-  rather than renumbering Rules 4-9.)
-  Rule 4 (Employee ID, Name): rows sharing at least one common Employee ID
-                        (a cell can already contain multiple semicolon-
-                        joined IDs) AND a compatible First+Last Name (see
-                        name_compat_match() - an incomplete/truncated entry,
-                        e.g. an initial like "J" for "Jeffrey", counts as
-                        compatible, not a mismatch) are merged, as long as
-                        SSN and DOB are each either matching or blank on
-                        both sides (a real, differing value on both sides
-                        blocks it).
-  Rule 5 (Driver's License, Name): same as Rule 4, but matched on Driver's
-                        License Number instead of Employee ID.
-  Rule 6 (Passport Number, Name): same as Rule 4, but matched on Passport
-                        Number instead of Employee ID.
-  Rule 7 (Phone Number, Name): same as Rule 4, but matched on Phone Number
-                        instead of Employee ID.
-  Rule 8 (Full Address, Name): Residential Address, City, State, Zip, and
-                        Province are each checked individually - blank on
-                        either side is fine, but a real, differing value in
-                        ANY of them blocks the merge, and at least one field
-                        must genuinely match on both sides. Unlike SSN,
-                        address is NEVER enough to override a name
-                        difference on its own - this also always requires
-                        a compatible Name match (name_compat_match()) and
-                        SSN/DOB to be matching-or-blank, same as Rules 4-7,
-                        9.
-  Rule 9 (Email, Name): same as Rule 4, but matched on Email Address -
-                        Personal instead of Employee ID.
+  and has been removed; numbering is left as-is, with a gap at 3, rather
+  than renumbering Rules 4-9. Rule 4 - Employee ID, Name - no longer exists
+  as its own standalone rule/level either: a shared Employee ID is instead
+  checked as one of two ways Rule 8, below, can match.)
+  Rule 5 (Driver's License, Name): rows sharing at least one common Driver's
+                        License Number (a cell can already contain multiple
+                        semicolon-joined IDs) AND a compatible First+Last
+                        Name (see name_compat_match() - an incomplete/
+                        truncated entry, e.g. an initial like "J" for
+                        "Jeffrey", counts as compatible, not a mismatch) are
+                        merged, as long as SSN and DOB are each either
+                        matching or blank on both sides (a real, differing
+                        value on both sides blocks it).
+  Rule 6 (Passport Number, Name): same as Rule 5, but matched on Passport
+                        Number instead of Driver's License.
+  Rule 7 (Phone Number, Name): same as Rule 5, but matched on Phone Number
+                        instead of Driver's License.
+  Rule 8 (Full Address, Name): matches via EITHER of two independent paths -
+                        a pair only needs to satisfy one (see
+                        address_name_match()):
+                          (a) Address-based - Residential Address, City,
+                              State, Zip, and Province are each checked
+                              individually - blank on either side is fine,
+                              but a real, differing value in ANY of them
+                              blocks THIS path, and at least one field must
+                              genuinely match on both sides.
+                          (b) Employee ID-based - rows share at least one
+                              common Employee ID (a cell can already contain
+                              multiple semicolon-joined IDs). A shared
+                              Employee ID is trusted enough to merge the two
+                              rows into one person EVEN WHEN their addresses
+                              actively conflict - but that never merges the
+                              conflicting addresses themselves into one
+                              value: the output still keeps every distinct
+                              address, the majority one in the normal
+                              columns and every other real address preserved
+                              in "Other Address" (see split_addresses()
+                              below) - address data is never dropped, only
+                              the per-pair address-conflict CHECK is skipped
+                              for this path (see try_union() in main()).
+                        Unlike SSN, neither path is ever enough to override a
+                        name difference on its own - both always also
+                        require a compatible Name match (name_compat_match())
+                        and SSN/DOB to be matching-or-blank (compatible()),
+                        same as Rules 5-7, 9.
+  Rule 9 (Email, Name): same as Rule 5, but matched on Email Address -
+                        Personal instead of Driver's License.
 
 Rules are NOT all-or-nothing OR'd together in one flat pass. Each rule is
 also a PRIORITY LEVEL, applied strictly in this order (see LEVEL_ORDER):
 
     Level 1: SSN                    (Rule 1 - SSN Exists)
     Level 2: SSN + DOB              (Rule 2 - Exact Name, DOB)
-    Level 3: Employee ID            (Rule 4)
-    Level 4: Driver's License       (Rule 5)
-    Level 5: Passport               (Rule 6)
-    Level 6: Phone Number           (Rule 7)
-    Level 7: Email                  (Rule 9)
-    Level 8: Full Address           (Rule 8 - weakest evidence, lowest priority)
+    Level 3: Driver's License       (Rule 5)
+    Level 4: Passport               (Rule 6)
+    Level 5: Phone Number           (Rule 7)
+    Level 6: Email                  (Rule 9)
+    Level 7: Full Address /         (Rule 8 - matches on address OR a shared
+              Employee ID           Employee ID; weakest evidence and lowest
+                                     priority, except where Employee ID
+                                     overrides a conflicting address)
 
 Within a level, a match is still transitive (if A matches B and B matches C
 at that level, all three end up in one group, even if A and C don't directly
@@ -80,9 +100,9 @@ produced (2+ rows) is LOCKED: a later, lower-priority level can still add a
 new, not-yet-grouped row into a locked group (that's just appending more
 values), but it can NEVER merge two groups that are both already locked -
 e.g. two rows locked together by a shared SSN (Level 1) can never be pulled
-apart or bridged into a different SSN's group by a weaker Employee ID/Phone/
-Address match discovered later (see the `locked` array and try_union() in
-main()).
+apart or bridged into a different SSN's group by a weaker Driver's License/
+Phone/Address match discovered later (see the `locked` array and try_union()
+in main()).
 
 Independent of that level-lock, a merge is ALSO refused whenever it would
 combine 2+ DIFFERENT known SSNs, or 2+ DIFFERENT known DOBs, into one group
@@ -96,12 +116,15 @@ This check applies at every level, since the bridging risk isn't specific
 to any one rule.
 
 A conflicting real ADDRESS gets the same same-level transitive-bridge
-protection, but only for Level 8 (Full Address, Name) itself - since every
-higher-priority level has already run and locked its groups by the time
-Level 8 executes, a conflicting address can no longer override a stronger
-match the way it could in a flat pass; this guard now only keeps Level 8's
-OWN address-only matches from bridging two conflicting addresses together
-(see group_addr/try_union() in main()).
+protection, but only for Level 7 (Full Address, Name) itself, and only for
+its address-based path - since every higher-priority level has already run
+and locked its groups by the time Level 7 executes, a conflicting address
+can no longer override a stronger match the way it could in a flat pass;
+this guard keeps Level 7's OWN address-based matches from bridging two
+conflicting addresses together. It's skipped entirely for a pair merging
+via the Employee ID path instead (see try_union() in main()) - a shared
+Employee ID is trusted enough to bridge a conflicting address on purpose,
+that's the whole point of that path.
 
 INPUT  : an Excel workbook with the columns listed in EXPECTED_COLS below.
 OUTPUT : a new Excel workbook with four sheets:
@@ -159,8 +182,9 @@ secured/authorized folder for this data (never a desktop) - it contains
 SSN, DOB, and other PII/PHI.
 
 Designed for large row counts (uses "blocking" - only compares rows that
-already share an exact SSN, an exact First+Last Name+DOB, a Last Name, or
-an Employee ID + Name - instead of comparing every row to every other row).
+already share an exact SSN, an exact First+Last Name+DOB, a Last Name, a
+Driver's License Number + Name, or an Employee ID + Name - instead of
+comparing every row to every other row).
 
 Install once:
     pip install pandas openpyxl pyxlsb xlsxwriter
@@ -267,8 +291,10 @@ COL_SUFFIX = "Suffix"
 COL_DOB    = "Full Date of Birth (MM/DD/YYYY)"
 COL_SSN    = "Social Security Number"
 
-# COL_EMPID/COL_DL/COL_PASSPORT/COL_PHONE/COL_EMAIL are used for matching
-# (Rules 4-7, 9). COL_GOVID isn't used for matching - kept as a plain
+# COL_DL/COL_PASSPORT/COL_PHONE/COL_EMAIL are used for matching (Rules 5-7,
+# 9). COL_EMPID is also used for matching, but only within Rule 8 (see
+# address_name_match()) - a shared Employee ID there can bridge a
+# conflicting address. COL_GOVID isn't used for matching - kept as a plain
 # semicolon-merged column in OTHER_MERGE_COLS below.
 COL_DL       = "Driver's License Number"
 COL_PASSPORT = "Passport Number"
@@ -867,13 +893,13 @@ def address_conflict(r1: Rec, r2: Rec) -> bool:
 
 def compatible(a: str, b: str) -> bool:
     """True if either side is blank, or both sides are equal. Used for
-    Rules 4-6's SSN/DOB check - blank never conflicts, matching is fine,
+    Rules 5-6's SSN/DOB check - blank never conflicts, matching is fine,
     but a real, differing value on both sides is a conflict."""
     return not a or not b or a == b
 
 
 def _id_name_match(ids1: frozenset, ids2: frozenset, r1: Rec, r2: Rec) -> bool:
-    """Shared logic for Rules 4-7, 9: rows share at least one common ID
+    """Shared logic for Rules 5-7, 9: rows share at least one common ID
     token (from whichever ID field is being checked - see
     parse_id_tokens(), a cell can already contain multiple semicolon-joined
     IDs) AND have a compatible First+Last Name (see name_compat_match() -
@@ -886,11 +912,6 @@ def _id_name_match(ids1: frozenset, ids2: frozenset, r1: Rec, r2: Rec) -> bool:
     if not name_compat_match(r1, r2):
         return False
     return compatible(r1.ssn, r2.ssn) and compatible(r1.dob, r2.dob)
-
-
-def empid_name_match(r1: Rec, r2: Rec) -> bool:
-    """Step 4 - 'Employee ID, Name' (see _id_name_match())."""
-    return _id_name_match(r1.empids, r2.empids, r1, r2)
 
 
 def dl_name_match(r1: Rec, r2: Rec) -> bool:
@@ -914,23 +935,47 @@ def email_name_match(r1: Rec, r2: Rec) -> bool:
 
 
 def address_name_match(r1: Rec, r2: Rec) -> bool:
-    """Step 8 - 'Full Address, Name': Residential Address, City, State,
-    Zip, and Province are each checked individually - blank on either side
-    is fine, but a real, differing value in ANY of them is a conflict that
-    blocks the merge. At least one of these fields must have a genuine
-    matching value on BOTH sides (two addresses that are entirely blank on
-    one side never 'match' just because nothing conflicts).
+    """Step 8 - 'Full Address, Name': matches via EITHER of two independent
+    paths (a pair only needs to satisfy one):
 
-    Unlike SSN (Rule 1), address is NEVER enough on its own to override a
-    name difference - a compatible Name match (see name_compat_match() - an
-    incomplete/truncated entry, e.g. an initial like "J" for "Jeffrey",
-    counts as compatible, not a mismatch) is always required here too,
-    plus SSN/DOB each being matching-or-blank (compatible()), same as
-    Rules 4-7, 9. Zip is compared by its 5-digit prefix (zip5()), so a plain
-    5-digit ZIP and its ZIP+4 form count as the same value, not a conflict
-    and not a missed overlap. Street is compared via street_compat(), so
-    '123 Abc Lane' vs '123 Abc Lane Apt 1' (unit detail on only one side)
-    counts as a genuine overlap too, not a conflict and not a miss."""
+    (a) Address-based: Residential Address, City, State, Zip, and Province
+        are each checked individually - blank on either side is fine, but a
+        real, differing value in ANY of them is a conflict that blocks THIS
+        path (address_conflict()). At least one of these fields must also
+        have a genuine matching value on BOTH sides (two addresses that are
+        entirely blank on one side never 'match' just because nothing
+        conflicts). Zip is compared by its 5-digit prefix (zip5()), so a
+        plain 5-digit ZIP and its ZIP+4 form count as the same value, not a
+        conflict and not a missed overlap. Street is compared via
+        street_compat(), so '123 Abc Lane' vs '123 Abc Lane Apt 1' (unit
+        detail on only one side) counts as a genuine overlap too, not a
+        conflict and not a miss.
+    (b) Employee ID-based: rows share at least one common Employee ID token
+        (empids - a cell can already contain multiple semicolon-joined IDs,
+        see parse_id_tokens()). This path does NOT call address_conflict()
+        at all, so a genuinely conflicting address never blocks it - a
+        shared Employee ID is trusted enough to merge the two rows into one
+        person regardless. It still never merges the conflicting addresses
+        themselves into one value - main()'s try_union() only skips the
+        pairwise address-conflict CHECK for this path, the address data
+        itself is untouched and every distinct address a merged group ends
+        up with is still preserved by split_addresses() in the output (the
+        majority one in the normal columns, every other real one in "Other
+        Address") - see try_union() in main() and split_addresses() below.
+
+    Unlike SSN (Rule 1), neither path is ever enough on its own to override
+    a name difference - a compatible Name match (see name_compat_match() -
+    an incomplete/truncated entry, e.g. an initial like "J" for "Jeffrey",
+    counts as compatible, not a mismatch) is always required, plus SSN/DOB
+    each being matching-or-blank (compatible()), same as Rules 5-7, 9."""
+    if not name_compat_match(r1, r2):
+        return False
+    if not (compatible(r1.ssn, r2.ssn) and compatible(r1.dob, r2.dob)):
+        return False
+
+    if r1.empids and r2.empids and not r1.empids.isdisjoint(r2.empids):
+        return True   # (b) Employee ID path - a conflicting address is allowed
+
     if address_conflict(r1, r2):
         return False
     # address_conflict() already confirmed the street is compatible (equal,
@@ -941,11 +986,7 @@ def address_name_match(r1: Rec, r2: Rec) -> bool:
     other_fields1 = (r1.city, r1.state, zip5(r1.zip), r1.province)
     other_fields2 = (r2.city, r2.state, zip5(r2.zip), r2.province)
     other_overlap = any(a and b and a == b for a, b in zip(other_fields1, other_fields2))
-    if not (street_overlap or other_overlap):
-        return False   # nothing real actually overlaps - not a match
-    if not name_compat_match(r1, r2):
-        return False
-    return compatible(r1.ssn, r2.ssn) and compatible(r1.dob, r2.dob)
+    return street_overlap or other_overlap   # (a) Address path
 
 
 # Strict priority order the rules are now applied in. A group formed at an
@@ -953,31 +994,38 @@ def address_name_match(r1: Rec, r2: Rec) -> bool:
 # lower-priority level can still add new unlocked rows into it, but can never
 # merge it with another already-locked group - e.g. two rows locked together
 # by a shared SSN (Level 1) can never be pulled apart or bridged into a
-# different SSN's group by a weaker match (Employee ID, Phone, ...) later on;
-# they can only gain MORE rows/values (see the `locked` array and
+# different SSN's group by a weaker match (Driver's License, Phone, ...)
+# later on; they can only gain MORE rows/values (see the `locked` array and
 # try_union() in main()).
+#
+# Employee ID (Rule 4) no longer has its own standalone matching level - it's
+# instead checked inside LEVEL_ADDRESS's own match function
+# (address_name_match()) as an alternate path that's allowed to match even
+# when the address itself conflicts. Level numbers below are renumbered
+# contiguously (no gap) - Rule numbers keep their own gap instead (see the
+# module docstring).
 LEVEL_SSN      = 1   # Rule 1 - SSN Exists
 LEVEL_NAMEDOB  = 2   # Rule 2 - SSN + DOB (Exact Name, DOB)
-LEVEL_EMPID    = 3   # Rule 4 - Employee ID, Name
-LEVEL_DL       = 4   # Rule 5 - Driver's License, Name
-LEVEL_PASSPORT = 5   # Rule 6 - Passport Number, Name
-LEVEL_PHONE    = 6   # Rule 7 - Phone Number, Name
-LEVEL_EMAIL    = 7   # Rule 9 - Email, Name
-LEVEL_ADDRESS  = 8   # Rule 8 - Full Address, Name (weakest evidence - lowest priority)
+LEVEL_DL       = 3   # Rule 5 - Driver's License, Name
+LEVEL_PASSPORT = 4   # Rule 6 - Passport Number, Name
+LEVEL_PHONE    = 5   # Rule 7 - Phone Number, Name
+LEVEL_EMAIL    = 6   # Rule 9 - Email, Name
+LEVEL_ADDRESS  = 7   # Rule 8 - Full Address, Name OR Employee ID, Name
+                      # (weakest evidence and lowest priority, except that
+                      # the Employee ID path overrides a conflicting address)
 
 # Processed strictly in this order - see main().
-LEVEL_ORDER = [LEVEL_SSN, LEVEL_NAMEDOB, LEVEL_EMPID, LEVEL_DL,
+LEVEL_ORDER = [LEVEL_SSN, LEVEL_NAMEDOB, LEVEL_DL,
                LEVEL_PASSPORT, LEVEL_PHONE, LEVEL_EMAIL, LEVEL_ADDRESS]
 
 LEVEL_NAMES = {
     LEVEL_SSN: "SSN",
     LEVEL_NAMEDOB: "SSN + DOB",
-    LEVEL_EMPID: "Employee ID",
     LEVEL_DL: "Driver's License",
     LEVEL_PASSPORT: "Passport",
     LEVEL_PHONE: "Phone Number",
     LEVEL_EMAIL: "Email",
-    LEVEL_ADDRESS: "Full Address",
+    LEVEL_ADDRESS: "Full Address / Employee ID",
 }
 
 # One single-rule match function per level - a pair is NEVER tested against
@@ -987,7 +1035,6 @@ LEVEL_NAMES = {
 LEVEL_MATCH_FUNCS = {
     LEVEL_SSN: ssn_exists_match,
     LEVEL_NAMEDOB: exact_name_dob_match,
-    LEVEL_EMPID: empid_name_match,
     LEVEL_DL: dl_name_match,
     LEVEL_PASSPORT: passport_name_match,
     LEVEL_PHONE: phone_name_match,
@@ -1064,7 +1111,8 @@ def describe_bucket_key(key) -> str:
     surface."""
     level = key[0]
     if level == LEVEL_ADDRESS:
-        return {"addr": "Street Address", "city": "City", "zip": "Zip"}.get(key[1], key[1])
+        return {"addr": "Street Address", "city": "City", "zip": "Zip",
+                 "empid": "Employee ID"}.get(key[1], key[1])
     if level == LEVEL_SSN:
         return "SSN"
     if level == LEVEL_NAMEDOB:
@@ -1078,8 +1126,8 @@ def bucket_candidate_pairs(recs):
     """Returns (level_pairs, biggest_buckets):
       - level_pairs: {level: list_of_candidate_pairs}, one deduped list per
         LEVEL_ORDER entry (a pair can be produced more than once within a
-        level - e.g. two rows sharing 2 different Employee ID tokens, or the
-        3 separate Address sub-buckets - so a dedup pass is still needed, just
+        level - e.g. two rows sharing 2 different Driver's License tokens, or
+        the 3 separate Address sub-buckets - so a dedup pass is still needed, just
         done once in bulk via numpy at the end instead of per-insert via a
         Python set, which is far cheaper at large candidate-pair counts).
         Each level's pairs are bucketed - and later tested - independently,
@@ -1096,22 +1144,27 @@ def bucket_candidate_pairs(recs):
             buckets[(LEVEL_SSN, r.ssn)].append(r.idx)
         if r.first and r.last and r.dob:              # Level 2: SSN + DOB
             buckets[(LEVEL_NAMEDOB, r.first, r.last, r.dob)].append(r.idx)
-        if r.empids and r.first and r.last:           # Level 3: Employee ID, Name
-            for tok in r.empids:
-                buckets[(LEVEL_EMPID, tok, r.first, r.last)].append(r.idx)
-        if r.dl_ids and r.first and r.last:            # Level 4: Driver's License, Name
+        if r.dl_ids and r.first and r.last:            # Level 3: Driver's License, Name
             for tok in r.dl_ids:
                 buckets[(LEVEL_DL, tok, r.first, r.last)].append(r.idx)
-        if r.passport_ids and r.first and r.last:      # Level 5: Passport Number, Name
+        if r.passport_ids and r.first and r.last:      # Level 4: Passport Number, Name
             for tok in r.passport_ids:
                 buckets[(LEVEL_PASSPORT, tok, r.first, r.last)].append(r.idx)
-        if r.phones and r.first and r.last:            # Level 6: Phone Number, Name
+        if r.phones and r.first and r.last:            # Level 5: Phone Number, Name
             for tok in r.phones:
                 buckets[(LEVEL_PHONE, tok, r.first, r.last)].append(r.idx)
-        if r.emails and r.first and r.last:             # Level 7: Email, Name
+        if r.emails and r.first and r.last:             # Level 6: Email, Name
             for tok in r.emails:
                 buckets[(LEVEL_EMAIL, tok, r.first, r.last)].append(r.idx)
-        # Level 8: Full Address, Name - bucket by each address FIELD
+        # Level 7, path (b): Full Address, Name - via a shared Employee ID
+        # instead of a shared address (see address_name_match()) - bucketed
+        # the same way as the DL/Passport/Phone/Email ID buckets above, just
+        # tagged "empid" so describe_bucket_key() can label it distinctly
+        # from the address-field sub-buckets below.
+        if r.empids and r.first and r.last:
+            for tok in r.empids:
+                buckets[(LEVEL_ADDRESS, "empid", tok, r.first, r.last)].append(r.idx)
+        # Level 7, path (a): Full Address, Name - bucket by each address FIELD
         # individually (not the whole address as one key), since
         # address_name_match() only needs ONE field to genuinely overlap.
         # The level's own match function then does the real per-field
@@ -1512,7 +1565,7 @@ def main() -> None:
     # that are BOTH already locked, regardless of what a lower-priority rule
     # thinks it has found - e.g. two rows locked together in one group by a
     # shared SSN (Level 1) can never be split apart or bridged into a
-    # different SSN's group by a weaker Employee ID/Phone/Address match
+    # different SSN's group by a weaker Driver's License/Phone/Address match
     # later on. Set at the end of each level's pass, once that level's own
     # transitive clustering is finished (see the per-level loop below).
     locked = [False] * len(recs)
@@ -1543,10 +1596,10 @@ def main() -> None:
     # group_addr[root] = 5 sets (one per address field: Street, City, State,
     # Zip, Province), each holding every DISTINCT known value currently in
     # that root's group. Same bridging risk again, but only relevant to
-    # Level 8 (Full Address, Name) itself - by the time Level 8 runs, every
+    # Level 7 (Full Address, Name) itself - by the time Level 7 runs, every
     # higher-priority level has already finished and locked its groups, so a
     # conflicting address can no longer override a stronger match the way it
-    # could in a single flat pass; this only guards Level 8's OWN transitive
+    # could in a single flat pass; this only guards Level 7's OWN transitive
     # clustering of same-level address matches.
     group_addr = [
         (({split_street_unit(r.addr)[0]} if r.addr else set()),   # base street, so a unit/apt suffix doesn't falsely conflict
@@ -1590,10 +1643,21 @@ def main() -> None:
             refused_dob += 1
             return   # would combine two different real DOBs - refused
         if level == LEVEL_ADDRESS:
-            aa, ab = group_addr[ra], group_addr[rb]
-            if any(fa and fb and fa.isdisjoint(fb) for fa, fb in zip(aa, ab)):
-                refused_addr += 1
-                return   # would combine two conflicting real addresses - refused
+            ea, eb = recs[a_idx].empids, recs[b_idx].empids
+            via_empid = bool(ea) and bool(eb) and not ea.isdisjoint(eb)
+            if not via_empid:
+                # This pair matched on address, not a shared Employee ID -
+                # a conflicting address (even a transitively-bridged one)
+                # still blocks it, same as always. A pair that matched via
+                # a shared Employee ID instead skips this guard entirely -
+                # address_name_match() already let it through despite any
+                # address conflict, on purpose (see its docstring); the
+                # address data itself is never touched by this, only this
+                # cross-group conflict CHECK is skipped for it.
+                aa, ab = group_addr[ra], group_addr[rb]
+                if any(fa and fb and fa.isdisjoint(fb) for fa, fb in zip(aa, ab)):
+                    refused_addr += 1
+                    return   # would combine two conflicting real addresses - refused
         uf.union(a_idx, b_idx)
         merged_root = min(ra, rb)
         group_ssn[merged_root] = sa | sb
