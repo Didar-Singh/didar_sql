@@ -2,7 +2,8 @@
 260711 pd ds notification merge.py
 
 Merge PII/PHI person records from an Excel export into one row per
-confirmed person, for the notification report. Nine rules, applied as
+confirmed person, for the notification report. Rules numbered 1-9 (Rule 4
+folded into Rule 8, not standalone - eight rules in total), applied as
 strict priority levels (see LEVEL_ORDER below), built step by step:
 
   Rule 1 (SSN Exists): rows with the same (non-blank) SSN are merged,
@@ -30,11 +31,28 @@ strict priority levels (see LEVEL_ORDER below), built step by step:
                         DOB are merged, as long as their SSNs don't conflict
                         (blank on either/both sides is fine) and Middle
                         Name/Suffix don't actively disagree.
-  (Rule 3 - a Name-Only, no-SSN/no-DOB fallback - previously existed here
-  and has been removed; numbering is left as-is, with a gap at 3, rather
-  than renumbering Rules 4-9. Rule 4 - Employee ID, Name - no longer exists
-  as its own standalone rule/level either: a shared Employee ID is instead
-  checked as one of two ways Rule 8, below, can match.)
+  Rule 3 (Name Only, No Other Evidence): the absolute LAST-RESORT rule,
+                        lowest priority of all (see LEVEL_NAME_ONLY) - only
+                        runs after every other rule (1-2, 5-9) has already
+                        had its shot at a pair and found nothing. First and
+                        Last Name must each be real and COMPATIBLE (same
+                        name_compat_match() used by Rules 2, 5-9 - an
+                        incomplete/truncated entry, e.g. "J" for "Jeffrey",
+                        counts as compatible, not a mismatch), Middle
+                        Name/Suffix must not actively disagree, and SSN/DOB
+                        must be matching-or-blank (compatible()). Unlike
+                        every other rule, NO other field is even consulted -
+                        Employee ID, Driver's License, Passport, Phone,
+                        Email, Government ID, and Address can all hold
+                        genuinely DIFFERENT values on each side and it still
+                        matches; none of those are trusted enough on their
+                        own to rule out a match when the only other signal
+                        (SSN/DOB) is absent or non-conflicting. The
+                        differing values themselves are never lost - see
+                        name_only_match() and the OUTPUT section below.
+  (Rule 4 - Employee ID, Name - no longer exists as its own standalone
+  rule/level: a shared Employee ID is instead checked as one of two ways
+  Rule 8, below, can match.)
   Rule 5 (Driver's License, Name): rows sharing at least one common Driver's
                         License Number (a cell can already contain multiple
                         semicolon-joined IDs) AND a compatible First+Last
@@ -47,7 +65,13 @@ strict priority levels (see LEVEL_ORDER below), built step by step:
   Rule 6 (Passport Number, Name): same as Rule 5, but matched on Passport
                         Number instead of Driver's License.
   Rule 7 (Phone Number, Name): same as Rule 5, but matched on Phone Number
-                        instead of Driver's License.
+                        instead of Driver's License - with one difference: a
+                        shared Phone Number is trusted enough to override a
+                        genuinely differing Middle Name (e.g. one row has
+                        just an initial like "L", another has a real but
+                        different middle name like "Michael"). A First/Last
+                        Name difference or a Suffix conflict (Jr vs Sr)
+                        still blocks the merge, same as every other rule.
   Rule 8 (Full Address, Name): matches via EITHER of two independent paths -
                         a pair only needs to satisfy one (see
                         address_name_match()):
@@ -72,12 +96,15 @@ strict priority levels (see LEVEL_ORDER below), built step by step:
                               the per-pair address-conflict CHECK is skipped
                               for this path (see try_union() in main()).
                         Unlike SSN, neither path is ever enough to override a
-                        name difference on its own - both always also
-                        require a compatible Name match (name_compat_match())
-                        and SSN/DOB to be matching-or-blank (compatible()),
-                        same as Rules 5-7, 9.
+                        First/Last Name or Suffix difference on its own -
+                        both always also require a compatible Name match
+                        (name_compat_match()) and SSN/DOB to be matching-
+                        or-blank (compatible()), same as Rules 5-7, 9 (Rules
+                        7 and 9 additionally tolerate a Middle Name
+                        conflict specifically, see there).
   Rule 9 (Email, Name): same as Rule 5, but matched on Email Address -
-                        Personal instead of Driver's License.
+                        Personal instead of Driver's License - with the same
+                        Middle Name override as Rule 7 (see there).
 
 Rules are NOT all-or-nothing OR'd together in one flat pass. Each rule is
 also a PRIORITY LEVEL, applied strictly in this order (see LEVEL_ORDER):
@@ -92,6 +119,8 @@ also a PRIORITY LEVEL, applied strictly in this order (see LEVEL_ORDER):
               Employee ID           Employee ID; weakest evidence and lowest
                                      priority, except where Employee ID
                                      overrides a conflicting address)
+    Level 8: Name Only              (Rule 3 - absolute last resort; only
+                                     runs when nothing else matched at all)
 
 Within a level, a match is still transitive (if A matches B and B matches C
 at that level, all three end up in one group, even if A and C don't directly
@@ -156,14 +185,18 @@ OUTPUT : a new Excel workbook with four sheets:
              extra "DOCIDs 2", "DOCIDs 3", ... columns, splitting only at
              "; " boundaries (see split_docid_chunks()).
            - Address fields (Residential Address, City, State, Province,
-             Zip, Country) are kept TOGETHER as one unit: the most common
-             address (by total row count) stays in those columns - with any
-             field left blank on one row filled in from another row's fuller
+             Zip, Country) are kept TOGETHER as one unit: the PRIMARY
+             address stays in those columns - a US address (has a real
+             State of Residence value) is always preferred as Primary over
+             a non-US one, regardless of row count; among addresses that
+             tie on US-ness, the most common one (by total row count) wins
+             (see is_us_cluster() in split_addresses()) - with any field
+             left blank on one row filled in from another row's fuller
              copy of that SAME address, so e.g. a blank Zip on one row never
              by itself creates a spurious extra address - and every OTHER,
-             genuinely different address goes into a new "Other Address"
-             column as one combined string per address, semicolon-joined
-             (see address_key_conflict()).
+             genuinely different (non-Primary) address goes into a new
+             "Other Address" column as one combined string per address,
+             semicolon-joined (see address_key_conflict()).
          - "Junk SSN Review": every row where a non-blank SSN value was
            ignored as unusable (a masked SSN with too few known digits) - so
            a real-looking SSN that got silently treated as blank doesn't go
@@ -754,24 +787,32 @@ def name_prefix_compat(a: str, b: str) -> bool:
     return a.startswith(b) or b.startswith(a)
 
 
-def name_conflict(r1: Rec, r2: Rec) -> bool:
+def name_conflict(r1: Rec, r2: Rec, *, ignore_middle: bool = False) -> bool:
     """True when First, Middle, or Last Name genuinely disagrees between two
     rows (see name_prefix_compat() - blank on either side, or one being a
     truncated/incomplete version of the other, is NOT a conflict), or when
     Suffix is present on both sides and differs (e.g. 'Jr' vs 'Sr' - no
     prefix tolerance for Suffix, since it isn't an abbreviation-of-the-same-
     value situation). Blocks Step 1 (SSN Exists) - a matching SSN is not
-    trusted enough to override a genuine name difference."""
+    trusted enough to override a genuine name difference.
+
+    ignore_middle: when True, a genuinely differing Middle Name is NOT
+    treated as a conflict - used by Rules 7 and 9 (Phone/Email, Name), where
+    a shared Phone Number or Email Address is trusted enough to override a
+    Middle Name mismatch (e.g. one row recording just an initial like 'L'
+    while another has a real but different middle name like 'Michael') but
+    NOT a First/Last Name difference or a Suffix conflict, which still block
+    the merge exactly as they do everywhere else."""
     if not name_prefix_compat(r1.first, r2.first):
         return True
-    if not name_prefix_compat(r1.mid, r2.mid):
+    if not ignore_middle and not name_prefix_compat(r1.mid, r2.mid):
         return True
     if not name_prefix_compat(r1.last, r2.last):
         return True
     return bool(r1.suffix) and bool(r2.suffix) and r1.suffix != r2.suffix
 
 
-def name_compat_match(r1: Rec, r2: Rec) -> bool:
+def name_compat_match(r1: Rec, r2: Rec, *, ignore_middle: bool = False) -> bool:
     """True if First and Last Name are each real (non-blank) on both sides
     and COMPATIBLE - not required to be byte-exact (see
     name_prefix_compat(): an incomplete/truncated entry, e.g. an initial
@@ -780,8 +821,11 @@ def name_compat_match(r1: Rec, r2: Rec) -> bool:
     name_conflict()). This is the shared POSITIVE name-match requirement for
     Rules 2, 4-9 (Rule 1 instead uses name_conflict() alone, as a blocking
     guard on top of an already-strong SSN match, not a positive
-    requirement)."""
-    if name_conflict(r1, r2):
+    requirement).
+
+    ignore_middle: passed straight through to name_conflict() - see there.
+    Used only by Rules 7 and 9 (phone_name_match()/email_name_match())."""
+    if name_conflict(r1, r2, ignore_middle=ignore_middle):
         return False
     return bool(r1.first) and bool(r2.first) and bool(r1.last) and bool(r2.last)
 
@@ -898,7 +942,8 @@ def compatible(a: str, b: str) -> bool:
     return not a or not b or a == b
 
 
-def _id_name_match(ids1: frozenset, ids2: frozenset, r1: Rec, r2: Rec) -> bool:
+def _id_name_match(ids1: frozenset, ids2: frozenset, r1: Rec, r2: Rec,
+                    *, ignore_middle: bool = False) -> bool:
     """Shared logic for Rules 5-7, 9: rows share at least one common ID
     token (from whichever ID field is being checked - see
     parse_id_tokens(), a cell can already contain multiple semicolon-joined
@@ -906,10 +951,14 @@ def _id_name_match(ids1: frozenset, ids2: frozenset, r1: Rec, r2: Rec) -> bool:
     an incomplete/truncated entry, e.g. an initial like "J" for "Jeffrey",
     counts as compatible, not a mismatch), AND SSN and DOB are each either
     matching or blank on both sides (a real, differing value on either
-    blocks it)."""
+    blocks it).
+
+    ignore_middle: passed straight through to name_compat_match() - see
+    phone_name_match()/email_name_match() for why those two (and only
+    those two) pass True here."""
     if not (ids1 and ids2 and not ids1.isdisjoint(ids2)):
         return False
-    if not name_compat_match(r1, r2):
+    if not name_compat_match(r1, r2, ignore_middle=ignore_middle):
         return False
     return compatible(r1.ssn, r2.ssn) and compatible(r1.dob, r2.dob)
 
@@ -925,13 +974,19 @@ def passport_name_match(r1: Rec, r2: Rec) -> bool:
 
 
 def phone_name_match(r1: Rec, r2: Rec) -> bool:
-    """Step 7 - 'Phone Number, Name' (see _id_name_match())."""
-    return _id_name_match(r1.phones, r2.phones, r1, r2)
+    """Step 7 - 'Phone Number, Name' (see _id_name_match()). A shared Phone
+    Number is trusted enough to override a genuinely differing Middle Name
+    (ignore_middle=True) - but NOT a First/Last Name difference or a Suffix
+    conflict (Jr vs Sr), which still block the merge same as everywhere
+    else."""
+    return _id_name_match(r1.phones, r2.phones, r1, r2, ignore_middle=True)
 
 
 def email_name_match(r1: Rec, r2: Rec) -> bool:
-    """Step 9 - 'Email, Name' (see _id_name_match())."""
-    return _id_name_match(r1.emails, r2.emails, r1, r2)
+    """Step 9 - 'Email, Name' (see _id_name_match()). Same Middle-Name
+    override as phone_name_match() - a shared Email overrides a genuinely
+    differing Middle Name only, not a First/Last or Suffix conflict."""
+    return _id_name_match(r1.emails, r2.emails, r1, r2, ignore_middle=True)
 
 
 def address_name_match(r1: Rec, r2: Rec) -> bool:
@@ -989,6 +1044,34 @@ def address_name_match(r1: Rec, r2: Rec) -> bool:
     return street_overlap or other_overlap   # (a) Address path
 
 
+def name_only_match(r1: Rec, r2: Rec) -> bool:
+    """Step 3 (revived) - 'Name Only, No Other Evidence' - the lowest-
+    priority, absolute-last-resort rule: First and Last Name are each real
+    and compatible (name_compat_match() - an incomplete/truncated entry,
+    e.g. an initial like "J" for "Jeffrey", counts as compatible, not a
+    mismatch), Middle Name/Suffix don't actively disagree, and SSN/DOB are
+    each matching-or-blank (compatible()) - the exact same positive
+    requirement as Rules 2, 5-9.
+
+    Unlike every other rule, NO other field is even consulted - not
+    Employee ID, Driver's License, Passport, Phone, Email, Government ID,
+    or Address. A pair can still match here even when those fields hold
+    genuinely DIFFERENT values on each side (e.g. two different Employee
+    IDs, two different phone numbers, two different addresses) - none of
+    that is treated as a conflict for this rule, since none of those
+    fields are considered reliable enough on their own to rule out a match
+    when the only other signal (SSN/DOB) is absent or non-conflicting. The
+    differing values themselves are never lost: Employee ID/Phone/Email
+    still end up semicolon-joined in the output same as always
+    (OTHER_MERGE_COLS), and a differing address still goes through the
+    normal split_addresses() handling (majority address kept, every other
+    real one preserved in "Other Address" - see there for how a US address
+    is now preferred as the majority one)."""
+    if not name_compat_match(r1, r2):
+        return False
+    return compatible(r1.ssn, r2.ssn) and compatible(r1.dob, r2.dob)
+
+
 # Strict priority order the rules are now applied in. A group formed at an
 # earlier (lower-numbered) LEVEL is LOCKED once that level finishes: a later,
 # lower-priority level can still add new unlocked rows into it, but can never
@@ -1004,6 +1087,12 @@ def address_name_match(r1: Rec, r2: Rec) -> bool:
 # when the address itself conflicts. Level numbers below are renumbered
 # contiguously (no gap) - Rule numbers keep their own gap instead (see the
 # module docstring).
+#
+# Rule 3 (Name Only) is back as LEVEL_NAME_ONLY - the absolute lowest
+# priority, running dead last: only when nothing else (SSN, DOB, Driver's
+# License, Passport, Phone, Email, Address, Employee ID) already matched a
+# pair at a higher level does a merely-compatible Name (with no SSN/DOB
+# conflict) get to merge them (see name_only_match()).
 LEVEL_SSN      = 1   # Rule 1 - SSN Exists
 LEVEL_NAMEDOB  = 2   # Rule 2 - SSN + DOB (Exact Name, DOB)
 LEVEL_DL       = 3   # Rule 5 - Driver's License, Name
@@ -1013,10 +1102,11 @@ LEVEL_EMAIL    = 6   # Rule 9 - Email, Name
 LEVEL_ADDRESS  = 7   # Rule 8 - Full Address, Name OR Employee ID, Name
                       # (weakest evidence and lowest priority, except that
                       # the Employee ID path overrides a conflicting address)
+LEVEL_NAME_ONLY = 8  # Rule 3 - Name Only, No Other Evidence (absolute last resort)
 
 # Processed strictly in this order - see main().
-LEVEL_ORDER = [LEVEL_SSN, LEVEL_NAMEDOB, LEVEL_DL,
-               LEVEL_PASSPORT, LEVEL_PHONE, LEVEL_EMAIL, LEVEL_ADDRESS]
+LEVEL_ORDER = [LEVEL_SSN, LEVEL_NAMEDOB, LEVEL_DL, LEVEL_PASSPORT,
+               LEVEL_PHONE, LEVEL_EMAIL, LEVEL_ADDRESS, LEVEL_NAME_ONLY]
 
 LEVEL_NAMES = {
     LEVEL_SSN: "SSN",
@@ -1026,6 +1116,7 @@ LEVEL_NAMES = {
     LEVEL_PHONE: "Phone Number",
     LEVEL_EMAIL: "Email",
     LEVEL_ADDRESS: "Full Address / Employee ID",
+    LEVEL_NAME_ONLY: "Name Only",
 }
 
 # One single-rule match function per level - a pair is NEVER tested against
@@ -1040,6 +1131,7 @@ LEVEL_MATCH_FUNCS = {
     LEVEL_PHONE: phone_name_match,
     LEVEL_EMAIL: email_name_match,
     LEVEL_ADDRESS: address_name_match,
+    LEVEL_NAME_ONLY: name_only_match,
 }
 
 
@@ -1117,6 +1209,8 @@ def describe_bucket_key(key) -> str:
         return "SSN"
     if level == LEVEL_NAMEDOB:
         return "First+Last Name + DOB"
+    if level == LEVEL_NAME_ONLY:
+        return "Name Only"
     return f"{LEVEL_NAMES[level]} + Name"
 
 
@@ -1201,6 +1295,15 @@ def bucket_candidate_pairs(recs):
             buckets[(LEVEL_ADDRESS, "city", r.city, r.last[0])].append(r.idx)
         if r.zip and r.first and r.last:
             buckets[(LEVEL_ADDRESS, "zip", r.zip, r.last[0])].append(r.idx)
+        # Level 8: Name Only, No Other Evidence - the absolute last resort.
+        # Bucketed by the exact (First, Last) pair, same convention as every
+        # other ID+Name bucket above (name_only_match() itself still applies
+        # the real prefix-tolerant name_compat_match() check - this bucket
+        # only misses the rare case of two rows that are prefix-compatible
+        # but not byte-identical, e.g. "J"/"Jeffrey", same accepted trade-off
+        # as the DL/Passport/Phone/Email buckets above).
+        if r.first and r.last:
+            buckets[(LEVEL_NAME_ONLY, r.first, r.last)].append(r.idx)
 
     level_pair_lists = {lvl: [] for lvl in LEVEL_ORDER}
     total = len(buckets)
@@ -1414,11 +1517,14 @@ def split_addresses(values_arr, addr_col_pos, group_idxs):
     address_key_conflict()) - e.g. the same street/city with Zip blank on
     one row and present on another are one cluster, one address, not two.
     majority_values: the fullest non-blank value per field (see
-    fullest_value()) across the winning cluster - the one with the most
-    rows in it - so a row missing a field borrows it from another row's
-    fuller copy of the same address, instead of leaving it blank or
-    spinning off a spurious 'Other Address' entry. These go into the normal
-    Residential Address/City/State/Zip/Country columns.
+    fullest_value()) across the winning cluster - PREFERRED: any cluster
+    with a real 'State of Residence (if US)' value (a US address), over
+    every non-US cluster, regardless of row count; among clusters that tie
+    on US-ness, the one with the most rows wins (see is_us_cluster()) - so
+    a row missing a field borrows it from another row's fuller copy of the
+    same address, instead of leaving it blank or spinning off a spurious
+    'Other Address' entry. These go into the normal Residential
+    Address/City/State/Zip/Country columns.
     other_address_string: every OTHER, genuinely different address cluster,
     combined into one string per address and semicolon-joined, for the
     'Other Address' column. A row with no address at all doesn't count as
@@ -1483,10 +1589,21 @@ def split_addresses(values_arr, addr_col_pos, group_idxs):
             out.append(fullest_value(raws, norms))
         return tuple(out)
 
+    def is_us_cluster(positions):
+        """True if any key in this cluster has a real 'State of Residence
+        (if US)' value (ADDRESS_COLS index 2). Used to prefer a US address
+        as the group's PRIMARY address (kept in the normal Residential
+        Address/City/State/Zip/Country columns), with every non-US address
+        going to 'Other Address' - regardless of which one has more rows.
+        If no cluster has a US address at all, this has no effect and the
+        row-count majority below decides as usual."""
+        return any(key_order[i][2] for i in positions)
+
     non_blank_clusters = [c for c in clusters.values()
                           if any(any(key_order[i]) for i in c)]
     candidates = non_blank_clusters or list(clusters.values())
-    majority_cluster = max(candidates, key=lambda c: (cluster_weight(c), -min(c)))
+    majority_cluster = max(
+        candidates, key=lambda c: (is_us_cluster(c), cluster_weight(c), -min(c)))
 
     other_strings = []
     for c in clusters.values():
