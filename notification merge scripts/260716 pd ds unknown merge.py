@@ -250,6 +250,13 @@ COL_COUNTRY = "Country of Residence"
 # as one combined string per address, semicolon-joined.
 ADDRESS_COLS = [COL_ADDR, COL_CITY, COL_STATE, COL_PROVINCE, COL_ZIP, COL_COUNTRY]
 
+# Output-only column holding every non-majority address (see split_addresses()
+# below). Not part of ADDRESS_COLS/EXPECTED_COLS - but if the INPUT already
+# has it (e.g. it's the output of a prior merge), its content is carried
+# forward and merged in too, rather than being silently overwritten by this
+# run's own freshly-computed "Other Address" value.
+COL_OTHER_ADDR = "Other Address"
+
 # Every other column in the sheet - these get semicolon-merged as-is.
 # Edit this list if your real headers differ.
 OTHER_MERGE_COLS = [
@@ -1069,6 +1076,7 @@ def dob_merge(values) -> str:
 
 
 DOCID_CHUNK_SIZE = 20_000   # keep well under Excel's 32,767-char cell limit
+OTHER_ADDR_CHUNK_SIZE = 25_000   # keep well under Excel's 32,767-char cell limit
 
 
 def split_docid_chunks(docid_str, max_chars=DOCID_CHUNK_SIZE):
@@ -1298,6 +1306,19 @@ def main() -> None:
         print(f"  Input already has overflow DOCID columns "
               f"({', '.join(docid_input_cols[1:])}) - merging them in too.")
 
+    # "Other Address" is optional (not in EXPECTED_COLS - a fresh source file
+    # won't have it), but if the input already has it - plus any
+    # "Other Address 2"/"Other Address 3"/... from a prior merge that itself
+    # overflowed - all of those are read and merged in too.
+    _other_addr_extra_re = re.compile(rf"^{re.escape(COL_OTHER_ADDR)} (\d+)$")
+    other_addr_input_cols = ([COL_OTHER_ADDR] if COL_OTHER_ADDR in df.columns else []) + sorted(
+        (c for c in df.columns if _other_addr_extra_re.match(c)),
+        key=lambda c: int(_other_addr_extra_re.match(c).group(1)),
+    )
+    if len(other_addr_input_cols) > 1:
+        print(f"  Input already has overflow Other Address columns "
+              f"({', '.join(other_addr_input_cols[1:])}) - merging them in too.")
+
     recs = build_records(df)   # recs[i].idx == i == df row position
 
     print("Clustering (blocked comparison) ...")
@@ -1474,6 +1495,8 @@ def main() -> None:
     dob_conflict_rows = []
     docid_overflow_groups = 0
     max_docid_cols = 1
+    other_addr_overflow_groups = 0
+    max_other_addr_cols = 1
     for n, group_idxs in enumerate(groups, 1):
         progress("Building output", n, total_groups)
         sub = df.iloc[group_idxs]           # O(group size), not O(n)
@@ -1521,7 +1544,24 @@ def main() -> None:
         majority_addr_values, other_address = split_addresses(df, group_idxs)
         for c, v in zip(ADDRESS_COLS, majority_addr_values):
             row[c] = v
-        row["Other Address"] = other_address
+        if other_addr_input_cols:
+            # Preserve whatever the input already had here (e.g. from a
+            # prior merge pass) instead of overwriting it with only this
+            # run's own newly-computed value.
+            other_address = semicolon_merge(itertools.chain(
+                itertools.chain.from_iterable(sub[c] for c in other_addr_input_cols),
+                [other_address],
+            ))
+
+        # Same overflow protection as DOCIDs above - split across
+        # 'Other Address', 'Other Address 2', 'Other Address 3', ...
+        other_addr_chunks = split_docid_chunks(other_address, max_chars=OTHER_ADDR_CHUNK_SIZE)
+        row[COL_OTHER_ADDR] = other_addr_chunks[0]
+        for extra_i, chunk in enumerate(other_addr_chunks[1:], start=2):
+            row[f"{COL_OTHER_ADDR} {extra_i}"] = chunk
+        if len(other_addr_chunks) > 1:
+            other_addr_overflow_groups += 1
+            max_other_addr_cols = max(max_other_addr_cols, len(other_addr_chunks))
 
         row["Rows Merged"] = len(group_idxs)
         row["Names Differ"] = has_variation(sub[COL_FIRST]) or has_variation(sub[COL_LAST])
@@ -1532,19 +1572,38 @@ def main() -> None:
     # Column order: follow the INPUT file's own header sequence (not a
     # fixed order), so the output layout matches the source workbook the
     # user already knows - any 'DOCIDs 2', 'DOCIDs 3', ... overflow columns
-    # go right after 'DOCIDs', and columns with no input counterpart
-    # ('Other Address', 'Rows Merged', 'Names Differ') go at the end.
+    # go right after 'DOCIDs', and any 'Other Address 2', 'Other Address 3',
+    # ... overflow columns go right after 'Other Address' (regardless of
+    # whether the input already had those overflow columns itself - they're
+    # always placed via this fixed logic, never via their own raw input
+    # position too, so a chained run's input never ends up with the same
+    # overflow column listed twice). Columns with no input counterpart
+    # ('Other Address' on a fresh source file, 'Rows Merged', 'Names Differ')
+    # go at the end.
     docid_extra_cols = [f"{COL_DOCID} {i}" for i in range(2, max_docid_cols + 1)]
+    other_addr_extra_cols = [f"{COL_OTHER_ADDR} {i}" for i in range(2, max_other_addr_cols + 1)]
+    docid_extra_names = {f"{COL_DOCID} {i}" for i in range(2, max_docid_cols + 1)}
+    other_addr_extra_names = {f"{COL_OTHER_ADDR} {i}" for i in range(2, max_other_addr_cols + 1)}
     input_order = list(df.columns)
-    extra_cols = [c for c in df_out.columns if c not in input_order and c not in docid_extra_cols]
+    extra_cols = [c for c in df_out.columns
+                  if c not in input_order
+                  and c not in docid_extra_names
+                  and c not in other_addr_extra_names]
     new_order = []
     for c in input_order:
+        if c in docid_extra_names or c in other_addr_extra_names:
+            continue
         if c not in df_out.columns:
             continue
         new_order.append(c)
         if c == COL_DOCID:
             new_order.extend(docid_extra_cols)
-    new_order.extend(extra_cols)
+        if c == COL_OTHER_ADDR:
+            new_order.extend(other_addr_extra_cols)
+    for c in extra_cols:
+        new_order.append(c)
+        if c == COL_OTHER_ADDR:
+            new_order.extend(other_addr_extra_cols)
     df_out = df_out[new_order]
 
     df_out = df_out.sort_values(["Rows Merged"], ascending=False).reset_index(drop=True)
@@ -1553,6 +1612,10 @@ def main() -> None:
         print(f"  {docid_overflow_groups:,} group(s) had a DOCID list too long for one "
               f"cell (> {DOCID_CHUNK_SIZE:,} chars) - split across up to "
               f"{max_docid_cols} '{COL_DOCID}' columns.")
+    if other_addr_overflow_groups:
+        print(f"  {other_addr_overflow_groups:,} group(s) had an Other Address list too "
+              f"long for one cell (> {OTHER_ADDR_CHUNK_SIZE:,} chars) - split across up "
+              f"to {max_other_addr_cols} '{COL_OTHER_ADDR}' columns.")
 
     n_multi = (df_out["Rows Merged"] > 1).sum()
     print(f"  {n_multi:,} merged groups combine 2+ original rows.")
