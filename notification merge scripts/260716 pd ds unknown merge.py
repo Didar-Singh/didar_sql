@@ -1283,6 +1283,21 @@ def main() -> None:
         )
     print(f"  {len(df):,} rows read.")
 
+    # "DOCIDs" is always required (see EXPECTED_COLS above), but the input
+    # may ALSO already have "DOCIDs 2"/"DOCIDs 3"/... - e.g. it's the output
+    # of a prior merge that itself overflowed into those columns. Whichever
+    # of those are present get read and merged in too (see SEMICOLON_COLS
+    # handling below), so a value that only lives in one row's "DOCIDs 3"
+    # isn't silently dropped.
+    _docid_extra_re = re.compile(rf"^{re.escape(COL_DOCID)} (\d+)$")
+    docid_input_cols = [COL_DOCID] + sorted(
+        (c for c in df.columns if _docid_extra_re.match(c)),
+        key=lambda c: int(_docid_extra_re.match(c).group(1)),
+    )
+    if len(docid_input_cols) > 1:
+        print(f"  Input already has overflow DOCID columns "
+              f"({', '.join(docid_input_cols[1:])}) - merging them in too.")
+
     recs = build_records(df)   # recs[i].idx == i == df row position
 
     print("Clustering (blocked comparison) ...")
@@ -1479,7 +1494,10 @@ def main() -> None:
                 dob_conflict_rows.append(conflict_row)
             continue
 
-        row = {c: semicolon_merge(sub[c]) for c in SEMICOLON_COLS}
+        row = {c: semicolon_merge(sub[c]) for c in SEMICOLON_COLS if c != COL_DOCID}
+        row[COL_DOCID] = semicolon_merge(
+            itertools.chain.from_iterable(sub[c] for c in docid_input_cols)
+        )
         row[COL_DOB] = merged_dob
 
         # A group merging enough rows can produce a DOCID string longer than
