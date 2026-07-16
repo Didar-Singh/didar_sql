@@ -528,7 +528,17 @@ def split_addresses(df, group_idxs):
     across the winning cluster - the one with the most rows in it ('Max
     Count' rule). other_address_string: every OTHER, genuinely different
     address cluster, combined into one string per address and semicolon-
-    joined, for the 'Other Address' column."""
+    joined, for the 'Other Address' column.
+
+    Uses the same transitive-safe Union-Find pattern as
+    split_bucket_by_identity(): a pairwise union is refused (not just
+    skipped) whenever it would combine two clusters that each already
+    contain a key conflicting with a key on the other side - checking every
+    key already accumulated in each cluster, not just the two specific keys
+    being compared. This stops a fully-blank address row from acting as a
+    'bridge' that transitively merges two otherwise-conflicting addresses
+    into one (which would silently drop one of them, since a single merged
+    cluster leaves nothing left over for 'Other Address')."""
     key_order = []
     key_count = {}
     key_raw = {}
@@ -554,9 +564,20 @@ def split_addresses(df, group_idxs):
         if ra != rb:
             parent[max(ra, rb)] = min(ra, rb)
 
+    key_sets = [{key_order[i]} for i in range(len(key_order))]
+
+    def keys_conflict(set1, set2):
+        return any(address_key_conflict(k1, k2) for k1 in set1 for k2 in set2)
+
     for i, j in itertools.combinations(range(len(key_order)), 2):
-        if not address_key_conflict(key_order[i], key_order[j]):
-            union(i, j)
+        ri, rj = find(i), find(j)
+        if ri == rj:
+            continue
+        if keys_conflict(key_sets[ri], key_sets[rj]):
+            continue   # refused - would bridge two conflicting addresses
+        union(i, j)
+        new_root, old_root = min(ri, rj), max(ri, rj)
+        key_sets[new_root] |= key_sets[old_root]
 
     clusters = defaultdict(list)
     for i in range(len(key_order)):
