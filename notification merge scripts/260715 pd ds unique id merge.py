@@ -60,10 +60,15 @@ Per-column merge rule, as specified for this report:
     into a new "Other Address" column as one combined string per address,
     semicolon-joined if there's more than one.
   - DOCIDs: every distinct DOCID, deduplicated and joined with "; ". If the
-    merged list would exceed Excel's 32,767-char cell limit, it spills into
-    "DOCIDs 2", "DOCIDs 3", "DOCIDs 4" (splitting only at "; " boundaries) -
-    capped at these 4 columns; a group with more DOCIDs than fits across all
-    4 gets a console warning instead of a 5th column.
+    INPUT already has "DOCIDs 2"/"DOCIDs 3"/"DOCIDs 4" (e.g. it's the output
+    of a prior merge that itself overflowed), whichever of those are present
+    are read and merged in too - not just "DOCIDs" - so a value that only
+    lives in one row's "DOCIDs 3" isn't silently dropped. The combined,
+    deduplicated result is then re-chunked for output the same way: if it
+    would exceed Excel's 32,767-char cell limit, it spills into "DOCIDs 2",
+    "DOCIDs 3", "DOCIDs 4" (splitting only at "; " boundaries) - capped at
+    these 4 columns; a group with more DOCIDs than fits across all 4 gets a
+    console warning instead of a 5th column.
   - Rows Merged (output-only): count of original rows merged into this
     identity group.
   - Other Address (output-only): see above.
@@ -715,6 +720,19 @@ def main() -> None:
         )
     print(f"  {len(df):,} rows read.")
 
+    # "DOCIDs" is always required (see EXPECTED_COLS above), but the input
+    # may ALSO already have "DOCIDs 2"/"DOCIDs 3"/"DOCIDs 4" - e.g. it's the
+    # output of a prior merge that itself overflowed into those columns.
+    # Whichever of those are present get read and merged in too, so a value
+    # that only lives in one row's "DOCIDs 3" isn't silently dropped.
+    docid_input_cols = [COL_DOCID] + [
+        f"{COL_DOCID} {i}" for i in range(2, MAX_DOCID_COLS + 1)
+        if f"{COL_DOCID} {i}" in df.columns
+    ]
+    if len(docid_input_cols) > 1:
+        print(f"  Input already has overflow DOCID columns "
+              f"({', '.join(docid_input_cols[1:])}) - merging them in too.")
+
     # Bucket by normalized Unique ID. A row is instead isolated into its own
     # singleton bucket (never merged with anything) when either:
     #   - its Unique ID is blank/missing (a blank never merges with another
@@ -774,7 +792,9 @@ def main() -> None:
         for c in SEMICOLON_COLS:
             row[c] = semicolon_merge(sub[c])
 
-        docid_merged = semicolon_merge(sub[COL_DOCID])
+        docid_merged = semicolon_merge(
+            itertools.chain.from_iterable(sub[c] for c in docid_input_cols)
+        )
         docid_chunks = split_docid_chunks(docid_merged)
         row[COL_DOCID] = docid_chunks[0]
         for extra_i, chunk in enumerate(docid_chunks[1:], start=2):
