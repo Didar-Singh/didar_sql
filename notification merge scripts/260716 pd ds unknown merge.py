@@ -233,6 +233,7 @@ COL_GOVID    = "Government-Issued ID Number"
 COL_EMPID    = "Employee Identification Number"
 COL_PHONE    = "Phone Number"
 COL_EMAIL    = "Email Address - Personal"
+COL_TAXID    = "Tax Identification Number"
 
 # Address fields are handled specially (see ADDRESS_COLS below), not as
 # plain semicolon-merged columns - they need to stay together as one unit
@@ -275,6 +276,7 @@ OTHER_MERGE_COLS = [
     "Government ID Issuing Country",
     "Government- Issued Identification",
     COL_GOVID,
+    COL_TAXID,
     "Health Related Information",
     COL_EMPID,
     "Work-Related Information",
