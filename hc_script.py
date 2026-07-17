@@ -323,6 +323,7 @@ COL_MIDDLE = "Middle Name"
 COL_SUFFIX = "Suffix"
 COL_DOB    = "Full Date of Birth (MM/DD/YYYY)"
 COL_SSN    = "Social Security Number"
+COL_TAXID  = "Tax Identification Number"
 
 # COL_DL/COL_PASSPORT/COL_PHONE/COL_EMAIL are used for matching (Rules 5-7,
 # 9). COL_EMPID is also used for matching, but only within Rule 8 (see
@@ -364,6 +365,7 @@ ADDRESS_COLS = [COL_ADDR, COL_CITY, COL_STATE, COL_PROVINCE, COL_ZIP, COL_COUNTR
 # Every other column in the sheet - these get semicolon-merged as-is.
 # Edit this list if your real headers differ.
 OTHER_MERGE_COLS = [
+    COL_TAXID,
     "Data Subject Type",
     "Birth Information",
     "Address Comments",
@@ -1925,6 +1927,20 @@ def main() -> None:
     # column would silently lose it on every run.
     other_addr_pos = col_pos.get(COL_OTHER_ADDR)
 
+    # A source file that's ITSELF a previous merge output already has its
+    # own "DOCIDs 2", "DOCIDs 3", ... overflow columns (see
+    # split_docid_chunks()) - these are real DOCID data, not just the base
+    # COL_DOCID column. Detect every such column so its values get folded
+    # into the SAME combine-and-rechunk step as COL_DOCID below, instead of
+    # being silently ignored (data loss) or - if this run happens to
+    # produce an overflow column with the SAME name - colliding into a
+    # duplicate column (pandas would then rename it "DOCIDs 2.1", etc.).
+    existing_docid_overflow_cols = [
+        c for c in df.columns
+        if c != COL_DOCID and re.fullmatch(re.escape(COL_DOCID) + r" \d+", c)
+    ]
+    docid_input_pos = [col_pos[COL_DOCID]] + [col_pos[c] for c in existing_docid_overflow_cols]
+
     for n, group_idxs in enumerate(groups, 1):
         progress("Building output", n, total_groups)
 
@@ -1940,7 +1956,11 @@ def main() -> None:
             row = {c: semicolon_merge([rv[p]]) for c, p in zip(SEMICOLON_COLS, semicol_col_pos)}
             row[COL_DOB] = dob_merge([rv[dob_pos]])
 
-            docid_chunks = split_docid_chunks(row[COL_DOCID])
+            # Combine COL_DOCID with any pre-existing "DOCIDs N" overflow
+            # columns from the source file (see docid_input_pos above) -
+            # never just the base column alone - before re-chunking.
+            combined_docid = semicolon_merge([rv[p] for p in docid_input_pos])
+            docid_chunks = split_docid_chunks(combined_docid)
             row[COL_DOCID] = docid_chunks[0]
             for extra_i, chunk in enumerate(docid_chunks[1:], start=2):
                 row[f"{COL_DOCID} {extra_i}"] = chunk
@@ -1982,7 +2002,11 @@ def main() -> None:
         # Excel's 32,767-char cell limit (silently truncated otherwise) -
         # split it across 'DOCIDs', 'DOCIDs 2', 'DOCIDs 3', ... columns,
         # breaking only at '; ' boundaries so no DOCID is ever cut in half.
-        docid_chunks = split_docid_chunks(row[COL_DOCID])
+        # Combine COL_DOCID with any pre-existing "DOCIDs N" overflow
+        # columns from the source file (see docid_input_pos above) across
+        # EVERY row in this group - never just the base column alone.
+        combined_docid = semicolon_merge([r[p] for r in sub_rows for p in docid_input_pos])
+        docid_chunks = split_docid_chunks(combined_docid)
         row[COL_DOCID] = docid_chunks[0]
         for extra_i, chunk in enumerate(docid_chunks[1:], start=2):
             row[f"{COL_DOCID} {extra_i}"] = chunk
@@ -2024,7 +2048,16 @@ def main() -> None:
     # go right after 'DOCIDs', and columns with no input counterpart
     # ('Other Address', 'Rows Merged', 'Names Differ') go at the end.
     docid_extra_cols = [f"{COL_DOCID} {i}" for i in range(2, max_docid_cols + 1)]
-    input_order = list(df.columns)
+    # Exclude the source file's OWN pre-existing "DOCIDs N" overflow columns
+    # from input_order - their data has already been fully absorbed into
+    # docid_input_pos/combined_docid above, so docid_extra_cols (this run's
+    # OWN freshly-recomputed overflow columns) is the single source of
+    # truth for how many such columns the output gets. Leaving the stale
+    # names in input_order would either drop a column whose data is no
+    # longer under that name (if this run needs fewer chunks) or collide
+    # into a duplicate "DOCIDs 2" that pandas silently renames to
+    # "DOCIDs 2.1" (if this run happens to need the same number of chunks).
+    input_order = [c for c in df.columns if c not in existing_docid_overflow_cols]
     extra_cols = [c for c in df_out.columns if c not in input_order and c not in docid_extra_cols]
     new_order = []
     for c in input_order:
