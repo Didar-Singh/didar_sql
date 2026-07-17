@@ -346,6 +346,15 @@ COL_PROVINCE = "Province of Residence (if Canada)"
 COL_ZIP     = "Zip Code"
 COL_COUNTRY = "Country of Residence"
 
+# OPTIONAL input column - NOT in EXPECTED_COLS/ADDRESS_COLS, so a source file
+# without it still works fine. If the source file already has its own
+# "Other Address" column (e.g. a secondary/alternate address the source
+# system tracks natively), its value is read and COMBINED with the freshly
+# computed "Other Address" this script derives from ADDRESS_COLS (see
+# main()) - never silently dropped, and never just overwritten by the
+# fresh value either.
+COL_OTHER_ADDR = "Other Address"
+
 # The full set of fields that make up "one address". The MAJORITY (most
 # common) address among a merged person's rows is kept in these columns as-is;
 # every OTHER distinct address goes into the "Other Address" output column
@@ -1590,14 +1599,26 @@ def split_addresses(values_arr, addr_col_pos, group_idxs):
         return tuple(out)
 
     def is_us_cluster(positions):
-        """True if any key in this cluster has a real 'State of Residence
-        (if US)' value (ADDRESS_COLS index 2). Used to prefer a US address
+        """True only for a cluster that is a genuinely real address (has a
+        real Street OR City - ADDRESS_COLS index 0/1) AND has a real 'State
+        of Residence (if US)' value (index 2). Used to prefer a US address
         as the group's PRIMARY address (kept in the normal Residential
         Address/City/State/Zip/Country columns), with every non-US address
         going to 'Other Address' - regardless of which one has more rows.
+
+        Requiring a real Street/City (not State alone) matters: a cluster
+        that has ONLY a bare State value - no street, no city - is not a
+        real, usable address on its own. Without this check, that bare
+        fragment would still outrank a fully-detailed but State-less
+        address (e.g. a real street/city/zip where State just wasn't
+        filled in), wrongly becoming Primary and leaving Residential
+        Address blank while the actual real address got demoted to 'Other
+        Address' - which looks like the address was deleted, not merged.
+
         If no cluster has a US address at all, this has no effect and the
         row-count majority below decides as usual."""
-        return any(key_order[i][2] for i in positions)
+        return (any(key_order[i][0] or key_order[i][1] for i in positions)
+                and any(key_order[i][2] for i in positions))
 
     non_blank_clusters = [c for c in clusters.values()
                           if any(any(key_order[i]) for i in c)]
@@ -1896,6 +1917,13 @@ def main() -> None:
         col_pos[COL_DOB], col_pos[COL_FIRST], col_pos[COL_LAST],
         col_pos[COL_MIDDLE], col_pos[COL_SUFFIX], col_pos[COL_SSN],
     )
+    # COL_OTHER_ADDR is OPTIONAL input - only present if the source file
+    # already tracks its own secondary/alternate address under that same
+    # column name. When present, its value must be COMBINED with (not
+    # overwritten by) the "Other Address" this script freshly computes
+    # below - otherwise a source file that already has real data in that
+    # column would silently lose it on every run.
+    other_addr_pos = col_pos.get(COL_OTHER_ADDR)
 
     for n, group_idxs in enumerate(groups, 1):
         progress("Building output", n, total_groups)
@@ -1930,7 +1958,8 @@ def main() -> None:
                 raw = rv[p]
                 norm = _address_field_norm(c, raw)
                 row[c] = "" if not norm else ("" if raw is None else str(raw).strip())
-            row["Other Address"] = ""
+            row["Other Address"] = (
+                semicolon_merge([rv[other_addr_pos]]) if other_addr_pos is not None else "")
 
             row["Rows Merged"] = 1
             row["Names Differ"] = False
@@ -1973,7 +2002,15 @@ def main() -> None:
         majority_addr_values, other_address = split_addresses(values_arr, addr_col_pos, group_idxs)
         for c, v in zip(ADDRESS_COLS, majority_addr_values):
             row[c] = v
-        row["Other Address"] = other_address
+        # Combine (never overwrite) whatever the source rows already had in
+        # their OWN "Other Address" column, if that column exists in the
+        # source file - see COL_OTHER_ADDR above. semicolon_merge() already
+        # splits every value on ";" and dedupes, so this correctly folds
+        # together the source rows' existing entries AND the freshly
+        # computed one without producing duplicates.
+        existing_other = (semicolon_merge([r[other_addr_pos] for r in sub_rows])
+                           if other_addr_pos is not None else "")
+        row["Other Address"] = semicolon_merge([existing_other, other_address])
 
         row["Rows Merged"] = len(group_idxs)
         row["Names Differ"] = has_variation(first_vals) or has_variation(last_vals)
