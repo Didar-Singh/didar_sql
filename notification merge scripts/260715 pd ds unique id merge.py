@@ -60,15 +60,15 @@ Per-column merge rule, as specified for this report:
     into a new "Other Address" column as one combined string per address,
     semicolon-joined if there's more than one.
   - DOCIDs: every distinct DOCID, deduplicated and joined with "; ". If the
-    INPUT already has "DOCIDs 2".."DOCIDs 10" (e.g. it's the output of a
-    prior merge that itself overflowed), whichever of those are present
-    are read and merged in too - not just "DOCIDs" - so a value that only
-    lives in one row's "DOCIDs 3" isn't silently dropped. The combined,
-    deduplicated result is then re-chunked for output the same way: if it
-    would exceed Excel's 32,767-char cell limit, it spills into "DOCIDs 2"
-    through "DOCIDs 10" (splitting only at "; " boundaries) - capped at
-    these 10 columns; a group with more DOCIDs than fits across all 10 gets
-    a console warning instead of an 11th column.
+    INPUT already has "DOCIDs 2", "DOCIDs 3", ... (e.g. it's the output of a
+    prior merge that itself overflowed - however many are present, with no
+    fixed limit), all of those are read and merged in too - not just
+    "DOCIDs" - so a value that only lives in one row's "DOCIDs 3" isn't
+    silently dropped. The combined, deduplicated result is then re-chunked
+    for output the same way: if it would exceed Excel's 32,767-char cell
+    limit, it spills into "DOCIDs 2", "DOCIDs 3", and so on (splitting only
+    at "; " boundaries) - UNCAPPED, so a group's DOCID list is never
+    truncated, it just takes as many columns as it needs.
   - Rows Merged (output-only): count of original rows merged into this
     identity group.
   - Other Address (output-only): see above.
@@ -204,7 +204,8 @@ EXPECTED_COLS = (
 MERGE_SEP = "; "
 EXCEL_MAX_ROWS = 1_048_576
 DOCID_CHUNK_SIZE = 20_000   # keep well under Excel's 32,767-char cell limit
-MAX_DOCID_COLS = 10         # fixed: DOCIDs, DOCIDs 2, DOCIDs 3, ... DOCIDs 10
+# DOCIDs columns are UNCAPPED (see split_docid_chunks()) - a group's DOCID
+# list spills into as many "DOCIDs N" columns as it takes, never truncated.
 OTHER_ADDR_CHUNK_SIZE = 25_000   # keep well under Excel's 32,767-char cell limit
 MAX_OTHER_ADDR_COLS = 4          # fixed: Other Address, Other Address 2, 3, 4
 
@@ -469,12 +470,18 @@ def semicolon_merge(values) -> str:
     return MERGE_SEP.join(out)
 
 
-def split_docid_chunks(docid_str, max_chars=DOCID_CHUNK_SIZE, max_cols=MAX_DOCID_COLS):
+def split_docid_chunks(docid_str, max_chars=DOCID_CHUNK_SIZE, max_cols=None):
     """Splits an already-merged DOCID string into chunks no longer than
-    max_chars, breaking ONLY at '; ' boundaries (never mid-DOCID) - capped at
-    max_cols total chunks. If content remains after the (max_cols - 1)th
-    split, everything left is packed into the final chunk (even if it then
-    exceeds max_chars) rather than spilling into a 5th column."""
+    max_chars, breaking ONLY at '; ' boundaries (never mid-DOCID).
+
+    max_cols=None (the default, used for DOCIDs) means UNCAPPED: as many
+    chunks as it takes, so a group's DOCID list is never truncated or dumped
+    into one oversized final column - it just spills into however many
+    'DOCIDs N' columns are needed. Pass an actual max_cols (used for Other
+    Address, which stays capped at MAX_OTHER_ADDR_COLS) to cap the chunk
+    count instead - once that many chunks exist, everything left is packed
+    into the final one (even past max_chars) rather than adding another
+    column."""
     if len(docid_str) <= max_chars:
         return [docid_str]
     parts = docid_str.split(MERGE_SEP)
@@ -484,7 +491,7 @@ def split_docid_chunks(docid_str, max_chars=DOCID_CHUNK_SIZE, max_cols=MAX_DOCID
     for part in parts:
         added_len = len(part) + (len(MERGE_SEP) if current else 0)
         if (current and current_len + added_len > max_chars
-                and len(chunks) < max_cols - 1):
+                and (max_cols is None or len(chunks) < max_cols - 1)):
             chunks.append(MERGE_SEP.join(current))
             current = [part]
             current_len = len(part)
@@ -730,14 +737,17 @@ def main() -> None:
     print(f"  {len(df):,} rows read.")
 
     # "DOCIDs" is always required (see EXPECTED_COLS above), but the input
-    # may ALSO already have "DOCIDs 2"/"DOCIDs 3"/"DOCIDs 4" - e.g. it's the
+    # may ALSO already have "DOCIDs 2", "DOCIDs 3", ... - e.g. it's the
     # output of a prior merge that itself overflowed into those columns.
-    # Whichever of those are present get read and merged in too, so a value
-    # that only lives in one row's "DOCIDs 3" isn't silently dropped.
-    docid_input_cols = [COL_DOCID] + [
-        f"{COL_DOCID} {i}" for i in range(2, MAX_DOCID_COLS + 1)
-        if f"{COL_DOCID} {i}" in df.columns
-    ]
+    # There's no fixed limit on how many (DOCIDs output is uncapped - see
+    # split_docid_chunks()), so this scans upward until a number is missing,
+    # rather than stopping at some hardcoded max - so a value that only
+    # lives in one row's "DOCIDs 11" (or higher) isn't silently dropped.
+    docid_input_cols = [COL_DOCID]
+    _i = 2
+    while f"{COL_DOCID} {_i}" in df.columns:
+        docid_input_cols.append(f"{COL_DOCID} {_i}")
+        _i += 1
     if len(docid_input_cols) > 1:
         print(f"  Input already has overflow DOCID columns "
               f"({', '.join(docid_input_cols[1:])}) - merging them in too.")
@@ -824,10 +834,6 @@ def main() -> None:
         if len(docid_chunks) > 1:
             docid_overflow_groups += 1
             max_docid_cols_used = max(max_docid_cols_used, len(docid_chunks))
-        if len(docid_chunks) == MAX_DOCID_COLS and len(docid_chunks[-1]) > DOCID_CHUNK_SIZE:
-            print(f"\n  WARNING: Unique ID {row[COL_UNIQUEID]!r} has more DOCIDs than "
-                  f"fit across {MAX_DOCID_COLS} columns - '{COL_DOCID} {MAX_DOCID_COLS}' "
-                  f"exceeds Excel's comfortable cell size and may display truncated.")
 
         majority_addr_values, other_address = split_addresses(df, group_idxs)
         for c, v in zip(ADDRESS_COLS, majority_addr_values):
@@ -862,19 +868,20 @@ def main() -> None:
     df_out = pd.DataFrame(out_rows)
 
     # Column order: follow the INPUT file's own header sequence, with any
-    # 'DOCIDs 2/3/4' overflow columns right after 'DOCIDs' and any
-    # 'Other Address 2/3/4' overflow columns right after 'Other Address'
-    # (regardless of whether the input already had those overflow columns
-    # itself - they're always placed via this fixed logic, never via their
-    # own raw input position too, so a chained run's input never ends up
-    # with the same overflow column listed twice), and columns with no
-    # input counterpart ('Other Address' on a fresh source file, 'Rows
-    # Merged') at the end.
-    docid_extra_cols = [f"{COL_DOCID} {i}" for i in range(2, MAX_DOCID_COLS + 1)
+    # 'DOCIDs 2/3/...' overflow columns right after 'DOCIDs' (however many
+    # this run actually produced - DOCIDs output is uncapped, see
+    # split_docid_chunks()/max_docid_cols_used) and any 'Other Address 2/3/4'
+    # overflow columns right after 'Other Address' (regardless of whether the
+    # input already had those overflow columns itself - they're always
+    # placed via this fixed logic, never via their own raw input position
+    # too, so a chained run's input never ends up with the same overflow
+    # column listed twice), and columns with no input counterpart ('Other
+    # Address' on a fresh source file, 'Rows Merged') at the end.
+    docid_extra_cols = [f"{COL_DOCID} {i}" for i in range(2, max_docid_cols_used + 1)
                         if f"{COL_DOCID} {i}" in df_out.columns]
     other_addr_extra_cols = [f"{COL_OTHER_ADDR} {i}" for i in range(2, MAX_OTHER_ADDR_COLS + 1)
                              if f"{COL_OTHER_ADDR} {i}" in df_out.columns]
-    docid_extra_names = {f"{COL_DOCID} {i}" for i in range(2, MAX_DOCID_COLS + 1)}
+    docid_extra_names = {f"{COL_DOCID} {i}" for i in range(2, max_docid_cols_used + 1)}
     other_addr_extra_names = {f"{COL_OTHER_ADDR} {i}" for i in range(2, MAX_OTHER_ADDR_COLS + 1)}
     input_order = list(df.columns)
     extra_cols = [c for c in df_out.columns
