@@ -60,15 +60,15 @@ Per-column merge rule, as specified for this report:
     into a new "Other Address" column as one combined string per address,
     semicolon-joined if there's more than one.
   - DOCIDs: every distinct DOCID, deduplicated and joined with "; ". If the
-    INPUT already has "DOCIDs 2"/"DOCIDs 3"/"DOCIDs 4" (e.g. it's the output
-    of a prior merge that itself overflowed), whichever of those are present
+    INPUT already has "DOCIDs 2".."DOCIDs 10" (e.g. it's the output of a
+    prior merge that itself overflowed), whichever of those are present
     are read and merged in too - not just "DOCIDs" - so a value that only
     lives in one row's "DOCIDs 3" isn't silently dropped. The combined,
     deduplicated result is then re-chunked for output the same way: if it
-    would exceed Excel's 32,767-char cell limit, it spills into "DOCIDs 2",
-    "DOCIDs 3", "DOCIDs 4" (splitting only at "; " boundaries) - capped at
-    these 4 columns; a group with more DOCIDs than fits across all 4 gets a
-    console warning instead of a 5th column.
+    would exceed Excel's 32,767-char cell limit, it spills into "DOCIDs 2"
+    through "DOCIDs 10" (splitting only at "; " boundaries) - capped at
+    these 10 columns; a group with more DOCIDs than fits across all 10 gets
+    a console warning instead of an 11th column.
   - Rows Merged (output-only): count of original rows merged into this
     identity group.
   - Other Address (output-only): see above.
@@ -204,7 +204,7 @@ EXPECTED_COLS = (
 MERGE_SEP = "; "
 EXCEL_MAX_ROWS = 1_048_576
 DOCID_CHUNK_SIZE = 20_000   # keep well under Excel's 32,767-char cell limit
-MAX_DOCID_COLS = 4          # fixed: DOCIDs, DOCIDs 2, DOCIDs 3, DOCIDs 4
+MAX_DOCID_COLS = 10         # fixed: DOCIDs, DOCIDs 2, DOCIDs 3, ... DOCIDs 10
 OTHER_ADDR_CHUNK_SIZE = 25_000   # keep well under Excel's 32,767-char cell limit
 MAX_OTHER_ADDR_COLS = 4          # fixed: Other Address, Other Address 2, 3, 4
 
