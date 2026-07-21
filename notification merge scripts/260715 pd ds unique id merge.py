@@ -12,8 +12,10 @@ Unique ID does the heavy lifting, with two safety rules layered on top:
      would incorrectly combine unrelated rows.
   2. A row whose First Name AND Last Name are BOTH entirely blank (or a
      placeholder like "[Unknown]"/"N/A" - see NAME_PLACEHOLDERS/norm_name())
-     is NEVER merged with any other row, even if it shares a Unique ID with
-     them - there isn't enough identifying information to safely combine it.
+     still merges normally into whichever Named row(s) share its Unique ID -
+     a shared Unique ID is enough on its own for an Unknown-named row, since
+     rule 3 below can never flag a name CONFLICT against a blank/placeholder
+     name (a real name is required on both sides to disagree).
   3. Within one Unique ID's rows, two rows are split apart (kept as separate
      people) whenever their First Name AND Last Name BOTH genuinely differ
      (a real, non-blank value on both sides that disagrees) UNLESS a
@@ -47,11 +49,11 @@ Per-column merge rule, as specified for this report:
     Personal, Phone Number, Contact Information, Driver's License Number,
     DL Issuing Country/Province/State, Passport Country/Number, Government
     ID Issuing Country, Government- Issued Identification, Government-Issued
-    ID Number, Health/Work/Family/Financial/Student/Demographic/Biometric
-    Information, PI Notes, Access Credentials: every distinct value across
-    the group, deduplicated and joined with "; " (see semicolon_merge() -
-    a cell that already contains multiple semicolon-joined values is split
-    and deduped at that token level too).
+    ID Number, Tax Identification Number, Health/Work/Family/Financial/
+    Student/Demographic/Biometric Information, PI Notes, Access Credentials:
+    every distinct value across the group, deduplicated and joined with "; "
+    (see semicolon_merge() - a cell that already contains multiple
+    semicolon-joined values is split and deduped at that token level too).
   - Residential Address, City, State, Province, Zip Code, Country of
     Residence: kept TOGETHER as one unit - the MOST COMMON (max count)
     complete address among the group's rows stays in these columns (with any
@@ -175,6 +177,7 @@ SEMICOLON_COLS = [
     "Government ID Issuing Country",
     "Government- Issued Identification",
     "Government-Issued ID Number",
+    "Tax Identification Number",
     "Health Related Information",
     "Work-Related Information",
     "Family Information",
@@ -769,21 +772,21 @@ def main() -> None:
         print(f"  Input already has overflow Other Address columns "
               f"({', '.join(other_addr_input_cols[1:])}) - merging them in too.")
 
-    # Bucket by normalized Unique ID. A row is instead isolated into its own
-    # singleton bucket (never merged with anything) when either:
-    #   - its Unique ID is blank/missing (a blank never merges with another
-    #     blank - treating all blanks as "the same ID" would incorrectly
-    #     combine unrelated rows), or
-    #   - First Name AND Last Name are BOTH entirely blank/placeholder (see
-    #     norm_name()) - not enough identifying information to safely merge.
+    # Bucket by normalized Unique ID. A row with First Name AND Last Name
+    # BOTH entirely blank/placeholder (see norm_name()) still joins its
+    # Unique ID's bucket like any other row - it merges into the Named
+    # entry(ies) sharing that Unique ID rather than being kept separate,
+    # since split_bucket_by_identity()'s conflict guard never fires against
+    # a blank/placeholder name (name_conflict_blocks_merge() requires a REAL
+    # name on both sides to detect a conflict) - so this can't accidentally
+    # combine two genuinely different people.
+    # A row is isolated into its own singleton bucket (never merged with
+    # anything) ONLY when its Unique ID is itself blank/missing - a blank
+    # Unique ID never merges with another blank, since treating all blanks
+    # as "the same ID" would incorrectly combine unrelated rows.
     blank_counter = itertools.count()
     groups_map = defaultdict(list)
     for i in range(len(df)):
-        first_blank = not norm_name(df.at[i, COL_FIRST])
-        last_blank = not norm_name(df.at[i, COL_LAST])
-        if first_blank and last_blank:
-            groups_map[f"__noname_{next(blank_counter)}__"].append(i)
-            continue
         uid = norm_text(df.at[i, COL_UNIQUEID])
         key = uid or f"__blankuid_{next(blank_counter)}__"
         groups_map[key].append(i)

@@ -2,7 +2,7 @@
 260716 pd ds unknown merge.py
 
 Merge PII/PHI person records from an Excel export into one row per
-confirmed person, for the notification report. Ten rules, built step by
+confirmed person, for the notification report. Eleven rules, built step by
 step:
 
   Rule 1 (SSN Exists): rows with the same (non-blank) SSN are merged, AS
@@ -77,6 +77,26 @@ step:
                         Rule 4 (no real name required on both sides), but
                         matched on Government-Issued ID Number instead of
                         Employee ID.
+  Rule 11 (Unknown Name Bridge): applies ONLY when exactly one of the two
+                        rows is "Unknown" - First Name AND Last Name BOTH
+                        entirely blank or a placeholder (see NAME_PLACEHOLDERS/
+                        norm_name()) - and the other row has a real name.
+                        Two real, different names are NEVER merged by this
+                        rule (or any other) - only an Unknown row is ever
+                        attached to a Named one. Checked in STRICT PRIORITY
+                        ORDER: SSN, then (only if SSN isn't a real, known
+                        value on BOTH sides) DOB, then Driver's License
+                        Number, then Government-Issued ID Number, then
+                        Passport Number, then Address. The FIRST of these
+                        fields that has a real value on BOTH sides decides
+                        the outcome - a match merges the Unknown row into
+                        that identity, a mismatch refuses the merge even if
+                        a later/weaker field in the list would have agreed
+                        (see unknown_bridge_match()). If NONE of these
+                        fields has a real value on both sides, there is no
+                        evidence to attach the Unknown row to this specific
+                        identity, so it is NOT merged - it stays its own
+                        separate, unnamed record.
 
 Either rule matching is enough to merge, and the match is transitive (if
 A matches B and B matches C, all three end up in one merged row, even if
@@ -90,12 +110,14 @@ SSN, bridged by a blank-SSN row, still end up as 2 clean groups instead of
 8 separate rows (see group_ssn/group_dob/try_union() in main()).
 
 A conflicting real ADDRESS gets the same transitive-bridge protection, but
-only for the WEAK-evidence Rule 8 (Full Address, Name) itself - a
-STRONG match (Rule 1 SSN, Rule 2 Name+DOB, or Rules 4-7/9-10 ID+Name) is
-trusted enough to override a conflicting address on its own, since the same
-person legitimately having two different addresses on file (e.g. they
-moved) is far more likely than two different people sharing an SSN/DOB/ID
-(see group_addr/try_union() in main()).
+only for the WEAK-evidence Rule 8 (Full Address, Name) itself, and for a
+Rule 11 (Unknown Name Bridge) match decided ONLY by its own weakest Address
+tier - a STRONG match (Rule 1 SSN, Rule 2 Name+DOB, Rules 4-7/9-10 ID+Name,
+or a Rule 11 match decided by its SSN/DOB/DL/Gov ID/Passport tier - see
+unknown_bridge_strong()) is trusted enough to override a conflicting
+address on its own, since the same person legitimately having two different
+addresses on file (e.g. they moved) is far more likely than two different
+people sharing an SSN/DOB/ID (see group_addr/try_union() in main()).
 
 INPUT  : an Excel workbook with the columns listed in EXPECTED_COLS below.
 OUTPUT : a new Excel workbook with two sheets:
@@ -885,6 +907,77 @@ def address_name_match(r1: Rec, r2: Rec) -> bool:
     return compatible(r1.ssn, r2.ssn) and compatible(r1.dob, r2.dob)
 
 
+def unknown_bridge_strong(r1: Rec, r2: Rec):
+    """The SSN -> DOB -> Driver's License -> Gov ID -> Passport tiers of
+    Rule 11 (Unknown Name Bridge) - every tier EXCEPT the final, weakest
+    Address fallback (see unknown_bridge_match()). Returns True (decisive
+    match), False (decisive mismatch - refuse, even though a later/weaker
+    tier might have agreed), or None if this pair isn't an Unknown+Named
+    pair at all, or no tier here has a real value on both sides (falls
+    through to the Address tier instead).
+
+    Split out from unknown_bridge_match() so try_union() can treat an
+    already-strong-tier bridge (SSN/DOB/DL/Gov ID/Passport) the same as the
+    other STRONG rules - trusted enough to override a conflicting address on
+    its own - while a bridge decided ONLY by the weak Address tier stays
+    WEAK, same as Rule 8."""
+    r1_named = bool(r1.first) or bool(r1.last)
+    r2_named = bool(r2.first) or bool(r2.last)
+    if r1_named == r2_named:
+        return None   # both Named or both Unknown - not this rule's job
+    if r1.ssn and r2.ssn:
+        return r1.ssn == r2.ssn
+    if r1.dob and r2.dob:
+        return r1.dob == r2.dob
+    if r1.dl_ids and r2.dl_ids:
+        return not r1.dl_ids.isdisjoint(r2.dl_ids)
+    if r1.govids and r2.govids:
+        return not r1.govids.isdisjoint(r2.govids)
+    if r1.passport_ids and r2.passport_ids:
+        return not r1.passport_ids.isdisjoint(r2.passport_ids)
+    return None
+
+
+def unknown_bridge_match(r1: Rec, r2: Rec) -> bool:
+    """Step 11 - 'Unknown Name Bridge': attaches an Unknown-named row (First
+    AND Last BOTH blank/placeholder - see norm_name()) to a Named row (a
+    real value on at least one of First/Last) - and ONLY that direction.
+    Two rows that are BOTH Named, or BOTH Unknown, are never matched by this
+    rule (they're governed by the other rules instead) - this rule never
+    merges two real, different names.
+
+    Checked in STRICT PRIORITY ORDER - SSN, then DOB, then Driver's License
+    Number, then Government-Issued ID Number, then Passport Number, then
+    Address (see unknown_bridge_strong() for the first five tiers): the
+    FIRST of these that has a real, known value on BOTH sides decides the
+    outcome and stops the chain right there - a real value agreeing merges
+    the Unknown row in, a real value disagreeing refuses the merge even if
+    a later/weaker field in the list would have agreed. A field that's
+    blank on either side is simply skipped (not decisive), falling through
+    to the next one. If NONE of these fields has a real value on both
+    sides, there's no evidence to attach this Unknown row to this specific
+    identity - it is NOT merged, and stays its own separate, unnamed
+    record."""
+    r1_named = bool(r1.first) or bool(r1.last)
+    r2_named = bool(r2.first) or bool(r2.last)
+    if r1_named == r2_named:
+        return False   # both Named or both Unknown - not this rule's job
+    strong = unknown_bridge_strong(r1, r2)
+    if strong is not None:
+        return strong
+    other_fields1 = (r1.city, r1.state, zip5(r1.zip), r1.province)
+    other_fields2 = (r2.city, r2.state, zip5(r2.zip), r2.province)
+    has_addr1 = bool(r1.addr) or any(other_fields1)
+    has_addr2 = bool(r2.addr) or any(other_fields2)
+    if has_addr1 and has_addr2:
+        if address_conflict(r1, r2):
+            return False
+        return (bool(r1.addr) and bool(r2.addr)) or any(
+            a and b and a == b for a, b in zip(other_fields1, other_fields2)
+        )
+    return False   # nothing usable on both sides at any priority level - stays Unknown
+
+
 def is_match(r1: Rec, r2: Rec) -> bool:
     return (
         ssn_exists_match(r1, r2)
@@ -896,6 +989,7 @@ def is_match(r1: Rec, r2: Rec) -> bool:
         or address_name_match(r1, r2)
         or email_name_match(r1, r2)
         or govid_name_match(r1, r2)
+        or unknown_bridge_match(r1, r2)
     )
 
 
@@ -964,6 +1058,13 @@ def bucket_candidate_pairs(recs):
             buckets[("ssn", r.ssn)].append(r.idx)
         if r.first and r.last and r.dob:              # Rule 2: Exact Name, DOB
             buckets[("namedob", r.first, r.last, r.dob)].append(r.idx)
+        # Rule 11 (Unknown Name Bridge) can match on DOB ALONE (no name
+        # needed on either side, unlike Rule 2's "namedob" bucket above) -
+        # bucket by DOB by itself too, so an Unknown row and a Named row
+        # sharing only a DOB (no SSN/DL/Gov ID/Passport/address overlap)
+        # still land in a shared bucket and get a chance to be tested.
+        if r.dob:
+            buckets[("dob", r.dob)].append(r.idx)
         # Rules 4-6, 10 (Employee ID/DL/Passport/Gov ID - STRONG identifiers)
         # bucket by the ID token ALONE, not name - a row with a blank/
         # placeholder name must still land in the same bucket as a
@@ -1417,19 +1518,22 @@ def main() -> None:
         if first_conflict or last_conflict:
             refused_name += 1
             return   # would combine two rows/groups with genuinely different real names - refused
-        # A STRONG match (SSN, Name+DOB, or any ID+Name rule) is trusted
-        # enough to override a conflicting address on its own - e.g. the
-        # same SSN turning up with two different addresses on file is far
-        # more likely to mean "this person moved" than "two different
-        # people happen to share this SSN". Only the WEAK-evidence Rule 8
-        # itself (which IS the address rule, so it can't be used to
-        # override its own conflict check) still gets blocked by a
-        # conflicting address.
+        # A STRONG match (SSN, Name+DOB, any ID+Name rule, or an
+        # SSN/DOB/DL/Gov ID/Passport-tier Unknown Name Bridge - see
+        # unknown_bridge_strong()) is trusted enough to override a
+        # conflicting address on its own - e.g. the same SSN turning up with
+        # two different addresses on file is far more likely to mean "this
+        # person moved" than "two different people happen to share this
+        # SSN". Only the WEAK-evidence Rule 8 itself, and an Unknown Name
+        # Bridge decided ONLY by its own weakest Address tier (which is
+        # itself IS the address evidence, so it can't override its own
+        # conflict check), still get blocked by a conflicting address.
         strong_match = (
             ssn_exists_match(r1, r2) or exact_name_dob_match(r1, r2)
             or empid_name_match(r1, r2) or dl_name_match(r1, r2)
             or passport_name_match(r1, r2) or phone_name_match(r1, r2)
             or email_name_match(r1, r2) or govid_name_match(r1, r2)
+            or bool(unknown_bridge_strong(r1, r2))
         )
         aa, ab = group_addr[ra], group_addr[rb]
         if not strong_match:
