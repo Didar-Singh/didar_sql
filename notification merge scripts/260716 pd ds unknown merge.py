@@ -1053,18 +1053,26 @@ class UnionFind:
 
 def bucket_candidate_pairs(recs):
     buckets = defaultdict(list)
+    # Rule 11 (Unknown Name Bridge)'s DOB tier ONLY ever matches an Unknown
+    # row against a Named row (see unknown_bridge_strong() - it returns None
+    # immediately for a Named-Named or Unknown-Unknown pair). So rather than
+    # bucketing ALL rows sharing a DOB together (which - unlike a specific
+    # Name+DOB or SSN - can be a very large bucket, since many unrelated
+    # people share a birthday, making the generic all-pairs-in-a-bucket
+    # approach below quadratic and slow), these two dicts split each DOB's
+    # rows by Named/Unknown up front, so only the Unknown x Named CROSS
+    # pairs get generated (see the dedicated loop after the main one below) -
+    # never Unknown x Unknown or Named x Named, which this rule can't match
+    # anyway and are already covered by the other buckets/rules.
+    dob_named = defaultdict(list)
+    dob_unknown = defaultdict(list)
     for r in recs:
         if r.ssn:                                    # Rule 1: SSN Exists
             buckets[("ssn", r.ssn)].append(r.idx)
         if r.first and r.last and r.dob:              # Rule 2: Exact Name, DOB
             buckets[("namedob", r.first, r.last, r.dob)].append(r.idx)
-        # Rule 11 (Unknown Name Bridge) can match on DOB ALONE (no name
-        # needed on either side, unlike Rule 2's "namedob" bucket above) -
-        # bucket by DOB by itself too, so an Unknown row and a Named row
-        # sharing only a DOB (no SSN/DL/Gov ID/Passport/address overlap)
-        # still land in a shared bucket and get a chance to be tested.
         if r.dob:
-            buckets[("dob", r.dob)].append(r.idx)
+            (dob_named if (r.first or r.last) else dob_unknown)[r.dob].append(r.idx)
         # Rules 4-6, 10 (Employee ID/DL/Passport/Gov ID - STRONG identifiers)
         # bucket by the ID token ALONE, not name - a row with a blank/
         # placeholder name must still land in the same bucket as a
@@ -1118,6 +1126,18 @@ def bucket_candidate_pairs(recs):
             continue
         for a, b in itertools.combinations(sorted(idxs), 2):
             pairs.add((a, b))
+
+    # Rule 11 DOB-tier cross pairs (see the comment on dob_named/dob_unknown
+    # above) - only Unknown x Named, for each DOB value both sides share.
+    total_dob = len(dob_named)
+    for n, (dob, named_idxs) in enumerate(dob_named.items(), 1):
+        progress("Bucketing (DOB bridge)", n, total_dob)
+        unknown_idxs = dob_unknown.get(dob)
+        if not unknown_idxs:
+            continue
+        for a in named_idxs:
+            for b in unknown_idxs:
+                pairs.add((a, b) if a < b else (b, a))
     return pairs
 
 
