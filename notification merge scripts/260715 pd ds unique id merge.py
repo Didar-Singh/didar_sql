@@ -27,6 +27,16 @@ Unique ID does the heavy lifting, with two safety rules layered on top:
      conflicting known identities" pattern as the notification-merge
      script's SSN/DOB/address guards, so a chain of rows can't quietly
      bridge two genuinely different people together.
+  4. Within one Unique ID's rows, two rows are ALSO split apart whenever
+     their Social Security Number AND Full Date of Birth BOTH genuinely
+     differ (real, non-blank values on both sides that disagree) - even if
+     the First/Last Name match or are blank (see ssn_dob_conflict()).
+     Unlike rule 3, there is no override for this one: a matching Name does
+     not excuse a genuine SSN+DOB conflict. A conflicting SSN or DOB ALONE
+     (the other blank, or matching) is NOT enough to split on its own -
+     both must genuinely disagree. Every row on either side of a split
+     caused by this rule is tagged in the output "SSN Differs Flag" column
+     ("Y") so it's easy to find and review.
 
 Per-column merge rule, as specified for this report:
 
@@ -73,6 +83,10 @@ Per-column merge rule, as specified for this report:
     truncated, it just takes as many columns as it needs.
   - Rows Merged (output-only): count of original rows merged into this
     identity group.
+  - SSN Differs Flag (output-only): "Y" if this identity group was kept
+    split apart from another group sharing the same Unique ID specifically
+    because of a genuine SSN+DOB conflict (see rule 4 above /
+    ssn_dob_conflict()); blank otherwise.
   - Other Address (output-only): see above.
 
 INPUT  : an Excel workbook with the columns listed in EXPECTED_COLS below.
@@ -657,12 +671,28 @@ def name_conflict_blocks_merge(g1: tuple, g2: tuple) -> bool:
     return not (ssn_confirms or dob_confirms)
 
 
+def ssn_dob_conflict(g1: tuple, g2: tuple) -> bool:
+    """True if two identity-groups (see name_conflict_blocks_merge() for the
+    (first_names, last_names, ssns, dobs) shape) must be split apart because
+    BOTH their SSN and their DOB genuinely disagree - a real, non-blank,
+    non-matching value on both sides for EACH identifier. Unlike
+    name_conflict_blocks_merge(), there is no override here: a shared/
+    matching Name does not excuse an SSN+DOB conflict. A conflict on only
+    ONE of SSN/DOB (the other blank or matching) is not enough to split."""
+    _, _, ssn1, dob1 = g1
+    _, _, ssn2, dob2 = g2
+    ssn_conflict = bool(ssn1) and bool(ssn2) and ssn1.isdisjoint(ssn2)
+    dob_conflict = bool(dob1) and bool(dob2) and dob1.isdisjoint(dob2)
+    return ssn_conflict and dob_conflict
+
+
 def split_bucket_by_identity(df, idxs):
     """Given a list of row indices that already share one (normalized)
     Unique ID, further splits them into sub-groups whenever two rows have a
     genuine First+Last Name conflict not confirmed-away by a matching SSN or
-    DOB (see name_conflict_blocks_merge()) - a shared Unique ID alone is not
-    trusted enough to override that.
+    DOB (see name_conflict_blocks_merge()), OR a genuine SSN+DOB conflict
+    with no override (see ssn_dob_conflict()) - a shared Unique ID alone is
+    not trusted enough to override either.
 
     Uses the same transitive-safe Union-Find pattern as split_addresses():
     each row starts in its own singleton, and a pairwise union is refused
@@ -670,11 +700,17 @@ def split_bucket_by_identity(df, idxs):
     identities - checking the accumulated set of every name/SSN/DOB already
     inside each side's cluster, not just the two specific rows being
     compared. This stops a 'bridge' row (e.g. blank name) from transitively
-    linking two otherwise-conflicting people together. Returns a list of
-    index-lists (sub-groups); a single-row input returns unchanged."""
+    linking two otherwise-conflicting people together.
+
+    Returns a list of (index-list, ssn_differs_flag) tuples - one per
+    sub-group. ssn_differs_flag is True for every sub-group that ended up
+    split apart from another sub-group of this SAME Unique ID specifically
+    because of an ssn_dob_conflict() (so it can be tagged in the output "SSN
+    Differs Flag" column). A single-row input returns unchanged with the
+    flag False."""
     n = len(idxs)
     if n == 1:
-        return [idxs]
+        return [(idxs, False)]
 
     parent = list(range(n))
 
@@ -706,7 +742,7 @@ def split_bucket_by_identity(df, idxs):
             continue
         g1 = (first_sets[ri], last_sets[ri], ssn_sets[ri], dob_sets[ri])
         g2 = (first_sets[rj], last_sets[rj], ssn_sets[rj], dob_sets[rj])
-        if name_conflict_blocks_merge(g1, g2):
+        if name_conflict_blocks_merge(g1, g2) or ssn_dob_conflict(g1, g2):
             continue   # refused - keep these apart despite the shared Unique ID
         union(i, j)
         new_root, old_root = min(ri, rj), max(ri, rj)
@@ -718,7 +754,21 @@ def split_bucket_by_identity(df, idxs):
     clusters = defaultdict(list)
     for i in range(n):
         clusters[find(i)].append(idxs[i])
-    return list(clusters.values())
+
+    # A final root's sets hold that whole sub-group's aggregated identity
+    # data (bubbled up through every union() above), so comparing final
+    # roots pairwise tells us exactly which sub-groups were kept apart
+    # because of a genuine SSN+DOB conflict (as opposed to only a Name
+    # conflict) - that's what gets tagged in the output.
+    roots = list(clusters.keys())
+    ssn_flag = {r: False for r in roots}
+    for ri, rj in itertools.combinations(roots, 2):
+        g1 = (first_sets[ri], last_sets[ri], ssn_sets[ri], dob_sets[ri])
+        g2 = (first_sets[rj], last_sets[rj], ssn_sets[rj], dob_sets[rj])
+        if ssn_dob_conflict(g1, g2):
+            ssn_flag[ri] = ssn_flag[rj] = True
+
+    return [(clusters[r], ssn_flag[r]) for r in roots]
 
 
 # ------------------------------------------------------------
@@ -796,19 +846,29 @@ def main() -> None:
     # DOB (see split_bucket_by_identity()) - a shared Unique ID is a strong
     # signal, not an absolute one.
     groups = []
+    group_ssn_flags = []
     split_bucket_count = 0
+    ssn_flagged_group_count = 0
     for idxs in groups_map.values():
         sub_groups = split_bucket_by_identity(df, idxs)
         if len(sub_groups) > 1:
             split_bucket_count += 1
-        groups.extend(sub_groups)
+        for sub_idxs, ssn_flag in sub_groups:
+            groups.append(sub_idxs)
+            group_ssn_flags.append(ssn_flag)
+            if ssn_flag:
+                ssn_flagged_group_count += 1
 
     print(f"  {len(df):,} rows -> {len(groups):,} identity groups "
           f"({len(df) - len(groups):,} rows collapsed by merging).")
     if split_bucket_count:
         print(f"  {split_bucket_count:,} Unique ID(s) were split into 2+ separate "
               f"identity groups due to a Name conflict not confirmed by a "
-              f"matching SSN/DOB.")
+              f"matching SSN/DOB, and/or a genuine SSN+DOB conflict.")
+    if ssn_flagged_group_count:
+        print(f"  {ssn_flagged_group_count:,} identity group(s) were kept split apart "
+              f"(and tagged 'SSN Differs Flag') due to a genuinely conflicting "
+              f"SSN AND Date of Birth.")
 
     out_rows = []
     docid_overflow_groups = 0
@@ -866,6 +926,7 @@ def main() -> None:
             max_other_addr_cols_used = max(max_other_addr_cols_used, len(other_addr_chunks))
 
         row["Rows Merged"] = len(group_idxs)
+        row["SSN Differs Flag"] = "Y" if group_ssn_flags[n - 1] else ""
         out_rows.append(row)
 
     df_out = pd.DataFrame(out_rows)
