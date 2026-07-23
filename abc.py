@@ -71,10 +71,10 @@ def main():
         help="Max characters per merged cell before overflowing into a new column (default: 25000)",
     )
     parser.add_argument(
-        "--id-col", default="Unique ID", help="Name of the unique id column (default: 'Unique ID')"
+        "--id-col", default="Unique_ID", help="Name of the unique id column (default: 'Unique_ID')"
     )
     parser.add_argument(
-        "--name-col", default="File Name", help="Name of the file name column (default: 'File Name')"
+        "--name-col", default="File_Name", help="Name of the file name column (default: 'File_Name')"
     )
     args = parser.parse_args()
 
