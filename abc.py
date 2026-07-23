@@ -22,6 +22,17 @@ import sys
 EXCEL_HARD_LIMIT = 32767  # Excel's absolute max characters per cell
 
 
+def print_progress(stage, current, total):
+    pct = 100 if total == 0 else min(100, int(current * 100 / total))
+    bar_width = 30
+    filled = int(bar_width * pct / 100)
+    bar = "#" * filled + "-" * (bar_width - filled)
+    sys.stderr.write(f"\r{stage:<22} [{bar}] {pct:3d}%")
+    sys.stderr.flush()
+    if pct >= 100:
+        sys.stderr.write("\n")
+
+
 def build_chunks(file_names, separator, max_len):
     """Pack file_names into as few chunks as possible, each <= max_len chars."""
     chunks = []
@@ -75,6 +86,10 @@ def main():
         )
         args.max_len = EXCEL_HARD_LIMIT
 
+    # Count data rows up front so read progress can show a real percentage.
+    total_rows = sum(1 for _ in open(args.input_csv, encoding="utf-8-sig")) - 1
+    total_rows = max(total_rows, 0)
+
     # Preserve first-seen order of Unique IDs, and collect file names per id.
     grouped = {}
     order = []
@@ -86,7 +101,7 @@ def main():
                 f"Input CSV must contain columns '{args.id_col}' and '{args.name_col}'. "
                 f"Found: {reader.fieldnames}"
             )
-        for row in reader:
+        for i, row in enumerate(reader, start=1):
             uid = row[args.id_col]
             name = row[args.name_col]
             if uid not in grouped:
@@ -94,14 +109,23 @@ def main():
                 order.append(uid)
             if name:
                 grouped[uid].append(name)
+            if i % 500 == 0 or i == total_rows:
+                print_progress("Reading rows", i, total_rows)
+    if total_rows == 0:
+        print_progress("Reading rows", 0, 0)
 
     # Build chunks per id, tracking the max number of columns needed.
     id_chunks = {}
     max_cols = 1
-    for uid in order:
+    total_ids = len(order)
+    for i, uid in enumerate(order, start=1):
         chunks = build_chunks(grouped[uid], args.sep, args.max_len)
         id_chunks[uid] = chunks
         max_cols = max(max_cols, len(chunks))
+        if i % 200 == 0 or i == total_ids:
+            print_progress("Merging IDs", i, total_ids)
+    if total_ids == 0:
+        print_progress("Merging IDs", 0, 0)
 
     # Dynamically name columns: File Name, File Name 2, File Name 3, ...
     name_columns = [args.name_col] + [f"{args.name_col} {i}" for i in range(2, max_cols + 1)]
@@ -109,10 +133,14 @@ def main():
     with open(args.output_csv, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
         writer.writerow([args.id_col] + name_columns)
-        for uid in order:
+        for i, uid in enumerate(order, start=1):
             chunks = id_chunks[uid]
             padded = chunks + [""] * (max_cols - len(chunks))
             writer.writerow([uid] + padded)
+            if i % 200 == 0 or i == total_ids:
+                print_progress("Writing output", i, total_ids)
+    if total_ids == 0:
+        print_progress("Writing output", 0, 0)
 
     print(f"Done. {len(order)} unique IDs written to '{args.output_csv}' using {max_cols} file name column(s).")
 
