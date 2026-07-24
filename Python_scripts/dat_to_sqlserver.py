@@ -60,7 +60,7 @@ from pathlib import Path
 import pyodbc
 
 # ---- EDIT THESE CONNECTION SETTINGS ----
-SERVER = r"prdenvfdevm-3\MSSQLSERVER01"   # Developer edition instance (no 10 GB limit)
+SERVER = r"prdenvfdevm-10"   # Developer edition instance (no 10 GB limit)
 DEFAULT_DATABASE = "sts_db"        # used only if you don't include a DB in the table name
 USE_WINDOWS_AUTH = False           # True -> Windows/domain login (like SSMS); False -> SQL login (sa) below
 SQL_USER = "sa"
@@ -71,7 +71,8 @@ SQL_PASSWORD = os.environ.get("SQL_PASSWORD", "PUT_YOUR_SA_PASSWORD_HERE")
 
 
 def build_conn_str(database: str) -> str:
-    base = f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={SERVER};DATABASE={database};"
+    base = (f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={SERVER};DATABASE={database};"
+            f"Encrypt=yes;TrustServerCertificate=yes;")
     if USE_WINDOWS_AUTH:
         return base + "Trusted_Connection=yes;"
     return base + f"UID={SQL_USER};PWD={SQL_PASSWORD};"
