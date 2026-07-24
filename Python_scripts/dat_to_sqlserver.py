@@ -276,9 +276,36 @@ def read_header(fin):
 
 def read_header_csv(fin):
     """Read the header row of a .csv file via the csv module (handles a
-    quoted header name that itself contains a comma)."""
-    raw_headers = next(csv.reader(fin))
+    quoted header name that itself contains a comma).
+
+    Reads the line with fin.readline() rather than handing fin straight to
+    csv.reader(). Once a text file has been iterated via next()/for-loop,
+    Python permanently disables fin.tell() on that handle (a long-standing
+    CPython quirk) -- readline() doesn't trigger it, so byte-progress
+    tracking (see CountingLineReader) keeps working for the rest of the file.
+    """
+    raw_headers = next(csv.reader([fin.readline()]))
     return dedupe_cols([clean_col(c, i) for i, c in enumerate(raw_headers)])
+
+
+class CountingLineReader:
+    """Feeds csv.reader lines via fin.readline() while tracking bytes
+    consumed manually, since fin.tell() is unusable once anything iterates
+    fin with next()/for-loop (see read_header_csv)."""
+
+    def __init__(self, fin):
+        self.fin = fin
+        self.processed = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        line = self.fin.readline()
+        if not line:
+            raise StopIteration
+        self.processed += len(line.encode("utf-8", "ignore"))
+        return line
 
 
 def get_row_count(cur, full_table) -> int:
@@ -414,7 +441,7 @@ def main():
     with open(dat_path, "r", **open_kwargs) as fin:
         if is_csv:
             cols = read_header_csv(fin)
-            processed = fin.tell()
+            processed = 0  # negligible vs. file size; refined once the loop starts
         else:
             header, cols = read_header(fin)
             processed = len(header.encode("utf-8", "ignore"))
@@ -426,8 +453,9 @@ def main():
         padded, trimmed = [], []
 
         if is_csv:
-            for line_no, raw_values in enumerate(csv.reader(fin), start=2):
-                processed = fin.tell()
+            line_reader = CountingLineReader(fin)
+            for line_no, raw_values in enumerate(csv.reader(line_reader), start=2):
+                processed = line_reader.processed
                 values = [v.strip() for v in raw_values]
                 if not any(values):
                     blank_skipped += 1
@@ -514,9 +542,10 @@ def main():
     try:
         with open(dat_path, "r", **open_kwargs) as fin:
             if is_csv:
-                reader = csv.reader(fin)
+                line_reader = CountingLineReader(fin)
+                reader = csv.reader(line_reader)
                 next(reader)  # skip header
-                processed = fin.tell()
+                processed = line_reader.processed
             else:
                 fin.readline()  # skip header
                 processed = len(header.encode("utf-8", "ignore"))
@@ -524,7 +553,7 @@ def main():
 
             if is_csv:
                 for raw_values in reader:
-                    processed = fin.tell()
+                    processed = line_reader.processed
                     values = [v.strip() for v in raw_values]
                     if not any(values):
                         continue
